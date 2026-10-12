@@ -16,7 +16,8 @@ on:
 # Not here yet, gated on workstation `ci-forgejo-runner-posture` stage `bc-file-system-job-packages` (the runner
 # has no musl, NDK or Emscripten): the NDK compile legs at API 30, 33 and 35; Emscripten (MEMFS and NODERAWFS
 # under Node); x86_64 musl native and aarch64 musl under qemu-user-static; wasm32 freestanding for the path
-# module; memory-sanitized. Each lands as its own job when its packages do.
+# module; memory-sanitized; and build-clang's sanitized leg (clang-19's compiler-rt, libclang-rt-19-dev: without it
+# the sanitized link fails on libclang_rt.asan*.a). Each lands as its own job when its packages do.
 jobs:
   build-gcc:
     runs-on: debian-13
@@ -34,7 +35,7 @@ jobs:
       CXX: clang++-19
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/verify.sh build-debug build-sanitized
+      - run: bash scripts/verify.sh build-debug
 
   header-four-ways:
     runs-on: debian-13
