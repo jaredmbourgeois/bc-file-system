@@ -605,9 +605,9 @@ fn relative(text: &str) -> Result<RelativePath, Error> {
 fn size_label(bytes: usize) -> String {
     const KIBIBYTE: usize = 1024;
     const MEBIBYTE: usize = KIBIBYTE * 1024;
-    if bytes % MEBIBYTE == 0 {
+    if bytes.is_multiple_of(MEBIBYTE) {
         format!("{} MiB", bytes / MEBIBYTE)
-    } else if bytes % KIBIBYTE == 0 {
+    } else if bytes.is_multiple_of(KIBIBYTE) {
         format!("{} KiB", bytes / KIBIBYTE)
     } else {
         format!("{bytes} B")
