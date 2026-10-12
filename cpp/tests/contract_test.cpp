@@ -1,6 +1,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -126,6 +127,14 @@ constexpr WriteOptions kDurablePreserveOr0644{.durability = Durability::durable,
                                               .permissions = Permissions::preserve_or(0644),
                                               .existing_destination = ExistingDestination::replace,
                                               .final_symlink = FinalSymlink::refuse};
+constexpr WriteOptions kWrittenPreserveOr0644{.durability = Durability::written,
+                                              .permissions = Permissions::preserve_or(0644),
+                                              .existing_destination = ExistingDestination::replace,
+                                              .final_symlink = FinalSymlink::refuse};
+constexpr WriteOptions kDurableExactly0644Refusing{.durability = Durability::durable,
+                                                   .permissions = Permissions::exactly(0644),
+                                                   .existing_destination = ExistingDestination::refuse,
+                                                   .final_symlink = FinalSymlink::refuse};
 constexpr WriteOptions kWrittenExactly0644Refusing{.durability = Durability::written,
                                                    .permissions = Permissions::exactly(0644),
                                                    .existing_destination = ExistingDestination::refuse,
@@ -171,6 +180,33 @@ auto fail_step(Operation operation, Step step, std::uint32_t occurrence, int sys
 auto stop_at(Operation operation, Step step, std::uint32_t occurrence) -> Fault {
     return Fault{
         .operation = operation, .step = step, .occurrence = occurrence, .action = FaultAction::stop, .system_code = 0};
+}
+
+// How many components the test's own directory has: the walk from the root opens each of them with `openat`,
+// so an operation's own `openat` of its leaf is the next occurrence after them.
+auto components_of(const std::filesystem::path& path) -> std::uint64_t {
+    std::uint64_t count = 0;
+    for (const std::filesystem::path& part : path) {
+        if (part != "/") {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+// The names in `directory` that are staged files of `leaf`: a staged write's temporary is `.<leaf>.bc-tmp-…`
+// beside its destination, and must never be seen after the write ends, however it ends.
+auto staged_names_of(const std::filesystem::path& directory, std::string_view leaf) -> std::vector<std::string> {
+    const std::vector<std::string> names = bc::file_system_test::names_raw(directory);
+    std::vector<std::string> staged;
+    staged.reserve(names.size());
+    const std::string prefix = "." + std::string(leaf) + ".bc-tmp-";
+    for (const std::string& name : names) {
+        if (name.starts_with(prefix)) {
+            staged.push_back(name);
+        }
+    }
+    return staged;
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -462,8 +498,7 @@ TEST(ReadLimitTest, HoldsTheBoundItWasGiven) {
 // write_file
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteCreatesTheFileWithItsBytesAndItsMode) {
+TEST_P(FileSystemContract, WriteCreatesTheFileWithItsBytesAndItsMode) {
     const auto bytes = bytes_of("fresh content");
 
     const auto achieved = files().write_file(in("new.txt"), bytes, kWrittenExactly0640);
@@ -474,8 +509,7 @@ TEST_P(FileSystemContract, DISABLED_WriteCreatesTheFileWithItsBytesAndItsMode) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("new.txt")), 0640U);
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteReplacesTheContentAndLeavesNoTemporaryFile) {
+TEST_P(FileSystemContract, WriteReplacesTheContentAndLeavesNoTemporaryFile) {
     bc::file_system_test::write_raw(path_of("config"), "old content, and longer than the new", 0644);
     const auto bytes = bytes_of("new");
 
@@ -486,8 +520,7 @@ TEST_P(FileSystemContract, DISABLED_WriteReplacesTheContentAndLeavesNoTemporaryF
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("config"));
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteOfNoBytesCreatesAnEmptyFile) {
+TEST_P(FileSystemContract, WriteOfNoBytesCreatesAnEmptyFile) {
     const auto achieved = files().write_file(in("empty"), {}, kWrittenExactly0600);
 
     ASSERT_TRUE(achieved.has_value());
@@ -495,8 +528,7 @@ TEST_P(FileSystemContract, DISABLED_WriteOfNoBytesCreatesAnEmptyFile) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("empty")), 0600U);
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteUnderExactlyGivesAReplacedFileTheStatedMode) {
+TEST_P(FileSystemContract, WriteUnderExactlyGivesAReplacedFileTheStatedMode) {
     bc::file_system_test::write_raw(path_of("config"), "old", 0600);
     const auto bytes = bytes_of("new");
 
@@ -506,8 +538,7 @@ TEST_P(FileSystemContract, DISABLED_WriteUnderExactlyGivesAReplacedFileTheStated
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0644U);
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteUnderPreserveOrKeepsTheReplacedFilesMode) {
+TEST_P(FileSystemContract, WriteUnderPreserveOrKeepsTheReplacedFilesMode) {
     bc::file_system_test::write_raw(path_of("config"), "old", 0640);
     const auto bytes = bytes_of("new");
 
@@ -518,8 +549,7 @@ TEST_P(FileSystemContract, DISABLED_WriteUnderPreserveOrKeepsTheReplacedFilesMod
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0640U);
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteUnderPreserveOrGivesANewFileTheStatedMode) {
+TEST_P(FileSystemContract, WriteUnderPreserveOrGivesANewFileTheStatedMode) {
     const auto bytes = bytes_of("new");
 
     const auto achieved = files().write_file(in("config"), bytes, kWrittenPreserveOr0600);
@@ -529,8 +559,7 @@ TEST_P(FileSystemContract, DISABLED_WriteUnderPreserveOrGivesANewFileTheStatedMo
 }
 
 // Under `refuse` an existing destination is left exactly as it was.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteUnderRefuseLeavesAnExistingFileAndIsAlreadyExists) {
+TEST_P(FileSystemContract, WriteUnderRefuseLeavesAnExistingFileAndIsAlreadyExists) {
     bc::file_system_test::write_raw(path_of("config"), "old", 0600);
     const auto bytes = bytes_of("new");
 
@@ -538,9 +567,47 @@ TEST_P(FileSystemContract, DISABLED_WriteUnderRefuseLeavesAnExistingFileAndIsAlr
 
     ASSERT_FALSE(achieved.has_value());
     EXPECT_EQ(achieved.error().kind, ErrorKind::already_exists);
+    EXPECT_EQ(achieved.error().path, path_of("config").string());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("config")), "old");
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0600U);
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("config"));
+}
+
+// `preserve_or` is there so a rewrite never widens a mode an operator tightened: the 0600 stays, whatever the
+// caller would have given a new file.
+TEST_P(FileSystemContract, WriteUnderPreserveOrKeepsAnOperatorsStricterModeAgainstTheCallers) {
+    bc::file_system_test::write_raw(path_of("secret"), "old", 0600);
+    const auto bytes = bytes_of("new");
+
+    const auto achieved = files().write_file(in("secret"), bytes, kWrittenPreserveOr0644);
+
+    ASSERT_TRUE(achieved.has_value());
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("secret")), "new");
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("secret")), 0600U);
+}
+
+// The root is a directory, which a write refuses like any other, before anything is staged.
+TEST_P(FileSystemContract, WriteOfTheRootIsNotRegularFile) {
+    const auto bytes = bytes_of("content");
+
+    const auto achieved = files().write_file(Location::at(std::filesystem::path{"/"}), bytes, kWrittenExactly0644);
+
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::not_regular_file);
+    EXPECT_FALSE(achieved.error().step.has_value());
+}
+
+// A leaf as long as a name may be leaves no room for the staged name's own parts, so the leaf inside the staged
+// name is cut; the write still stages beside it and lands under the whole leaf.
+TEST_P(FileSystemContract, WriteOfALeafAsLongAsANameMayBeStillStagesBesideIt) {
+    const std::string leaf(255, 'n');
+    const auto bytes = bytes_of("content");
+
+    const auto achieved = files().write_file(in(leaf), bytes, kWrittenExactly0644);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(leaf)), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(leaf));
 }
 
 // A mode with bits outside 07777 is a contract violation, refused before any system call: green now.
@@ -557,8 +624,7 @@ TEST_P(FileSystemContract, WriteRefusesAModeThatIsNotAMode) {
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("file")));
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteIntoADirectoryThatIsNotThereIsNotFound) {
+TEST_P(FileSystemContract, WriteIntoADirectoryThatIsNotThereIsNotFound) {
     const auto bytes = bytes_of("content");
 
     const auto achieved = files().write_file(in("missing/file"), bytes, kWrittenExactly0644);
@@ -569,8 +635,7 @@ TEST_P(FileSystemContract, DISABLED_WriteIntoADirectoryThatIsNotThereIsNotFound)
 
 // Under `refuse` a symlink at the destination is refused and nothing moves; under `follow` the file behind
 // it is the one replaced, and the link stays.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteRefusesADestinationThatIsASymlinkUnlessToldToFollow) {
+TEST_P(FileSystemContract, WriteRefusesADestinationThatIsASymlinkUnlessToldToFollow) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
     const auto bytes = bytes_of("replacement");
@@ -589,8 +654,43 @@ TEST_P(FileSystemContract, DISABLED_WriteRefusesADestinationThatIsASymlinkUnless
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("link", "target.txt"));
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteRefusesADestinationThatIsADirectory) {
+// A link's target is spelled against the link's own directory, as the system spells it: a relative target
+// through a subdirectory and a `..`, and a link to a link, each end at the file the system would open, and the
+// write stages in that file's directory, never the link's.
+TEST_P(FileSystemContract, WriteFollowsARelativeTargetAndAChainOfLinksToTheFileTheSystemWouldOpen) {
+    bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("elsewhere"), 0755);
+    bc::file_system_test::write_raw(path_of("elsewhere/target.txt"), "behind two links", 0644);
+    bc::file_system_test::make_symlink_raw("../elsewhere/target.txt", path_of("sub/inner"));
+    bc::file_system_test::make_symlink_raw("sub/inner", path_of("outer"));
+    const auto bytes = bytes_of("replacement");
+
+    const auto achieved = files().write_file(in("outer"), bytes, kWrittenExactly0644Following);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("elsewhere/target.txt")), "replacement");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("elsewhere", "outer", "sub"));
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub")), ElementsAre("inner"));
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("elsewhere")), ElementsAre("target.txt"));
+}
+
+// A dangling link under `follow` is what an open with O_CREAT through it would be: the target is created, the
+// link stays a link. Under `refuse` the link is refused like any other.
+TEST_P(FileSystemContract, WriteThroughADanglingSymlinkCreatesTheTargetUnderFollow) {
+    bc::file_system_test::make_symlink_raw("nowhere.txt", path_of("dangling"));
+    const auto bytes = bytes_of("content");
+
+    const auto refused = files().write_file(in("dangling"), bytes, kWrittenExactly0644);
+    const auto followed = files().write_file(in("dangling"), bytes, kWrittenExactly0644Following);
+
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().kind, ErrorKind::symlink_refused);
+    ASSERT_TRUE(followed.has_value()) << followed.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("nowhere.txt")), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("dangling", "nowhere.txt"));
+}
+
+TEST_P(FileSystemContract, WriteRefusesADestinationThatIsADirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
     const auto bytes = bytes_of("replacement");
 
@@ -601,8 +701,7 @@ TEST_P(FileSystemContract, DISABLED_WriteRefusesADestinationThatIsADirectory) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("folder"));
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteIntoADirectoryWithoutPermissionIsPermissionDenied) {
+TEST_P(FileSystemContract, WriteIntoADirectoryWithoutPermissionIsPermissionDenied) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process writes where its permission bits forbid";
     }
@@ -616,8 +715,7 @@ TEST_P(FileSystemContract, DISABLED_WriteIntoADirectoryWithoutPermissionIsPermis
 }
 
 // No space on write, injected: the write(2) fails with ENOSPC after the temporary file exists.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_WriteThatRunsOutOfSpaceLeavesTheDestinationWholeAndNoTemporaryFile) {
+TEST_F(ObservedContract, WriteThatRunsOutOfSpaceLeavesTheDestinationWholeAndNoTemporaryFile) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(fail_step(Operation::write_file, Step::write, 1, ENOSPC));
@@ -635,8 +733,7 @@ TEST_F(ObservedContract, DISABLED_WriteThatRunsOutOfSpaceLeavesTheDestinationWho
 // Too large, for real: the system refuses to let a file grow past the limit. The first write(2) is cut short
 // at the limit and the next one fails with EFBIG, so this is also the case of a short write that must not be
 // taken for success. EFBIG is `too_large`, not `no_space`: the file-size limit is a bound, not a full disk.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_WriteAgainstAFileSizeLimitIsTooLargeAndLeavesTheDestinationWhole) {
+TEST_P(FileSystemContract, WriteAgainstAFileSizeLimitIsTooLargeAndLeavesTheDestinationWhole) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const std::string too_large(64 * 1024, 'x');
     const auto bytes = bytes_of(too_large);
@@ -653,8 +750,7 @@ TEST_P(FileSystemContract, DISABLED_WriteAgainstAFileSizeLimitIsTooLargeAndLeave
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_WriteWhoseRenameFailsLeavesTheDestinationWholeAndNoTemporaryFile) {
+TEST_F(ObservedContract, WriteWhoseRenameFailsLeavesTheDestinationWholeAndNoTemporaryFile) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(fail_step(Operation::write_file, Step::renameat, 1, EIO));
@@ -671,22 +767,38 @@ TEST_F(ObservedContract, DISABLED_WriteWhoseRenameFailsLeavesTheDestinationWhole
     EXPECT_EQ(count(Operation::write_file, durable_sync_step()), 1U);
 }
 
-// The temporary file is the first `openat` of a write: the one that creates it O_EXCL beside the destination.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_WriteWhoseTemporaryFileCannotBeCreatedReportsWhy) {
+// The temporary file's creation is the first `openat` of a write after the walk's component opens: the one
+// that creates it O_EXCL beside the destination.
+TEST_F(ObservedContract, WriteWhoseTemporaryFileCannotBeCreatedReportsWhy) {
     const auto bytes = bytes_of("content");
-    script(fail_step(Operation::write_file, Step::openat, 1, EROFS));
+    const auto staging_open = static_cast<std::uint32_t>(components_of(root_path()) + 1);
+    script(fail_step(Operation::write_file, Step::openat, staging_open, EROFS));
 
     const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
 
     ASSERT_FALSE(achieved.has_value());
     EXPECT_EQ(achieved.error().kind, ErrorKind::permission_denied);
     EXPECT_EQ(achieved.error().system_code, EROFS);
+    EXPECT_EQ(achieved.error().step, Step::openat);
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_WriteWhoseModeCannotBeSetLeavesTheDestinationWholeAndNoTemporaryFile) {
+// A staged name that is taken (a leftover of a process that died with the same id) is tried again with the
+// next token: one more `openat`, and the write lands.
+TEST_F(ObservedContract, AStagedNameThatIsTakenIsTriedAgainWithTheNextToken) {
+    const auto bytes = bytes_of("content");
+    const auto staging_open = static_cast<std::uint32_t>(components_of(root_path()) + 1);
+    script(fail_step(Operation::write_file, Step::openat, staging_open, EEXIST));
+
+    const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
+    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 2);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file"));
+}
+
+TEST_F(ObservedContract, WriteWhoseModeCannotBeSetLeavesTheDestinationWholeAndNoTemporaryFile) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(fail_step(Operation::write_file, Step::fchmod, 1, EPERM));
@@ -701,8 +813,7 @@ TEST_F(ObservedContract, DISABLED_WriteWhoseModeCannotBeSetLeavesTheDestinationW
 }
 
 // A sync that fails before the rename is still an error: nothing has replaced the destination yet.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableWriteWhoseFileSyncFailsLeavesTheDestinationWhole) {
+TEST_F(ObservedContract, DurableWriteWhoseFileSyncFailsLeavesTheDestinationWhole) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(fail_step(Operation::write_file, durable_sync_step(), 1, EIO));
@@ -718,8 +829,7 @@ TEST_F(ObservedContract, DISABLED_DurableWriteWhoseFileSyncFailsLeavesTheDestina
 
 // The directory sync is the second sync of a durable write, and it comes after the rename. The destination is
 // already replaced, so the call may not report an error: it reports the durability it did achieve.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableWriteWhoseDirectorySyncFailsReportsWritten) {
+TEST_F(ObservedContract, DurableWriteWhoseDirectorySyncFailsReportsWritten) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(fail_step(Operation::write_file, durable_sync_step(), 2, EIO));
@@ -732,10 +842,11 @@ TEST_F(ObservedContract, DISABLED_DurableWriteWhoseDirectorySyncFailsReportsWrit
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
 }
 
-// The same outcome, provoked for real: files can be created in a directory with mode 0300, but the directory
-// cannot be opened for the sync.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_DurableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten) {
+// A directory with mode 0300 lets a path-based open create files in it, but the engine never opens by path:
+// the walk holds the destination's directory as a descriptor, opened read-only, which the mode forbids. So the
+// write is refused on the way, at the directory's own open, and nothing is created. (The outcome the
+// path-based draft met here, a directory that takes a file but not a sync, is the scripted case above.)
+TEST_P(FileSystemContract, WriteIntoADirectoryTheProcessCannotOpenIsPermissionDeniedBeforeAnythingIsStaged) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process opens what its permission bits forbid";
     }
@@ -744,34 +855,77 @@ TEST_P(FileSystemContract, DISABLED_DurableWriteIntoADirectoryThatCannotBeOpened
 
     const auto achieved = files().write_file(in("write-only/file"), bytes, kDurableExactly0644);
 
-    ASSERT_TRUE(achieved.has_value());
-    EXPECT_EQ(*achieved, Durability::written);
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(achieved.error().step, Step::openat);
     bc::file_system_test::set_mode_raw(path_of("write-only"), 0700);
-    EXPECT_EQ(bc::file_system_test::read_raw(path_of("write-only/file")), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("write-only")), IsEmpty());
 }
 
 // What "durable" means, read from the system calls the write made: the temporary file is created, written,
 // given its mode and synced; it is renamed over the destination; the directory is synced. On Apple platforms
 // both syncs are F_FULLFSYNC, and fsync is never called, because fsync there stops at the drive's cache. That
 // the file's sync comes before the rename is the case above, which fails it and finds no rename.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableWriteSyncsTheFileThenRenamesThenSyncsTheDirectory) {
+TEST_F(ObservedContract, DurableWriteSyncsTheFileThenRenamesThenSyncsTheDirectory) {
     const auto bytes = bytes_of("content");
 
     const auto achieved = files().write_file(in("ledger"), bytes, kDurableExactly0644);
 
     ASSERT_TRUE(achieved.has_value());
     EXPECT_EQ(*achieved, Durability::durable);
-    EXPECT_GE(count(Operation::write_file, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 1);
     EXPECT_EQ(count(Operation::write_file, Step::write), 1U);
     EXPECT_EQ(count(Operation::write_file, Step::fchmod), 1U);
     EXPECT_EQ(count(Operation::write_file, durable_sync_step()), 2U);
+    // The staged file is closed as a step of its own before the rename: the last call that can report a write
+    // the system deferred.
+    EXPECT_EQ(count(Operation::write_file, Step::close), 1U);
     EXPECT_EQ(count(Operation::write_file, Step::renameat), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::rename_no_replace), 0U);
     EXPECT_EQ(count(Operation::write_file, wrong_sync_step()), 0U);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_WrittenWriteMakesNoSyncCall) {
+// Under `refuse` the rename is the platform's no-replace rename, under its own step; a destination that is
+// absent takes the name, and the step counts say which rename was made.
+TEST_F(ObservedContract, WriteUnderRefuseRenamesWithTheNoReplaceRename) {
+    const auto bytes = bytes_of("content");
+
+    const auto achieved = files().write_file(in("fresh"), bytes, kWrittenExactly0644Refusing);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("fresh")), "content");
+    EXPECT_EQ(count(Operation::write_file, Step::rename_no_replace), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::renameat), 0U);
+}
+
+// A `written` write makes no sync and no reported close: the staged file closes through its owner.
+TEST_F(ObservedContract, WrittenWriteClosesTheStagedFileThroughItsOwnerNotAsAStep) {
+    const auto bytes = bytes_of("content");
+
+    const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
+
+    ASSERT_TRUE(achieved.has_value());
+    EXPECT_EQ(count(Operation::write_file, Step::close), 0U);
+}
+
+// A close that fails before the rename is an error like a failed sync: the destination is untouched and the
+// staged file is gone.
+TEST_F(ObservedContract, DurableWriteWhoseCloseFailsLeavesTheDestinationWhole) {
+    bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
+    const auto bytes = bytes_of("the new ledger");
+    script(fail_step(Operation::write_file, Step::close, 1, EIO));
+
+    const auto achieved = files().write_file(in("ledger"), bytes, kDurableExactly0644);
+
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(achieved.error().step, Step::close);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the old ledger");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
+    EXPECT_EQ(count(Operation::write_file, Step::renameat), 0U);
+}
+
+TEST_F(ObservedContract, WrittenWriteMakesNoSyncCall) {
     const auto bytes = bytes_of("content");
 
     const auto achieved = files().write_file(in("ledger"), bytes, kWrittenExactly0644);
@@ -782,8 +936,7 @@ TEST_F(ObservedContract, DISABLED_WrittenWriteMakesNoSyncCall) {
     EXPECT_EQ(count(Operation::write_file, Step::fcntl_fullfsync), 0U);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_AnInterruptedWriteIsAskedAgain) {
+TEST_F(ObservedContract, AnInterruptedWriteIsAskedAgain) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, Step::write, 1, EINTR));
 
@@ -794,8 +947,7 @@ TEST_F(ObservedContract, DISABLED_AnInterruptedWriteIsAskedAgain) {
     EXPECT_EQ(count(Operation::write_file, Step::write), 2U);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_AnInterruptedSyncIsAskedAgain) {
+TEST_F(ObservedContract, AnInterruptedSyncIsAskedAgain) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, durable_sync_step(), 1, EINTR));
 
@@ -808,8 +960,7 @@ TEST_F(ObservedContract, DISABLED_AnInterruptedSyncIsAskedAgain) {
 }
 
 // A file system with no sync call at all (some network mounts) cannot do better than written, and says so.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableWriteWhereSyncIsNotSupportedReportsWritten) {
+TEST_F(ObservedContract, DurableWriteWhereSyncIsNotSupportedReportsWritten) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, durable_sync_step(), 1, ENOTSUP));
 
@@ -821,8 +972,7 @@ TEST_F(ObservedContract, DISABLED_DurableWriteWhereSyncIsNotSupportedReportsWrit
 }
 
 // EDQUOT is a full quota, `no_space`; EFBIG is the process's file-size limit, `too_large`.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_EachRoomFailureHasItsKind) {
+TEST_F(ObservedContract, EachRoomFailureHasItsKind) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, Step::write, 1, EDQUOT));
     script(fail_step(Operation::write_file, Step::write, 2, EFBIG));
@@ -841,8 +991,7 @@ TEST_F(ObservedContract, DISABLED_EachRoomFailureHasItsKind) {
 // append
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_AppendCreatesTheFileWithItsMode) {
+TEST_P(FileSystemContract, AppendCreatesTheFileWithItsMode) {
     const auto bytes = bytes_of("first entry\n");
 
     const auto achieved = files().append(in("log"), bytes, Durability::written, Permissions::exactly(0640));
@@ -853,8 +1002,7 @@ TEST_P(FileSystemContract, DISABLED_AppendCreatesTheFileWithItsMode) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("log")), 0640U);
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_AppendAddsToTheEnd) {
+TEST_P(FileSystemContract, AppendAddsToTheEnd) {
     bc::file_system_test::write_raw(path_of("log"), "first entry\n", 0644);
     const auto bytes = bytes_of("second entry\n");
 
@@ -864,9 +1012,33 @@ TEST_P(FileSystemContract, DISABLED_AppendAddsToTheEnd) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "first entry\nsecond entry\n");
 }
 
+// Two appends through the library, the first creating the file: the bytes arrive in call order, whole.
+TEST_P(FileSystemContract, AppendAcrossTwoCallsConcatenatesInOrder) {
+    const auto first = bytes_of("one\n");
+    const auto second = bytes_of("two\n");
+
+    const auto first_achieved = files().append(in("log"), first, Durability::written, Permissions::exactly(0644));
+    const auto second_achieved = files().append(in("log"), second, Durability::written, Permissions::exactly(0644));
+
+    ASSERT_TRUE(first_achieved.has_value()) << first_achieved.error().message();
+    ASSERT_TRUE(second_achieved.has_value()) << second_achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "one\ntwo\n");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("log"));
+}
+
+// The root is a directory, which an append refuses before opening anything.
+TEST_P(FileSystemContract, AppendToTheRootIsNotRegularFile) {
+    const auto bytes = bytes_of("entry");
+
+    const auto achieved = files().append(Location::at(std::filesystem::path{"/"}), bytes, Durability::written,
+                                         Permissions::exactly(0644));
+
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::not_regular_file);
+}
+
 // An existing file is neither created nor replaced by an append, so its mode is not this call's to change.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_AppendLeavesAnExistingFilesModeAloneUnderEitherPolicy) {
+TEST_P(FileSystemContract, AppendLeavesAnExistingFilesModeAloneUnderEitherPolicy) {
     bc::file_system_test::write_raw(path_of("log"), "first entry\n", 0640);
     const auto bytes = bytes_of("more\n");
 
@@ -880,8 +1052,7 @@ TEST_P(FileSystemContract, DISABLED_AppendLeavesAnExistingFilesModeAloneUnderEit
 }
 
 // An append never follows a symlink (it takes no FinalSymlink): a link at the location is refused as one.
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_AppendRefusesASymlinkAndADirectory) {
+TEST_P(FileSystemContract, AppendRefusesASymlinkAndADirectory) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
@@ -897,8 +1068,7 @@ TEST_P(FileSystemContract, DISABLED_AppendRefusesASymlinkAndADirectory) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("target.txt")), "behind the link");
 }
 
-// stage 14 writes-in-c
-TEST_P(FileSystemContract, DISABLED_AppendIntoADirectoryThatIsNotThereIsNotFound) {
+TEST_P(FileSystemContract, AppendIntoADirectoryThatIsNotThereIsNotFound) {
     const auto bytes = bytes_of("entry");
 
     const auto achieved = files().append(in("missing/log"), bytes, Durability::written, Permissions::exactly(0644));
@@ -907,8 +1077,7 @@ TEST_P(FileSystemContract, DISABLED_AppendIntoADirectoryThatIsNotThereIsNotFound
     EXPECT_EQ(achieved.error().kind, ErrorKind::not_found);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_AppendThatRunsOutOfSpaceIsNoSpace) {
+TEST_F(ObservedContract, AppendThatRunsOutOfSpaceIsNoSpace) {
     bc::file_system_test::write_raw(path_of("log"), "first entry\n", 0644);
     const auto bytes = bytes_of("second entry\n");
     script(fail_step(Operation::append, Step::write, 1, ENOSPC));
@@ -920,8 +1089,7 @@ TEST_F(ObservedContract, DISABLED_AppendThatRunsOutOfSpaceIsNoSpace) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "first entry\n");
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_AppendWhoseNewFileCannotGetItsModeTakesTheFileBack) {
+TEST_F(ObservedContract, AppendWhoseNewFileCannotGetItsModeTakesTheFileBack) {
     const auto bytes = bytes_of("entry");
     script(fail_step(Operation::append, Step::fchmod, 1, EPERM));
 
@@ -932,8 +1100,7 @@ TEST_F(ObservedContract, DISABLED_AppendWhoseNewFileCannotGetItsModeTakesTheFile
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("log")));
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableAppendToANewFileSyncsTheFileAndItsDirectory) {
+TEST_F(ObservedContract, DurableAppendToANewFileSyncsTheFileAndItsDirectory) {
     const auto bytes = bytes_of("entry");
 
     const auto achieved = files().append(in("log"), bytes, Durability::durable, Permissions::exactly(0644));
@@ -944,8 +1111,7 @@ TEST_F(ObservedContract, DISABLED_DurableAppendToANewFileSyncsTheFileAndItsDirec
     EXPECT_EQ(count(Operation::append, wrong_sync_step()), 0U);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableAppendToAnExistingFileSyncsOnlyTheFile) {
+TEST_F(ObservedContract, DurableAppendToAnExistingFileSyncsOnlyTheFile) {
     bc::file_system_test::write_raw(path_of("log"), "first entry\n", 0644);
     const auto bytes = bytes_of("entry");
 
@@ -957,8 +1123,7 @@ TEST_F(ObservedContract, DISABLED_DurableAppendToAnExistingFileSyncsOnlyTheFile)
 }
 
 // The bytes are already in the file when the sync fails, so the call reports what it achieved, not an error.
-// stage 14 writes-in-c
-TEST_F(ObservedContract, DISABLED_DurableAppendWhoseSyncFailsReportsWritten) {
+TEST_F(ObservedContract, DurableAppendWhoseSyncFailsReportsWritten) {
     bc::file_system_test::write_raw(path_of("log"), "first entry\n", 0644);
     const auto bytes = bytes_of("second entry\n");
     script(fail_step(Operation::append, durable_sync_step(), 1, EIO));
@@ -968,6 +1133,94 @@ TEST_F(ObservedContract, DISABLED_DurableAppendWhoseSyncFailsReportsWritten) {
     ASSERT_TRUE(achieved.has_value());
     EXPECT_EQ(*achieved, Durability::written);
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "first entry\nsecond entry\n");
+}
+
+// "Stop without cleanup" on an append that created its file: the kill lands between the create and the mode,
+// so the empty file stays, as it would after a real kill there, and the error names the step.
+TEST_F(ObservedContract, AStopAtANewAppendedFilesModeLeavesTheFileAsAKillWould) {
+    const auto bytes = bytes_of("entry");
+    script(stop_at(Operation::append, Step::fchmod, 1));
+
+    const auto achieved = files().append(in("log"), bytes, Durability::written, Permissions::exactly(0644));
+
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(achieved.error().step, Step::fchmod);
+    EXPECT_EQ(achieved.error().system_code, 0);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "");
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// sync
+// -------------------------------------------------------------------------------------------------------------
+
+// A file and a directory each open read-only and sync; on every platform the suite runs on the sync is offered,
+// so the answer is `durable`.
+TEST_P(FileSystemContract, SyncOfAFileAndOfADirectoryAnswersDurable) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto file = files().sync(in("file"));
+    const auto folder = files().sync(in("folder"));
+    const auto own_directory = files().sync(root());
+
+    ASSERT_TRUE(file.has_value()) << file.error().message();
+    EXPECT_EQ(*file, Durability::durable);
+    ASSERT_TRUE(folder.has_value()) << folder.error().message();
+    EXPECT_EQ(*folder, Durability::durable);
+    ASSERT_TRUE(own_directory.has_value()) << own_directory.error().message();
+    EXPECT_EQ(*own_directory, Durability::durable);
+}
+
+// A sync takes no choice about a symlink, so one is refused; nothing there is `not_found`.
+TEST_P(FileSystemContract, SyncOfNothingIsNotFoundAndOfASymlinkIsRefused) {
+    bc::file_system_test::write_raw(path_of("target.txt"), "content", 0644);
+    bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
+
+    const auto absent = files().sync(in("absent"));
+    const auto through_link = files().sync(in("link"));
+
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(through_link.has_value());
+    EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
+}
+
+// What a sync costs: the leaf's open and one sync under this platform's step, never the other platform's.
+TEST_F(ObservedContract, SyncOpensTheLeafAndMakesOneSyncCallUnderThePlatformsStep) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto achieved = files().sync(in("file"));
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(count(Operation::sync, Step::openat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::sync, durable_sync_step()), 1U);
+    EXPECT_EQ(count(Operation::sync, wrong_sync_step()), 0U);
+}
+
+// A volume that offers no sync cannot do better than `written`, and says so.
+TEST_F(ObservedContract, SyncWhereTheVolumeOffersNoneAnswersWritten) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    script(fail_step(Operation::sync, durable_sync_step(), 1, ENOTSUP));
+
+    const auto achieved = files().sync(in("file"));
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::written);
+}
+
+// A sync of its own that fails is an error: this call changes nothing, so the rule that lowers a failed sync
+// to `written` because the change happened has nothing to apply to, and the caller asked for exactly this.
+TEST_F(ObservedContract, SyncThatFailsIsIoFailedAtThePlatformsStep) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    script(fail_step(Operation::sync, durable_sync_step(), 1, EIO));
+
+    const auto achieved = files().sync(in("file"));
+
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(achieved.error().system_code, EIO);
+    EXPECT_EQ(achieved.error().step, durable_sync_step());
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -1250,17 +1503,6 @@ auto lay_out_directories(const std::filesystem::path& root) -> void {
 // A relative path the suite spells as a literal it knows to be valid.
 auto relative(std::string_view text) -> RelativePath {
     return RelativePath::from(text).value();
-}
-
-// How many components the test's own directory has: the walk from the root opens each of them.
-auto components_of(const std::filesystem::path& path) -> std::uint64_t {
-    std::uint64_t count = 0;
-    for (const std::filesystem::path& part : path) {
-        if (part != "/") {
-            count += 1;
-        }
-    }
-    return count;
 }
 
 TEST_P(FileSystemContract, OpenDirectoryOpensADirectoryAndRemembersItsText) {
@@ -1624,6 +1866,28 @@ TEST_P(FileSystemContract, ReadFileBeneathADirectoryReadsAFileAndRefusesASymlink
     ASSERT_FALSE(through_a_link.has_value());
     EXPECT_EQ(through_a_link.error().kind, ErrorKind::symlink_refused);
     EXPECT_EQ(through_a_link.error().path, path_of("alias/deeper/notes.txt").string());
+}
+
+// A `beneath` write stages beside its leaf inside the held directory, and a symlink on the way is refused like
+// every `beneath` resolution's, with nothing staged anywhere.
+TEST_P(FileSystemContract, WriteBeneathADirectoryStagesBesideTheLeafAndRefusesASymlinkOnTheWay) {
+    lay_out_directories(root_path());
+    const auto bytes = bytes_of("content");
+    const auto held = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(held.has_value()) << held.error().message();
+
+    const auto written =
+        files().write_file(Location::beneath(*held, relative("sub/deeper/file")), bytes, kWrittenExactly0644);
+    const auto through_link =
+        files().write_file(Location::beneath(*held, relative("alias/file")), bytes, kWrittenExactly0644);
+
+    ASSERT_TRUE(written.has_value()) << written.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("sub/deeper/file")), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub/deeper")), ElementsAre("file"));
+    ASSERT_FALSE(through_link.has_value());
+    EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(through_link.error().path, path_of("alias/file").string());
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub")), ElementsAre("deeper", "way-out"));
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -2208,6 +2472,136 @@ TEST_F(ObservedContract, DISABLED_EveryOperationClosesWhatItOpened) {
     static_cast<void>(files().write_file(in("written"), bytes, kDurableExactly0644));
 
     EXPECT_EQ(bc::file_system_test::open_descriptors(), before);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// The kill points of write_file: one case per step, as a table
+// -------------------------------------------------------------------------------------------------------------
+
+// "Stop without cleanup" makes the operation return from a step as the process would have if it had been killed
+// there: the descriptors close, nothing is unlinked, renamed back or given its mode. Each row scripts that stop
+// at one step of a durable write over an existing destination (or, for the no-replace rename, over none) and
+// asserts the invariant every kill must keep: the destination holds the old content or the new, never a mixture
+// and never an empty file; at most one staged file remains, and only before the rename, which is what a later
+// sweep clears. The steps are the write's in order: the staged file's creation, the write of the bytes, its
+// mode, its sync, its close, the rename, the directory's sync.
+struct KillPoint {
+    const char* label; // the case's name
+    Step step;
+    std::uint32_t occurrence;                 // of `step` within one write, after the walk's own openat calls
+    ExistingDestination existing_destination; // `refuse` rows start with no destination
+    bool destination_replaced;                // the rename had happened when the kill landed
+    bool staged_file_remains;                 // the staged file had been created and not yet renamed
+};
+
+constexpr std::array<KillPoint, 8> kill_points{{
+    {.label = "TheStagedFilesCreation",
+     .step = Step::openat,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = false},
+    {.label = "TheWriteOfTheBytes",
+     .step = Step::write,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheMode",
+     .step = Step::fchmod,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheSyncOfTheStagedFile",
+     .step = durable_sync_step(),
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheCloseOfTheStagedFile",
+     .step = Step::close,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheRenameIntoPlace",
+     .step = Step::renameat,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheNoReplaceRenameIntoPlace",
+     .step = Step::rename_no_replace,
+     .occurrence = 1,
+     .existing_destination = ExistingDestination::refuse,
+     .destination_replaced = false,
+     .staged_file_remains = true},
+    {.label = "TheSyncOfTheDirectory",
+     .step = durable_sync_step(),
+     .occurrence = 2,
+     .existing_destination = ExistingDestination::replace,
+     .destination_replaced = true,
+     .staged_file_remains = false},
+}};
+
+auto kill_point_name(const testing::TestParamInfo<KillPoint>& info) -> std::string {
+    return info.param.label;
+}
+
+class WriteKillPoints : public Contract<bc::file_system_test::DescriptorBalancedWithParam<KillPoint>> {
+protected:
+    WriteKillPoints() : Contract(Engine::observed_for_tests()) {}
+
+    auto script(const Fault& fault) -> void {
+        const Result<void> added = engine().add_fault(fault);
+        ASSERT_TRUE(added.has_value()) << added.error().message();
+    }
+
+    // The occurrence the row names, counted from the write's own first openat: the walk opens every component
+    // of the test's directory with openat before the write opens anything of its own.
+    [[nodiscard]] auto occurrence_of(const KillPoint& point) const -> std::uint32_t {
+        if (point.step == Step::openat) {
+            return static_cast<std::uint32_t>(components_of(root_path()) + point.occurrence);
+        }
+        return point.occurrence;
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(Steps, WriteKillPoints, testing::ValuesIn(kill_points), kill_point_name);
+
+TEST_P(WriteKillPoints, LeavesTheDestinationWholeOrReplacedAndNeverAMixture) {
+    const KillPoint& point = GetParam();
+    const bool starts_with_a_destination = point.existing_destination == ExistingDestination::replace;
+    if (starts_with_a_destination) {
+        bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
+    }
+    const auto bytes = bytes_of("the new ledger");
+    const WriteOptions options = starts_with_a_destination ? kDurableExactly0644 : kDurableExactly0644Refusing;
+    script(stop_at(Operation::write_file, point.step, occurrence_of(point)));
+
+    const auto achieved = files().write_file(in("ledger"), bytes, options);
+
+    // The stop is reported as the step it landed on, with no system code: the operation did not fail, it ended.
+    ASSERT_FALSE(achieved.has_value());
+    EXPECT_EQ(achieved.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(achieved.error().step, point.step);
+    EXPECT_EQ(achieved.error().system_code, 0);
+
+    // The invariant: the destination is whole, old or new; a staged file remains only before the rename.
+    const std::vector<std::string> staged = staged_names_of(root_path(), "ledger");
+    EXPECT_EQ(staged.size(), point.staged_file_remains ? 1U : 0U) << testing::PrintToString(staged);
+    if (point.destination_replaced) {
+        EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the new ledger");
+    } else if (starts_with_a_destination) {
+        EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the old ledger");
+    } else {
+        EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("ledger")));
+    }
+    const std::vector<std::string> names = bc::file_system_test::names_raw(root_path());
+    const std::size_t destinations = names.size() - staged.size();
+    EXPECT_EQ(destinations, (point.destination_replaced || starts_with_a_destination) ? 1U : 0U)
+        << testing::PrintToString(names);
 }
 
 } // namespace

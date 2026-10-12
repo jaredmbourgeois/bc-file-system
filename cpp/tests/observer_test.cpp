@@ -312,8 +312,7 @@ TEST_F(ObserverTest, AScriptNamesOneOperationAndOneStepOnOpenDirectory) {
     EXPECT_EQ(count(Operation::open_directory, Step::fsync), 0U);
 }
 
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_AScriptedStepFailsWithItsCodeAndNothingIsWritten) {
+TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeAndNothingIsWritten) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, Step::openat, 1, ENOSPC));
 
@@ -463,8 +462,7 @@ TEST_F(ObserverTest, DISABLED_EachOperationCountsUnderItsOwnName) {
     }
 }
 
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_LetsEveryStepRunWhenNothingIsScripted) {
+TEST_F(ObserverTest, LetsEveryStepRunWhenNothingIsScripted) {
     const auto bytes = bytes_of("content");
 
     const auto achieved = files().write_file(in("file"), bytes, kDurableExactly0644);
@@ -476,8 +474,7 @@ TEST_F(ObserverTest, DISABLED_LetsEveryStepRunWhenNothingIsScripted) {
     EXPECT_EQ(text_of(*back), "content");
 }
 
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_FailsOnlyTheNthOccurrenceOfTheScriptedStep) {
+TEST_F(ObserverTest, FailsOnlyTheNthOccurrenceOfTheScriptedStep) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, Step::write, 2, ENOSPC));
 
@@ -494,8 +491,7 @@ TEST_F(ObserverTest, DISABLED_FailsOnlyTheNthOccurrenceOfTheScriptedStep) {
 
 // An occurrence counts across locations: the second durable sync of one write is the directory's, not a
 // second file's.
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_CountsAStepAcrossLocations) {
+TEST_F(ObserverTest, CountsAStepAcrossLocations) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, durable_sync_step(), 2, EIO));
 
@@ -508,8 +504,7 @@ TEST_F(ObserverTest, DISABLED_CountsAStepAcrossLocations) {
 
 // A step that was failed by script still counts: the count records what the operation reached, not what the
 // system did.
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_CountsAStepWhetherOrNotItWasFailed) {
+TEST_F(ObserverTest, CountsAStepWhetherOrNotItWasFailed) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::write_file, Step::renameat, 1, EIO));
 
@@ -522,8 +517,7 @@ TEST_F(ObserverTest, DISABLED_CountsAStepWhetherOrNotItWasFailed) {
 
 // "Stop without cleanup": the operation returns from the step as if the process had been killed there, so
 // the staged temporary file is left beside the untouched destination, which is what a kill-point case reads.
-// stage 14 writes-in-c
-TEST_F(ObserverTest, DISABLED_AStopFaultReturnsFromTheStepWithoutCleanup) {
+TEST_F(ObserverTest, AStopFaultReturnsFromTheStepWithoutCleanup) {
     bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
     const auto bytes = bytes_of("the new ledger");
     script(stop_at(Operation::write_file, Step::renameat, 1));

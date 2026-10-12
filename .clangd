@@ -1,0 +1,4 @@
+# clangd reads the debug preset's compile database, so an editor sees the same flags the build uses
+# (the presets export compile_commands.json). Configure the debug preset once and the diagnostics are real.
+CompileFlags:
+  CompilationDatabase: build/debug

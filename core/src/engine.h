@@ -15,7 +15,9 @@
  * number of threads at once, and that an engine created for tests is used from one thread at a time. The hooks
  * keep that promise by construction: on a live engine neither hook writes anything, not even a counter, so the
  * only cost a release build pays is one read of `observed` per step; on an observed engine both hooks write the
- * counters and the fault slot, which the single-thread contract makes safe without a lock.
+ * counters and the fault slot, which the single-thread contract makes safe without a lock. The one field a
+ * live engine writes after creation is the staged-write token counter in `bc_file_system.c`, which is atomic
+ * so two threads staging at once draw different tokens.
  */
 #pragma once
 
@@ -32,7 +34,9 @@ typedef enum bc_file_system_step_action : int32_t {
     bc_file_system_step_action_proceed = 0,
     /* The step fails with `system_code`, which the operation reports exactly as a real refusal. */
     bc_file_system_step_action_fail = bc_file_system_fault_action_fail,
-    /* The operation returns from this step with no cleanup: no close, no unlink, no rename back. */
+    /* The operation returns from this step leaving the disk as a kill would: a staged file stays where it is,
+     * nothing is unlinked, renamed back or given its mode. The descriptors the operation holds do close, as a
+     * process's death closes them, because the cleanup idiom runs on every return. */
     bc_file_system_step_action_stop = bc_file_system_fault_action_stop
 } bc_file_system_step_action;
 
@@ -97,8 +101,9 @@ static inline bool observer_decided(const bc_file_system_step_verdict *verdict, 
 /* Fills `error` for a step that failed and answers the status every failing path returns. The name stays
  * empty: what the step acted on is the location itself, whose text the face holds; an operation whose step
  * acted on an entry inside the location fills the name itself. A stop is answered as `io_failed` with no system
- * code at the stopped step: a read-only operation holds nothing a killed process would not lose as well, so
- * returning is the kill; an operation that holds state on disk defines its own stop. */
+ * code at the stopped step, for every operation: a read-only one holds nothing a killed process would not lose
+ * as well, so returning is the kill; one that holds a staged file on disk marks it kept before coming here
+ * (`report_staged_outcome` in `bc_file_system.c`), so its cleanup leaves what a kill would leave. */
 static inline int32_t report_outcome(bc_file_system_error *error, int32_t operation, int32_t step,
                                      const bc_file_system_call_outcome *outcome, int32_t kind) {
     /* Every kind the mapping answers is a failure, never 0: a caller that reads an out-parameter only when the

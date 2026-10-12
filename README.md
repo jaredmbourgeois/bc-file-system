@@ -56,6 +56,10 @@ to a parent descriptor and a leaf name with containment enforced by the kernel (
 deterministically. Stage 13 `status-and-reads` is in: `status` (absence is an answer, `lstat` semantics under
 `FinalSymlink`) and `read_file` (the leaf opened and judged by its descriptor, the read limit, the buffer
 protocol, a file that grew between its measurement and its reading asked for again) are real on every face, each
-system call behind the observer and asked again on EINTR. The remaining operations land in C group by group over
-the next stages (writes, directories, moves and copies, locks and links); `0.1.0` is tagged when every face is
-green on every platform.
+system call behind the observer and asked again on EINTR. Stage 14 `writes-in-c` is in: `write_file` (every write
+staged in an exclusive temporary beside its destination and renamed into place, `replace` or `refuse`, a final
+symlink refused or followed to the file it names, the mode set exactly, `durable` syncing the file and its
+directory), `append` and `sync` are real on every face; "stop without cleanup" is real, so the kill-point cases
+hold the destination whole or replaced at every step of a write; and every gated system call lives in one unit,
+`core/src/calls.c`. The remaining operations land in C group by group over the next stages (directories, moves
+and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.

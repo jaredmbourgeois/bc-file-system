@@ -241,20 +241,38 @@ TEST_F(BindingTest, ReadFileReachesC) {
     EXPECT_EQ(text_of(*bytes), "content");
 }
 
+// The write operation is real: the bytes and the mode land, and the durability achieved comes back through
+// the face's conversion.
 TEST_F(BindingTest, WriteFileReachesC) {
     const auto bytes = bytes_of("content");
-    expect_unsupported(files().write_file(in("file"), bytes, kWrittenExactly0644), Operation::write_file,
-                       path_text_of("file"));
+
+    const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::written);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0644U);
 }
 
+// The append operation is real: a file it creates gets the mode, and the bytes are in it.
 TEST_F(BindingTest, AppendReachesC) {
     const auto bytes = bytes_of("entry\n");
-    expect_unsupported(files().append(in("log"), bytes, Durability::written, Permissions::exactly(0644)),
-                       Operation::append, path_text_of("log"));
+
+    const auto achieved = files().append(in("log"), bytes, Durability::written, Permissions::exactly(0644));
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::written);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "entry\n");
 }
 
+// The sync operation is real: a file this platform can sync answers `durable`.
 TEST_F(BindingTest, SyncReachesC) {
-    expect_unsupported(files().sync(in("file")), Operation::sync, path_text_of("file"));
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto achieved = files().sync(in("file"));
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::durable);
 }
 
 TEST_F(BindingTest, CreateDirectoryReachesC) {
@@ -1046,7 +1064,7 @@ TEST_F(CoreBindingTest, ANulByteInsideAPathIsInvalidArgument) {
 }
 
 // A NULL byte pointer with a length of 0 is the stated way to pass no bytes, not a contract violation: the
-// stub gets past its checks and answers `unsupported`.
+// write gets past its checks and creates the empty file.
 TEST_F(CoreBindingTest, WriteOfNoBytesWithANullPointerIsNotAContractViolation) {
     const std::string path = path_text_of("empty");
     const bc_file_system_location location = at(path);
@@ -1057,7 +1075,8 @@ TEST_F(CoreBindingTest, WriteOfNoBytesWithANullPointerIsNotAContractViolation) {
     const std::int32_t status =
         bc_file_system_write_file(engine(), &location, nullptr, 0, &c_options, &achieved, &c_error);
 
-    EXPECT_EQ(status, bc_file_system_error_kind_unsupported);
+    EXPECT_EQ(status, 0);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("empty")), "");
 }
 
 // Likewise a NULL buffer with a capacity of 0 asks for the size; a NULL buffer with a capacity is a violation.
@@ -1256,8 +1275,7 @@ TEST_F(CoreBindingTest, StatusOfAnswersPresentForSomethingAndAbsentForNothing) {
     EXPECT_TRUE(is_all_zero(c_error));
 }
 
-// stage 14 writes-in-c
-TEST_F(CoreBindingTest, DISABLED_WriteAnswersWithTheDurabilityAchieved) {
+TEST_F(CoreBindingTest, WriteAnswersWithTheDurabilityAchieved) {
     const std::string plain = path_text_of("plain");
     const std::string synced = path_text_of("synced");
     const bc_file_system_location plain_location = at(plain);
@@ -1284,8 +1302,7 @@ TEST_F(CoreBindingTest, DISABLED_WriteAnswersWithTheDurabilityAchieved) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("synced")), 0600U);
 }
 
-// stage 14 writes-in-c
-TEST_F(CoreBindingTest, DISABLED_WriteOfNoBytesTakesANullPointer) {
+TEST_F(CoreBindingTest, WriteOfNoBytesTakesANullPointer) {
     const std::string path = path_text_of("empty");
     const bc_file_system_location location = at(path);
     const bc_file_system_write_options c_options = bc::file_system::to_c(kWrittenExactly0644);
@@ -1300,8 +1317,7 @@ TEST_F(CoreBindingTest, DISABLED_WriteOfNoBytesTakesANullPointer) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("empty")), "");
 }
 
-// stage 14 writes-in-c
-TEST_F(CoreBindingTest, DISABLED_WriteUnderPreserveOrKeepsTheReplacedFilesMode) {
+TEST_F(CoreBindingTest, WriteUnderPreserveOrKeepsTheReplacedFilesMode) {
     bc::file_system_test::write_raw(path_of("config"), "old", 0640);
     const std::string path = path_text_of("config");
     const bc_file_system_location location = at(path);
@@ -1319,8 +1335,7 @@ TEST_F(CoreBindingTest, DISABLED_WriteUnderPreserveOrKeepsTheReplacedFilesMode) 
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0640U);
 }
 
-// stage 14 writes-in-c
-TEST_F(CoreBindingTest, DISABLED_AppendAddsToTheEnd) {
+TEST_F(CoreBindingTest, AppendAddsToTheEnd) {
     bc::file_system_test::write_raw(path_of("log"), "one\n", 0644);
     const std::string path = path_text_of("log");
     const bc_file_system_location location = at(path);

@@ -59,7 +59,7 @@ struct ContractTests {
 
     // MARK: - Read and write
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func writeThenReadReturnsTheSameBytes() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("payload.bin")
@@ -72,7 +72,7 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "payload.bin") == 0o640)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func anEmptyFileRoundTrips() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("empty")
@@ -82,7 +82,7 @@ struct ContractTests {
         #expect(try observed.fileSystem.readFile(location, options: Self.wholeFileRefusingSymlink) == [])
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func aFileLargerThanAnyInternalBufferRoundTrips() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("large.bin")
@@ -93,7 +93,7 @@ struct ContractTests {
         #expect(try observed.fileSystem.readFile(location, options: Self.wholeFileRefusingSymlink) == bytes)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func writeReplacesTheContentAndLeavesNoTemporaryFile() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("config")
@@ -142,7 +142,7 @@ struct ContractTests {
         #expect(try observed.fileSystem.status(try observed.location("absent.txt"), finalSymlink: .refuse) == nil)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func writeIntoADirectoryThatIsNotThereIsNotFound() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("missing/file")
@@ -194,7 +194,7 @@ struct ContractTests {
         #expect(error?.kind == .notRegularFile)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func writeRefusesADestinationThatIsASymlink() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("behind the link", to: "target.txt", mode: 0o644)
@@ -241,7 +241,7 @@ struct ContractTests {
         #expect(error?.systemCode == EACCES)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func writeIntoADirectoryWithoutPermissionIsPermissionDenied() throws {
         let observed = try observedFileSystem()
         guard try observed.root.permissionsAreEnforced() else {
@@ -259,11 +259,12 @@ struct ContractTests {
 
     // MARK: - Durability
 
-    /// A directory sync that fails after the rename is not an error: the file is already replaced, and the call
-    /// reports the durability it did achieve. Files can be created in a directory with mode 0o300, but the
-    /// directory cannot be opened for the sync.
-    @Test(.disabled("stage 14 writes-in-c"))
-    func durableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten() throws {
+    /// A directory with mode 0o300 lets a path-based open create files in it, but the engine never opens by
+    /// path: the walk holds the destination's directory as a descriptor, opened read-only, which the mode
+    /// forbids. So the write is refused on the way and nothing is created. (A directory sync that fails after
+    /// the rename answering `written` is scripted and proven in the C++ suite.)
+    @Test
+    func writeIntoADirectoryTheProcessCannotOpenIsPermissionDenied() throws {
         let observed = try observedFileSystem()
         guard try observed.root.permissionsAreEnforced() else {
             return  // this process opens what its permission bits forbid; no such failure can happen
@@ -271,15 +272,16 @@ struct ContractTests {
         try observed.root.rawMakeDirectory("write-only", mode: 0o300)
         let location = try observed.location("write-only/file")
 
-        let achieved = try observed.fileSystem.writeFile(
-            location, bytes: Array("content".utf8), options: Self.durableExactly0644)
+        let error = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.writeFile(location, bytes: Array("content".utf8), options: Self.durableExactly0644)
+        }
 
-        #expect(achieved == .written)
+        #expect(error?.kind == .permissionDenied)
         try observed.root.rawSetMode(0o700, of: "write-only")
-        #expect(try observed.root.rawRead("write-only/file") == "content")
+        #expect(try observed.root.rawExists("write-only/file") == false)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func aWrittenWriteReportsWritten() throws {
         let observed = try observedFileSystem()
 
@@ -291,7 +293,7 @@ struct ContractTests {
 
     // MARK: - Permissions
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func aReplacedFileKeepsItsModeUnderPreserveOr() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("config")
@@ -303,7 +305,7 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "config") == 0o640)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func aNewFileGetsTheStatedModeUnderPreserveOr() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("config")
@@ -313,7 +315,7 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "config") == 0o600)
     }
 
-    @Test(.disabled("stage 14 writes-in-c"))
+    @Test
     func aReplacedFileGetsTheStatedModeUnderExactly() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("config")

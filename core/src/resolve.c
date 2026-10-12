@@ -3,11 +3,11 @@
  * One shape for every open of a directory entry: `fstatat` records what is there, `openat` opens it as a
  * directory, `fstat` reads what was opened, and the two identities are compared. The walk is that shape in a
  * loop, holding one parent descriptor at a time and closing the previous one as it goes; the fast path is that
- * shape once, with the platform's one-call open in the middle. Every system call is behind the observer's
- * `before_step`, asked again on EINTR, with the errno copied on the line after the call; the errno table and
- * the gated `fstatat`, `fstat` and `openat` are shared with the operations through resolve.h, so the core has
- * one mapping and one loop per system call. Nothing here opens a leaf, reads a byte or writes one; nothing
- * allocates.
+ * shape once, with the platform's one-call open in the middle. Every system call goes through calls.h (the two
+ * opens that are the walk's own, the root by path and the platform's one-call open, keep the same shape
+ * here), so it is behind the observer's `before_step`, asked again on EINTR, with the errno copied on the
+ * line after the call, and its failure is read with the one errno table of the core. Nothing here opens a
+ * leaf, reads a byte or writes one; nothing allocates.
  */
 #include "resolve.h"
 
@@ -23,6 +23,7 @@
 
 #include <bc_file_system/bc_file_system.h>
 
+#include "calls.h"
 #include "engine.h"
 #include "owned.h"
 #include "path.h"
@@ -37,41 +38,8 @@ enum : int32_t {
 
 /* ---- The errno mapping -------------------------------------------------------------------------------------- */
 
-/* The kind each errno of the resolution layer decides, in one table read by one function. A table rather than
- * a switch because two errno names are the same number on some systems, which a switch would not compile; the
- * first row that matches wins. Anything absent is `io_failed`, with the errno kept in the error. */
-typedef struct errno_mapping {
-    int system_code;
-    int32_t kind;
-} errno_mapping;
-
-static const errno_mapping errno_mappings[] = {
-    {ENOENT, bc_file_system_error_kind_not_found},
-    {ENOTDIR, bc_file_system_error_kind_not_directory},
-    /* A symlink the system would not follow, or a loop of them: either way a symlink sat in the way. */
-    {ELOOP, bc_file_system_error_kind_symlink_refused},
-    {EACCES, bc_file_system_error_kind_permission_denied},
-    {EPERM, bc_file_system_error_kind_permission_denied},
-    {EROFS, bc_file_system_error_kind_permission_denied},
-    /* A component longer than the system takes: the path module refuses those first, so this is a contract
-     * violation the system noticed before the module could. */
-    {ENAMETOOLONG, bc_file_system_error_kind_invalid_argument},
-    {EMFILE, bc_file_system_error_kind_resource_exhausted},
-    {ENFILE, bc_file_system_error_kind_resource_exhausted},
-    {ENOMEM, bc_file_system_error_kind_resource_exhausted},
-};
-
 static int32_t kind_of(int system_code) {
-    for (size_t index = 0; index < sizeof errno_mappings / sizeof errno_mappings[0]; ++index) {
-        if (errno_mappings[index].system_code == system_code) {
-            return errno_mappings[index].kind;
-        }
-    }
-    return bc_file_system_error_kind_io_failed;
-}
-
-int32_t bc_file_system_resolve_kind_of_errno(int system_code) {
-    return kind_of(system_code);
+    return bc_file_system_call_kind_of_errno(system_code);
 }
 
 /* The kind an open of a directory entry decides, which the plain table cannot: ENOTDIR from an entry the stat
@@ -116,72 +84,7 @@ static int32_t refuse(bc_file_system_error *error, int32_t kind, int32_t operati
     return kind;
 }
 
-/* ---- The system calls, each behind the observer and asked again on EINTR ------------------------------------ */
-
-bc_file_system_call_outcome bc_file_system_resolve_fstatat(bc_file_system_engine *engine, int32_t operation, int parent,
-                                                           const char *name, int flags, struct stat *info) {
-    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
-    do {
-        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fstatat);
-        if (verdict.action == bc_file_system_step_action_stop) {
-            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
-        }
-        if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
-            continue;
-        }
-        if (fstatat(parent, name, info, flags) == 0) {
-            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
-        }
-        const int code = errno;
-        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
-    } while (outcome.code == EINTR);
-    return outcome;
-}
-
-bc_file_system_call_outcome bc_file_system_resolve_fstat(bc_file_system_engine *engine, int32_t operation,
-                                                         int descriptor, struct stat *info) {
-    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
-    do {
-        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fstat);
-        if (verdict.action == bc_file_system_step_action_stop) {
-            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
-        }
-        if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
-            continue;
-        }
-        if (fstat(descriptor, info) == 0) {
-            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
-        }
-        const int code = errno;
-        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
-    } while (outcome.code == EINTR);
-    return outcome;
-}
-
-bc_file_system_call_outcome bc_file_system_resolve_openat(bc_file_system_engine *engine, int32_t operation, int parent,
-                                                          const char *name, int flags, int *descriptor) {
-    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
-    do {
-        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_openat);
-        if (verdict.action == bc_file_system_step_action_stop) {
-            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
-        }
-        if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
-            continue;
-        }
-        const int opened = openat(parent, name, flags);
-        if (opened >= 0) {
-            *descriptor = opened;
-            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
-        }
-        const int code = errno;
-        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
-    } while (outcome.code == EINTR);
-    return outcome;
-}
+/* ---- The two opens of the walk's own, in the shape of calls.c's -------------------------------------------- */
 
 /* The one open by path in the core: the root, where every absolute path starts. */
 static bc_file_system_call_outcome open_root(bc_file_system_engine *engine, int32_t operation, int *descriptor) {
@@ -245,7 +148,7 @@ static bool same_identity(const bc_file_system_expected_entry *expected, const s
 static int32_t verify_opened_identity(bc_file_system_engine *engine, int32_t operation, int descriptor,
                                       const bc_file_system_expected_entry *expected, bc_file_system_error *error) {
     struct stat actual;
-    const bc_file_system_call_outcome read = bc_file_system_resolve_fstat(engine, operation, descriptor, &actual);
+    const bc_file_system_call_outcome read = bc_file_system_call_fstat(engine, operation, descriptor, &actual);
     if (!read.succeeded) {
         return report_outcome(error, operation, bc_file_system_step_fstat, &read, kind_of(read.code));
     }
@@ -284,7 +187,7 @@ int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32
     const int flags = final_symlink == bc_file_system_final_symlink_refuse ? AT_SYMLINK_NOFOLLOW : 0;
     struct stat info;
     const bc_file_system_call_outcome outcome =
-        bc_file_system_resolve_fstatat(engine, operation, parent, name, flags, &info);
+        bc_file_system_call_fstatat(engine, operation, parent, name, flags, &info);
     if (!outcome.succeeded) {
         return report_outcome(error, operation, bc_file_system_step_fstatat, &outcome, kind_of(outcome.code));
     }
@@ -313,7 +216,7 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
         final_symlink == bc_file_system_final_symlink_refuse ? directory_open_flags | O_NOFOLLOW : directory_open_flags;
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor candidate = {.value = -1};
     const bc_file_system_call_outcome outcome =
-        bc_file_system_resolve_openat(engine, operation, parent, name, flags, &candidate.value);
+        bc_file_system_call_openat(engine, operation, parent, name, flags, &candidate.value);
     if (!outcome.succeeded) {
         return report_outcome(error, operation, bc_file_system_step_openat, &outcome,
                               kind_of_open_failure(outcome.code, expected));

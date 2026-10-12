@@ -84,28 +84,39 @@ struct BindingTests {
         #expect(String(decoding: bytes, as: UTF8.self) == "content")
     }
 
+    /// The write operation is real: the bytes and the mode land, and the durability achieved comes back.
     @Test func writeFileReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.writeFile, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.writeFile(
-                try observed.location("file"), bytes: Array("content".utf8), options: Self.writtenExactly0644)
-        }
+
+        let achieved = try observed.fileSystem.writeFile(
+            try observed.location("file"), bytes: Array("content".utf8), options: Self.writtenExactly0644)
+
+        #expect(achieved == .written)
+        #expect(try observed.root.rawRead("file") == "content")
+        #expect(try observed.root.rawMode(of: "file") == 0o644)
     }
 
+    /// The append operation is real: a file it creates gets the mode, and the bytes are in it.
     @Test func appendReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.append, path: observed.root.absolutePath(of: "log")) { () throws(FileSystemError) in
-            try observed.fileSystem.append(
-                try observed.location("log"), bytes: Array("entry\n".utf8), durability: .written,
-                permissions: .exactly(mode: 0o644))
-        }
+
+        let achieved = try observed.fileSystem.append(
+            try observed.location("log"), bytes: Array("entry\n".utf8), durability: .written,
+            permissions: .exactly(mode: 0o644))
+
+        #expect(achieved == .written)
+        #expect(try observed.root.rawRead("log") == "entry\n")
+        #expect(try observed.root.rawMode(of: "log") == 0o644)
     }
 
+    /// The sync operation is real: a file this platform can sync answers `durable`.
     @Test func syncReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.sync, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.sync(try observed.location("file"))
-        }
+        try observed.root.rawWrite("content", to: "file", mode: 0o644)
+
+        let achieved = try observed.fileSystem.sync(try observed.location("file"))
+
+        #expect(achieved == .durable)
     }
 
     @Test func createDirectoryReachesC() throws {
@@ -754,7 +765,7 @@ struct BindingTests {
     }
 
     /// A NULL byte pointer with a length of 0 is the stated way to pass no bytes, not a contract violation: the
-    /// stub gets past its checks and answers `unsupported`.
+    /// write gets past its checks and creates the empty file.
     @Test func writeOfNoBytesWithANullPointerIsNotAContractViolation() throws {
         let observed = try observedFileSystem()
         let path = Array(observed.root.absolutePath(of: "empty").utf8)
@@ -769,7 +780,9 @@ struct BindingTests {
             }
         }
 
-        #expect(outcome == Int32(bc_file_system_error_kind_unsupported.rawValue))
+        #expect(outcome == 0)
+        #expect(achieved == Int32(bc_file_system_durability_written.rawValue))
+        #expect(try observed.root.rawRead("empty") == "")
     }
 
     /// The error `operation` throws; records an issue and answers nil when it throws nothing.
