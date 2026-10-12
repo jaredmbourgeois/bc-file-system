@@ -1,13 +1,13 @@
-#!/usr/bin/env python3
 """check_build_parity.py — the three builds compile the same C the same way.
 
 CMake, SwiftPM and Cargo (through `cc`) each compile `core/src/*.c`, and each spells the C standard in its own
 manifest: `CMAKE_C_STANDARD 23` with `CMAKE_C_EXTENSIONS ON` in `CMakeLists.txt`, `cLanguageStandard: .gnu2x` in
 `Package.swift`, `.std("gnu2x")` in each `crates/*/build.rs`. This script reads every manifest that exists and
 reports, per manifest, whether it agrees with the CMake root (the reference), drifts from it, or is absent. An
-absent manifest is reported by name as absent, never as agreeing: `crates/` arrives at stage `rust-crates`, and
-until then its line says so. It also holds CMake's core source list (`core/CMakeLists.txt`) equal to the files
-under `core/src/*.c`, so a file one build compiles and another does not cannot exist.
+absent manifest is reported by name as absent, never as agreeing (a build system that is not there has not
+agreed to anything). It also holds CMake's core source list (`core/CMakeLists.txt`) equal to the files under
+`core/src/*.c`, so a file one build compiles and another does not cannot exist; SwiftPM compiles the `src`
+directory and `build.rs` reads it, so those two lists are the directory by construction.
 
 Exit 0 when every present manifest agrees and the source lists match, 1 on a drift, 2 when blind (the CMake
 root or `core/CMakeLists.txt` cannot be read, or the command line is wrong). Python 3.9+, stdlib only.

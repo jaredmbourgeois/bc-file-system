@@ -12,7 +12,7 @@
 # target) says so on standard error before its PASS.
 set -euo pipefail
 
-ALL_LEGS="build-debug build-sanitized header-four-ways path-freestanding guards consumer swift clang-tidy fuzz-smoke"
+ALL_LEGS="build-debug build-sanitized header-four-ways path-freestanding guards consumer swift rust clang-tidy fuzz-smoke"
 
 pass() {
     printf 'PASS %s\n' "$1"
@@ -91,6 +91,18 @@ leg_swift() {
     pass swift
 }
 
+# The Rust workspace under crates/: formatting, clippy over every target with warnings denied, and the tests,
+# each `--locked` so the committed Cargo.lock is the one resolution. The build script compiles the C core with
+# the host's C compiler, so this leg proves the core builds the way a Rust consumer builds it.
+leg_rust() {
+    command -v cargo > /dev/null || fail rust "cargo is not on PATH; the Rust crate was not built or tested"
+    local manifest=crates/Cargo.toml
+    cargo fmt --manifest-path "$manifest" --check || fail rust "cargo fmt --check: the Rust is not formatted"
+    cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings || fail rust "cargo clippy"
+    cargo test --manifest-path "$manifest" --locked || fail rust "cargo test"
+    pass rust
+}
+
 # Report-only this stage: the findings are printed and the leg passes whenever clang-tidy ran. Two sweeps, one
 # per language directory, each under that directory's own .clang-tidy (clang-tidy reads the nearest one).
 leg_clang_tidy() {
@@ -149,6 +161,7 @@ run_leg() {
         guards) leg_guards ;;
         consumer) leg_consumer "$root" ;;
         swift) leg_swift ;;
+        rust) leg_rust ;;
         clang-tidy) leg_clang_tidy ;;
         fuzz-smoke) leg_fuzz_smoke ;;
         *) fail "$leg" "unknown leg; the legs are: $ALL_LEGS" ;;

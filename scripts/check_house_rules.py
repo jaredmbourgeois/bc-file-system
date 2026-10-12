@@ -1,14 +1,14 @@
-#!/usr/bin/env python3
-"""check_house_rules.py — the house rules over this repository's C, C++, Swift, Python and CMake.
+"""check_house_rules.py — the house rules over this repository's C, C++, Rust, Swift, Python and CMake.
 
 `scripts/verify.sh` runs it as `--selftest` followed by a scan of the tree. The rules are stated in AGENTS.md
 ("Inject, never reach", "No default arguments", "No macros"); this script checks the part of them a program can
 check, one finding per violation, each named for its rule:
 
-    c-/cpp-/swift-ambient-reach   code obtaining something from the process around it (an operating-system
+    c-/cpp-/rust-/swift-ambient-reach
+                                  code obtaining something from the process around it (an operating-system
                                   header, the environment, a file opened directly, a clock, a sleep, a random
-                                  source, the working or temporary directory, a process stream) outside the
-                                  files REACH_IS_LEGAL_IN names; a `reach-ok:` marker outside them is a finding
+                                  source, the working or temporary directory, a process or its streams) outside
+                                  the files REACH_IS_LEGAL_IN names; a `reach-ok:` marker outside them is a finding
     c-/cpp-library-stream         the library writing a process stream (tests and examples may)
     cpp-/swift-/python-parameter-default
                                   a parameter default, except the caller-context captures and a Python `@override`
@@ -95,17 +95,30 @@ class Configuration:
 # ======================================================================================================
 
 CONFIGURATION: Final = Configuration(
-    expected_languages=("c", "cpp", "swift", "python", "cmake"),
+    expected_languages=("c", "cpp", "rust", "swift", "python", "cmake"),
     reach_is_legal_in={
-        # The body of the seam's one live implementation (the engine and its platform header), and the one
-        # composition root in C (the consumer example's `main`).
-        "c": ("core/src/bc_file_system.c", "core/src/platform.h", "examples/consumer/main.c"),
+        # The body of the seam's one live implementation (the engine, its platform header and the platform
+        # bodies), and the one composition root in C (the consumer example's `main`).
+        "c": (
+            "core/src/bc_file_system.c",
+            "core/src/platform.h",
+            "core/src/platform.c",
+            "examples/consumer/main.c",
+        ),
         # The one C++ file that names `bc_file_system_engine_create_live` (the face's live factory), and the tests'
         # own file system: the temporary directory and the descriptor-balance fixture.
         "cpp": (
             "cpp/src/engine.cpp",
             "cpp/tests/support/temp_directory.cpp",
             "cpp/tests/support/descriptor_balance.cpp",
+        ),
+        # The build script (the build's composition root: cargo's environment and the directory of C sources),
+        # the one Rust file that names the live factory (`Engine::live`), and the ABI smoke, which creates a live
+        # engine to prove the declarations against the real core.
+        "rust": (
+            "crates/bc-file-system/build.rs",
+            "crates/bc-file-system/src/live.rs",
+            "crates/bc-file-system/tests/abi_smoke.rs",
         ),
         # The fixtures' temporary directory: the one place `swift test` reads where its root is.
         "swift": ("Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift",),
@@ -119,14 +132,18 @@ CONFIGURATION: Final = Configuration(
     macro_exception_pin=0,
     face_parity_header="core/include/bc_file_system/bc_file_system.h",
     face_parity_prefix="bc_file_system_",
-    # The C++ face this stage; the Swift row is added at stage `swift-package`, the Rust row at `rust-crates`. The
-    # leg looks for each C name where the face calls it, so a method named differently from its C function still
+    # The C++ face, and the Rust face's declarations; the Swift row is added at stage `swift-package`. The leg
+    # looks for each C name where the face calls it, so a method named differently from its C function still
     # passes; the renamed ones, for the reader: bc_file_system_directory_open -> FileSystem::open_directory,
     # bc_file_system_status_of -> FileSystem::status, bc_file_system_directory_opened_as -> Directory::opened_as,
     # bc_file_system_engine_release / directory_release / lock_release -> the three destructors,
     # bc_file_system_observed_fault_add / faults_clear / step_count -> Engine::add_fault / clear_faults / step_count.
+    # The Rust row holds every function declared (ffi.rs mirrors the whole header by hand) while the typed face
+    # over them (live.rs) carries the engine, the observer and one operation; the typed face grows at stage
+    # `rust-crates`, and this row then reads the typed files alone.
     face_parity_faces={
         "C++": ("cpp/src/engine.cpp", "cpp/src/error.cpp", "cpp/src/file_system.cpp", "cpp/src/path.cpp"),
+        "Rust": ("crates/bc-file-system/src/ffi.rs", "crates/bc-file-system/src/live.rs"),
     },
     test_only_factory_patterns=(
         r"\bbc_file_system_engine_create_observed_for_tests\b",
@@ -139,6 +156,10 @@ CONFIGURATION: Final = Configuration(
         "cpp/include/bc_file_system/engine.hpp",
         "cpp/src/engine.cpp",
         "cpp/tests/",
+        "core/tests/",
+        "crates/bc-file-system/src/ffi.rs",
+        "crates/bc-file-system/src/live.rs",
+        "crates/bc-file-system/tests/",
         "Sources/BCFileSystemTestFixtures/",
         "Tests/",
     ),
@@ -285,6 +306,41 @@ SWIFT_REACH_VOCABULARY: Final = (
 )
 # In a test, naming the live value is the reach that spreads.
 SWIFT_TEST_REACH_VOCABULARY: Final = (reach(".live in a test", r"\.\s*live\b", "let files = FileSystem.live"),)
+# What Rust code may not obtain for itself: the standard library's doors to the process, each a path a value or
+# a seam is handed instead. `environment.var(` and `files.read(` are seams, not reaches.
+RUST_REACH_VOCABULARY: Final = (
+    reach(
+        "the environment or the process facts (std::env)",
+        r"\benv\s*::\s*(var|var_os|vars|vars_os|args|args_os|current_dir|temp_dir|home_dir|current_exe)\s*\(",
+        'let home = env::var("HOME");',
+    ),
+    reach(
+        "the file system (std::fs, File::open, OpenOptions)",
+        r"\bfs\s*::\s*\w+\s*\(|\bFile\s*::\s*(open|create|create_new|options)\s*\(|\bOpenOptions\s*::\s*new\s*\(",
+        "let text = fs::read_to_string(path);",
+    ),
+    reach(
+        "a clock (SystemTime::now, Instant::now)",
+        r"\b(SystemTime|Instant)\s*::\s*now\s*\(",
+        "let start = Instant::now();",
+    ),
+    reach("a sleep (thread::sleep)", r"\b(thread\s*::\s*)?sleep\s*\(", "thread::sleep(delay);"),
+    reach(
+        "a random source (rand, thread_rng, random)",
+        r"\brand\s*::|\bthread_rng\s*\(|\brandom\s*\(",
+        "let value = rand::random::<u32>();",
+    ),
+    reach(
+        "a process spawned, exited or identified (std::process, Command)",
+        r"\bprocess\s*::\s*(exit|abort|id|Command)\b|\bCommand\s*::\s*new\s*\(",
+        'let status = Command::new("ls").status();',
+    ),
+    reach(
+        "a process stream (print!, println!, eprint!, eprintln!, dbg!, io::stdin/stdout/stderr)",
+        r"\b(e?print(ln)?|dbg)\s*!|\bio\s*::\s*(stdin|stdout|stderr)\s*\(",
+        'println!("done");',
+    ),
+)
 # What the library may not write to. Tests and examples may.
 STDIO_STREAM_VOCABULARY: Final = (
     reach(
@@ -368,7 +424,7 @@ def literal_length(source: str, opening: re.Match[str], language: str) -> int:
     else:
         closing = opening.group(0)
         escape = "\\"
-    ends_at_newline = not (closing.startswith('"""') or closing.startswith(")"))
+    ends_at_newline = not closing.startswith(('"""', ")"))
     index = opening.end()
     while index < len(source) and not source.startswith(closing, index):
         if escape is not None and source.startswith(escape, index):
@@ -796,8 +852,7 @@ def cmake_definition_names(tokens: list[str]) -> list[str]:
     for token in tokens:
         if token in CMAKE_SCOPE_KEYWORDS:
             continue
-        if token.startswith("-D"):
-            token = token[2:]
+        token = token.removeprefix("-D")
         if "$<" in token:
             token = token.rsplit(":", 1)[-1].rstrip(">")
         name = token.split("=", 1)[0].strip('"')
@@ -968,6 +1023,9 @@ def file_findings(source: str, path: str, language: str, configuration: Configur
         if path.endswith(HEADER_SUFFIXES):
             findings += include_guard_findings(source, path, "cpp-include-guard")
     elif language == "rust":
+        findings += reach_findings(
+            source, path, "rust-ambient-reach", RUST_REACH_VOCABULARY, legal.get("rust", ()), "c"
+        )
         findings += macro_findings(source, path, "rust-macro-rules", knobs, exceptions, MACRO_RULES)
         if path.endswith("build.rs"):
             findings += define_findings(source, path, "rust-build-define", knobs)
@@ -1127,6 +1185,17 @@ SWIFT_REACH_NEAR_MISSES: Final = (
     "let printed = printer(text)",
     "func exitCode() -> Int { 0 }",
 )
+RUST_REACH_NEAR_MISSES: Final = (
+    'let home = environment.var("HOME");',
+    "let text = files.read_to_string(path);",
+    "// fs::read is what this crate does not call.",
+    'let advice = "call env::var at the root";',
+    "let started = clock.now();",
+    "let printed = printer.render(text);",
+    "fn sleepy(budget: Duration) -> Duration { budget }",
+    "let id = random_identifier(entropy);",
+    "let answer = process_answer(bytes);",
+)
 STREAM_NEAR_MISSES: Final = (
     "std::string text = format_error(error);",
     "// std::cout is for programs, not for the library.",
@@ -1201,6 +1270,7 @@ SELFTEST_CONFIGURATION: Final = Configuration(
     reach_is_legal_in={
         "c": ("core/src/live.c",),
         "cpp": ("core/src/live.cpp",),
+        "rust": ("crates/planted/src/live.rs",),
         "swift": ("Tests/PlantedTests/TemporaryDirectory.swift",),
     },
     library_directories=("core/",),
@@ -1274,6 +1344,14 @@ def selftest(output: TextIO) -> bool:
             CPP_REACH_NEAR_MISSES,
             "core/src/planted.cpp",
             "core/test/planted_test.cpp",
+        ),
+        (
+            "rust-ambient-reach",
+            "rust",
+            RUST_REACH_VOCABULARY,
+            RUST_REACH_NEAR_MISSES,
+            "crates/planted/src/planted.rs",
+            "crates/planted/tests/planted.rs",
         ),
         (
             "swift-ambient-reach",
@@ -1434,6 +1512,9 @@ def selftest(output: TextIO) -> bool:
         (root / "crates" / "planted" / "src").mkdir(parents=True)
         (root / "crates" / "planted" / "src" / "admitted.rs").write_text(
             "macro_rules! admitted { () => {} }  // macro-ok: variadic composition\n", encoding="utf-8"
+        )
+        (root / "crates" / "planted" / "src" / "live.rs").write_text(
+            'let home = env::var("HOME");  // reach-ok: the selftest\'s live site\n', encoding="utf-8"
         )
         clean_result = scan_tree(root, configuration, io.StringIO())
         expect(

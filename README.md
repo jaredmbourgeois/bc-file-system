@@ -20,7 +20,9 @@ and `bc_file_system` (C++), linked as `bc::file_system_core` and `bc::file_syste
 
 The published consumer-host floor is GCC 14, clang 19, Apple clang 21 (Xcode 27), NDK r28 or later and
 Emscripten 2025 or later: C23 in its GNU dialect with `<stdckdint.h>`. A host below it fails at the floor check
-in the core's private platform header with a clear error.
+in the core's private platform header with a clear error. The Rust crate `bc-file-system` (`crates/`, Rust 1.89
+or later, `publish = false`: pin it by git SHA) compiles the same core with the consumer's own C compiler, so the
+floor is its floor too, and its build script names the floor and the compiler it found when a host falls below.
 
 ## Building and testing
 
@@ -29,7 +31,8 @@ cmake --preset debug && cmake --build --preset debug && ctest --preset debug
 cmake --preset sanitized && cmake --build --preset sanitized && ctest --preset sanitized   # ASan + UBSan
 cmake --preset hardened && cmake --build --preset hardened                                 # the production posture
 swift test
-bash scripts/verify.sh            # every leg: both builds, the header four ways, the guards, the consumer, swift test
+cargo test --manifest-path crates/Cargo.toml --locked
+bash scripts/verify.sh            # every leg: both builds, the header four ways, the guards, the consumer, swift test, cargo
 ```
 
 Build output goes under `build/<preset>/`. GoogleTest is fetched by CMake, pinned to a commit, and only when this
@@ -43,6 +46,9 @@ Stage 9 of its plan, `salvaged-under-the-new-name`: the public header, an honest
 `unsupported` to every operation, the C++ face, the contract suite (red or disabled until each operation's stage),
 the binding suites, the Swift skeleton, the guards and CI. Stage 10 `path-module` is in: the path module (`core/src/path.c`), the freestanding tier of the core, compiled
 on every build under `-ffreestanding` and for bare wasm32, proven by a C-only test and fuzzed under the `fuzz`
-preset. The remaining operations land in C group by group over the next stages (the engine and its errors, the
-resolution layer, status and reads, writes, directories, moves and copies, locks and links); `0.1.0` is tagged
-when every face is green on every platform.
+preset. Stage 11 `engine-and-errors` is in: the engine probes the platform's fast paths once at creation, the
+observer's mechanics are real (every step counted, a scripted fault firing at its occurrence, a stop as a
+verdict), the platform layer has its durable sync and no-replace rename, and the Rust crate's ABI smoke proves
+the hand-written declarations against the core. The remaining operations land in C group by group over the next
+stages (the resolution layer, status and reads, writes, directories, moves and copies, locks and links); `0.1.0`
+is tagged when every face is green on every platform.

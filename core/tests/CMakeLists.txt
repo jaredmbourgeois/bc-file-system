@@ -1,9 +1,19 @@
-# The C-only test of the path module: a `.c` main over tables of cases, registered with add_test (the non-gtest
-# form), so the module is proven through the public header alone, with no face in between. The contract and
-# binding suites under cpp/tests/ drive the same functions through the C++ face.
+# The C-only tests, each a `.c` main over tables of cases, registered with add_test (the non-gtest form). The
+# path test proves the path module through the public header alone, with no face in between; the engine test
+# drives the observer's hooks and the platform probes through the core's private headers (engine.h, platform.h),
+# which no face can reach. The contract and binding suites under cpp/tests/ drive the same core through the C++
+# face.
 add_executable(bc_file_system_path_test
     path_test.c
 )
 target_link_libraries(bc_file_system_path_test PRIVATE bc::file_system_core)
 bc_file_system_set_compile_options(bc_file_system_path_test)
 add_test(NAME bc_file_system_path_test COMMAND bc_file_system_path_test)
+
+add_executable(bc_file_system_engine_test
+    engine_test.c
+)
+target_link_libraries(bc_file_system_engine_test PRIVATE bc::file_system_core)
+target_include_directories(bc_file_system_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+bc_file_system_set_compile_options(bc_file_system_engine_test)
+add_test(NAME bc_file_system_engine_test COMMAND bc_file_system_engine_test)

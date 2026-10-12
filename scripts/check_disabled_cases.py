@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """check_disabled_cases.py — the disabled-case count is pinned, and the pin only falls.
 
 A contract case that cannot pass against the core yet is written complete and disabled with the stage that turns

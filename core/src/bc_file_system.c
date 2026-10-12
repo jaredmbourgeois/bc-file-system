@@ -4,22 +4,25 @@
  * the test observer's slot and every operation. It is C23 in the GNU dialect; the public header it implements
  * is the common subset, and the platform differences are behind platform.h.
  *
- * Where the library stands: the handles and the observer's bookkeeping are real, and every operation on the
- * file system is an honest stub. Each one validates its arguments exactly as the header promises (a contract
- * violation is `invalid_argument` and touches nothing) and then answers `unsupported` with the operation named
- * and the step zero, so every contract case is red for a stated reason until the stage that builds it. Nothing
- * here opens a file yet, so the cleanup idiom (`[[gnu::cleanup]]` on an owned descriptor) is not needed yet.
+ * Where the library stands: the handles, the platform probes and the observer are real, and every operation on
+ * the file system is an honest stub. Each one validates its arguments exactly as the header promises (a contract
+ * violation is `invalid_argument` and touches nothing), announces itself to the observer, and then answers
+ * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
+ * until the stage that builds it. Nothing here opens a file yet, so the cleanup idiom (`[[gnu::cleanup]]` on an
+ * owned descriptor) is not needed yet.
  */
 #include <bc_file_system/bc_file_system.h>
 
 #include <unistd.h>
 
+#include <assert.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "engine.h"
 #include "path.h"
 #include "platform.h"
 
@@ -84,16 +87,16 @@ enum : int32_t {
 
 struct bc_file_system_engine {
     /* Created by the observed factory: the fault slot and the step counters are live. A live engine carries the
-     * same fields and never touches them, which is the one indirect decision per step a release build pays. */
+     * same fields and never touches them, which is the one decision per step a release build pays. */
     bool observed;
-    /* The platform's fast paths, probed once by the live factory (the resolution layer fills these in); every
-     * probe reads "absent" until then, and under the portable_only test run. */
-    bool has_openat2;
-    bool has_rename_no_replace;
-    bool has_clone;
+    /* The platform's fast paths, probed once by whichever factory created the engine and read by the operations
+     * that have one (the resolution layer, writes, moves and copies). */
+    bc_file_system_platform_fast_paths fast_paths;
     uint32_t fault_count;
     bc_file_system_fault faults[fault_capacity];
-    /* How many times each operation has reached each step; row and column 0 are unused because 0 is no value. */
+    /* How many times each operation has reached each step. Row 0 is unused because 0 is no operation; column 0
+     * of each row holds how many times that operation began (`before_operation`), which the public step count
+     * never reads because 0 is no step. */
     uint64_t step_counts[operation_last + 1][step_last + 1];
 };
 
@@ -218,19 +221,20 @@ static int32_t create_engine(bool observed, int32_t operation, bc_file_system_en
     if (engine == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
-    /* calloc zeroes the probes, the fault slot and every counter in one step. */
+    /* calloc zeroes the fault slot and every counter in one step. */
     bc_file_system_engine *created = calloc(1, sizeof *created);
     if (created == nullptr) {
         return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
     }
     created->observed = observed;
+    /* Probed once, here, so no operation asks the kernel twice; the observed engine probes the same way, so the
+     * suite runs over the same fast paths a composition root gets. */
+    created->fast_paths = bc_file_system_platform_probe_fast_paths();
     *engine = created;
     return succeed(error);
 }
 
 int32_t bc_file_system_engine_create_live(bc_file_system_engine **engine, bc_file_system_error *error) {
-    /* The platform probes (openat2, the no-replace rename, cloning) run here once the resolution layer lands;
-     * until then every fast path reads as absent. */
     return create_engine(false, bc_file_system_operation_engine_create_live, engine, error);
 }
 
@@ -285,6 +289,60 @@ int32_t bc_file_system_observed_step_count(const bc_file_system_engine *engine, 
     return succeed(error);
 }
 
+/* ---- The observer's hooks (engine.h) --------------------------------------------------------------------- */
+
+const bc_file_system_platform_fast_paths *bc_file_system_engine_fast_paths(const bc_file_system_engine *engine) {
+    return &engine->fast_paths;
+}
+
+void bc_file_system_engine_before_operation(bc_file_system_engine *engine, int32_t operation) {
+    assert(is_in_enum(operation, operation_last));
+    if (!engine->observed) {
+        return;
+    }
+    engine->step_counts[(size_t)operation][0] += 1;
+}
+
+/* The one fault that fires now, if any: the first in the slot whose operation and step match and whose
+ * occurrence is this count. It leaves the slot by being overwritten with the last entry, which keeps the slot
+ * dense; the order of the faults carries no meaning, since a fault is identified by its three numbers. */
+static bool take_firing_fault(bc_file_system_engine *engine, int32_t operation, int32_t step, uint64_t count,
+                              bc_file_system_fault *fired) {
+    for (uint32_t index = 0; index < engine->fault_count; ++index) {
+        const bc_file_system_fault *candidate = &engine->faults[index];
+        if (candidate->operation != operation || candidate->step != step || candidate->occurrence != count) {
+            continue;
+        }
+        *fired = *candidate;
+        engine->fault_count -= 1;
+        engine->faults[index] = engine->faults[engine->fault_count];
+        return true;
+    }
+    return false;
+}
+
+void bc_file_system_engine_before_step(bc_file_system_engine *engine, int32_t operation, int32_t step,
+                                       bc_file_system_step_verdict *verdict) {
+    assert(is_in_enum(operation, operation_last));
+    assert(is_in_enum(step, step_last));
+    *verdict = (bc_file_system_step_verdict){.action = bc_file_system_step_action_proceed, .system_code = 0};
+    if (!engine->observed) {
+        return;
+    }
+    /* A step belongs to an operation that announced itself; a helper that counts under a name its caller never
+     * began is the bug this catches. */
+    assert(engine->step_counts[(size_t)operation][0] > 0);
+    engine->step_counts[(size_t)operation][(size_t)step] += 1;
+    const uint64_t count = engine->step_counts[(size_t)operation][(size_t)step];
+    bc_file_system_fault fired;
+    if (!take_firing_fault(engine, operation, step, count, &fired)) {
+        return;
+    }
+    /* The fault's action values are the verdict's, so the verdict is the fault read as one. */
+    verdict->action = fired.action;
+    verdict->system_code = fired.system_code;
+}
+
 /* ---- Directories and locks ----------------------------------------------------------------------------------- */
 
 int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -298,6 +356,7 @@ int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_fi
         directory == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
 }
 
@@ -345,8 +404,10 @@ void bc_file_system_lock_release(bc_file_system_lock *lock) {
 
 /* ---- Operations --------------------------------------------------------------------------------------------- */
 
-/* Every operation below checks its contract and then answers `unsupported` with its operation named: the honest
- * stub, replaced group by group by the stage each comment names. */
+/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
+ * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
+ * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
+ * names. */
 
 int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_system_location *location,
                                  int32_t final_symlink, int32_t *present, bc_file_system_status *status,
@@ -359,6 +420,7 @@ int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_sy
         present == nullptr || status == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
 }
 
@@ -373,6 +435,7 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
         !is_answer_buffer(buffer, capacity, length)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
 }
 
@@ -387,6 +450,7 @@ int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_s
         !is_valid_write_options(options) || durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 14 writes-in-c */
 }
 
@@ -403,6 +467,7 @@ int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_syste
         durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 14 writes-in-c */
 }
 
@@ -415,6 +480,7 @@ int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_
     if (engine == nullptr || !is_valid_location(location) || durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 14 writes-in-c */
 }
 
@@ -427,6 +493,7 @@ int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_
     if (engine == nullptr || !is_valid_location(location) || !is_valid_permissions(permissions)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -439,6 +506,7 @@ int32_t bc_file_system_create_directories(bc_file_system_engine *engine, const b
     if (engine == nullptr || !is_valid_location(location) || !is_valid_permissions(permissions)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -453,6 +521,7 @@ int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_fi
         (entries == nullptr && capacity != 0) || count == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -465,6 +534,7 @@ int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_
     if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -477,6 +547,7 @@ int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_
     if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -489,6 +560,7 @@ int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_
     if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -503,6 +575,7 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
         !is_answer_buffer(buffer, capacity, length)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -518,6 +591,7 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
         durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 16 moves-and-copies-in-c */
 }
 
@@ -533,6 +607,7 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
         !is_valid_write_options(options) || durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 16 moves-and-copies-in-c */
 }
 
@@ -546,6 +621,7 @@ int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_f
         !is_in_enum(final_symlink, final_symlink_last)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
@@ -558,6 +634,7 @@ int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8
     if (engine == nullptr || !is_byte_span(target, target_length) || !is_valid_location(location)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
 }
 
@@ -570,6 +647,7 @@ int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file
     if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
 }
 
@@ -582,6 +660,7 @@ int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_sys
     if (engine == nullptr || !is_valid_location(location) || lock == nullptr || outcome == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
 }
 
@@ -594,6 +673,7 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
     if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
 }
 
@@ -606,5 +686,6 @@ int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_
     if (engine == nullptr || !is_valid_location(parent)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
 }

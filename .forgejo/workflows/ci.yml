@@ -10,17 +10,21 @@ on:
 
 # Every job is one leg of scripts/verify.sh (its name is the leg's name), so "green locally" and "green in CI"
 # cannot drift; the workflow chooses the compiler and nothing else. The runner is Debian 13 with GCC 14,
-# clang 19, Swift 6.4, CMake, Ninja and Python 3 on PATH; the jobs install nothing. The one thing fetched is
-# GoogleTest, by CMake, pinned to a commit.
+# clang 19, Swift 6.4, CMake, Ninja and Python 3 on PATH; the jobs install nothing but the Rust toolchain the
+# `rust` job pins through rustup (the shape bc-plumb's workflow uses on the same runner). The one other thing
+# fetched is GoogleTest, by CMake, pinned to a commit.
 #
 # Not here yet, gated on workstation `ci-forgejo-runner-posture` stage `bc-file-system-job-packages` (the runner
 # has no musl, NDK or Emscripten): the NDK compile legs at API 30, 33 and 35; Emscripten (MEMFS and NODERAWFS
-# under Node); x86_64 musl native and aarch64 musl under qemu-user-static; memory-sanitized; build-clang's
-# sanitized leg (clang-19's compiler-rt, libclang-rt-19-dev: without it the sanitized link fails on
-# libclang_rt.asan*.a); and the `fuzz-smoke` leg (libFuzzer is in that same compiler-rt package), which runs on
-# the Mac by hand (`bash scripts/verify.sh fuzz-smoke`) until then. Each lands as its own job when its packages
-# do. The wasm32 freestanding compile of the path module needs no package: clang-19 has the target, so the
-# path-freestanding job below runs under it.
+# under Node); x86_64 musl native and aarch64 musl under qemu-user-static, for the C build and for `cargo test`
+# on the two musl targets `x86_64-unknown-linux-musl` (musl-gcc from musl-tools) and
+# `aarch64-unknown-linux-musl` (clang-19 `--target=aarch64-linux-musl` over musl-dev:arm64 headers, named per
+# target through CC_<triple>; no cargo-zigbuild on the Mac either); memory-sanitized; build-clang's sanitized
+# leg (clang-19's compiler-rt, libclang-rt-19-dev: without it the sanitized link fails on libclang_rt.asan*.a);
+# and the `fuzz-smoke` leg (libFuzzer is in that same compiler-rt package), which runs on the Mac by hand
+# (`bash scripts/verify.sh fuzz-smoke`) until then. Each lands as its own job when its packages do. The wasm32
+# freestanding compile of the path module needs no package: clang-19 has the target, so the path-freestanding
+# job below runs under it.
 jobs:
   build-gcc:
     runs-on: debian-13
@@ -72,3 +76,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/verify.sh consumer
+
+  # The Rust workspace, on the crate's MSRV and one pinned stable, never the moving channel, so a push is red
+  # only for what it changed; the pin moves in one commit with that release's lint fixes. The build script
+  # compiles the C core with the runner's `cc` (GCC 14), the way a Rust consumer on this host would.
+  rust:
+    runs-on: debian-13
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.89.0", "1.98.0"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+      - name: Cache cargo
+        uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            crates/target
+          key: cargo-${{ matrix.rust }}-${{ hashFiles('crates/Cargo.lock') }}
+          # A leg with no cache of its own (a pinned stable just bumped) starts from the MSRV leg's: the
+          # registry carries over, and cargo rebuilds what another compiler built.
+          restore-keys: |
+            cargo-${{ matrix.rust }}-
+            cargo-1.89.0-
+      - run: bash scripts/verify.sh rust

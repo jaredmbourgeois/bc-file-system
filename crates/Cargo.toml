@@ -1,0 +1,17 @@
+# The Rust workspace: a virtual root so one Cargo.lock pins every crate under crates/ together. The binding
+# crate `bc-file-system` compiles the C core from ../core through `cc`; `bc-file-system-testing` (the temporary
+# directory and the observed-engine factory for a consumer's tests) joins at stage `rust-crates`. Nothing here is
+# published: consumers pin a git SHA (design doc, "Faces and their compositions"; plan Decision mine-7), because
+# the C sources sit outside the crate directory and `cargo package` cannot reach them.
+[workspace]
+members = ["bc-file-system"]
+# The edition-2024 resolver, which resolves with the declared `rust-version` in view.
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# bc-mutants' MSRV, the first Rust consumer this crate is cut for; the design doc names no Rust floor of its own.
+rust-version = "1.89"
+publish = false
+license = "Apache-2.0"

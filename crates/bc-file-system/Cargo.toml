@@ -1,0 +1,32 @@
+[package]
+name = "bc-file-system"
+description = "A file system that code is handed: the Rust face of the bc-file-system C core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+# Once per C core: cargo refuses a second package that links `bc_file_system`, so a consumer's binary holds one
+# copy of the engine.
+links = "bc_file_system"
+build = "build.rs"
+
+[dependencies]
+
+# The binding crate is the one member that may compile C; `cc` is its named exception (AGENTS.md, "Rust").
+[build-dependencies]
+cc = "1"
+
+# The lint policy lives here so the IDE and CI read one table. `unsafe_code` is `deny`, not `forbid`: this crate
+# is the binding, and its two `unsafe` modules (`ffi`, `live`) each carry an `#[expect(unsafe_code)]` with the
+# invariant written at the block; every consumer keeps `forbid`. `missing_docs` is in lib.rs, because a `[lints]`
+# table reaches the integration tests too and they have no crate-level docs to write.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+let_underscore_must_use = "warn"
+allow_attributes_without_reason = "warn"

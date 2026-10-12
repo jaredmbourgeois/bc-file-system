@@ -6,6 +6,9 @@
 /.swiftpm/
 /Package.resolved
 
+# Cargo: the workspace's build output. crates/Cargo.lock is tracked (one resolution for every crate here).
+crates/**/target/
+
 # Python
 __pycache__/
 .mypy_cache/

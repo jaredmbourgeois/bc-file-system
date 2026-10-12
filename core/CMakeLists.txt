@@ -1,10 +1,13 @@
-# The C core. The public header is include/bc_file_system/bc_file_system.h; platform.h is private and is the only
-# file that names the operating system; path.c is the path module, the freestanding tier, with its private face
-# path.h. scripts/check_build_parity.py holds the .c list below equal to src/*.c.
+# The C core. The public header is include/bc_file_system/bc_file_system.h; platform.h and platform.c are private
+# and are the only files that name the operating system; engine.h is the engine's private face (the observer's
+# hooks, the probed fast paths) for the C-only test; path.c is the path module, the freestanding tier, with its
+# private face path.h. scripts/check_build_parity.py holds the .c list below equal to src/*.c.
 add_library(bc_file_system_core STATIC
     src/bc_file_system.c
+    src/engine.h
     src/path.c
     src/path.h
+    src/platform.c
     src/platform.h
 )
 add_library(bc::file_system_core ALIAS bc_file_system_core)
