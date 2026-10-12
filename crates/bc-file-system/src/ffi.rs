@@ -58,6 +58,10 @@ pub struct bc_file_system_error {
     pub name_truncated: u8,
     /// The entry the step acted on, relative to the location; empty when it was the location itself.
     pub name: [u8; 256],
+    /// Which location of an operation over two (`rename`, `copy_file`) the failure belongs to: 1 the first (the
+    /// source), 2 the second (the destination); 0 for an operation over one location, and for a contract
+    /// violation, which blames neither.
+    pub failed_location: i32,
 }
 
 impl bc_file_system_error {
@@ -72,6 +76,7 @@ impl bc_file_system_error {
             name_length: 0,
             name_truncated: 0,
             name: [0; 256],
+            failed_location: 0,
         }
     }
 }
@@ -231,9 +236,10 @@ pub const fn bc_file_system_location_beneath(
 
 // The layout pins: the same literals the core asserts, so a field added on either side fails this build. The
 // location holds two pointers, so its numbers depend on the pointer width, and both shipped widths are pinned.
-const _: () = assert!(size_of::<bc_file_system_error>() == 280);
+const _: () = assert!(size_of::<bc_file_system_error>() == 284);
 const _: () = assert!(align_of::<bc_file_system_error>() == 4);
 const _: () = assert!(offset_of!(bc_file_system_error, name) == 21);
+const _: () = assert!(offset_of!(bc_file_system_error, failed_location) == 280);
 const _: () =
     assert!(size_of::<bc_file_system_location>() == if size_of::<usize>() == 8 { 32 } else { 16 });
 const _: () = assert!(

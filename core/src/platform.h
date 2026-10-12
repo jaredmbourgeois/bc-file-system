@@ -72,6 +72,12 @@ bool bc_file_system_platform_search_open_checks_permission(void);
 /* The flags `faccessat` takes to judge by the effective ids: AT_EACCESS, or 0 on bionic, which refuses the flag. */
 int bc_file_system_platform_access_check_flags(void);
 
+/* Whether the platform's `flock` holds a lock at all: true on Apple platforms and Linux, where an exclusive lock
+ * on one open-file description excludes every other; false on Emscripten, whose `flock` is a stub that answers
+ * 0 to every caller, so two descriptors both "acquire" and `try_lock` answers `unsupported` before any call
+ * rather than hand out a lock that excludes nobody. A fact of the platform, not a probe. */
+bool bc_file_system_platform_enforces_locks(void);
+
 /* ---- The five operations ------------------------------------------------------------------------------------- */
 
 /* Each operation returns 0 or the errno it failed with, so a call reads `const int code = sync_descriptor(…)`.

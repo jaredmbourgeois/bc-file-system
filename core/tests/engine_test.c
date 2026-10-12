@@ -187,6 +187,7 @@ static void expect_platform_operations(report *tally) {
     expect(tally, bc_file_system_platform_sync_descriptor(-1) == ENOTSUP, "Emscripten: sync is not offered", "");
     expect(tally, bc_file_system_platform_rename_no_replace(-1, "a", -1, "b") == ENOTSUP,
            "Emscripten: the no-replace rename is not offered", "");
+    expect(tally, !bc_file_system_platform_enforces_locks(), "Emscripten: flock is a stub, so no lock is held", "");
 }
 #else
 static void expect_platform_operations(report *tally) {
@@ -195,6 +196,7 @@ static void expect_platform_operations(report *tally) {
     const int rename_code = bc_file_system_platform_rename_no_replace(-1, "a", -1, "b");
     expect(tally, rename_code != 0, "rename_no_replace on an invalid descriptor fails", "");
     expect(tally, rename_code != ENOTSUP, "rename_no_replace on an invalid descriptor is not ENOTSUP", "");
+    expect(tally, bc_file_system_platform_enforces_locks(), "flock holds a lock on this platform", "");
 }
 #endif
 

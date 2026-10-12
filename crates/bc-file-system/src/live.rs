@@ -343,6 +343,7 @@ impl Status {
             system_code: 0,
             name: Vec::new(),
             name_truncated: false,
+            failed_location: None,
             unknown_value: Some(unknown),
         })?;
         Ok(Self {

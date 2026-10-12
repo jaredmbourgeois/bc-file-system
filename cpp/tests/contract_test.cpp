@@ -66,6 +66,7 @@ using bc::file_system::Entry;
 using bc::file_system::EntryType;
 using bc::file_system::ErrorKind;
 using bc::file_system::ExistingDestination;
+using bc::file_system::FailedLocation;
 using bc::file_system::Fault;
 using bc::file_system::FaultAction;
 using bc::file_system::FileSystem;
@@ -2698,12 +2699,9 @@ TEST_P(FileSystemContract, RenameUnderRefuseLeavesAnExistingDestinationAndIsAlre
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("current")), "the old content");
 }
 
-// The error of every two-location operation is composed from its destination by the face, whichever of the two
-// locations the failing step acted on: the error struct names an entry relative to one location and has no field
-// for which, so a missing source is `not_found` at the source's own stat (the step and the code say so) under
-// the destination's path. The draft asked for the source here; that needs a field in the error, which is the
-// header's to add, not a convention the core could smuggle through the name.
-TEST_P(FileSystemContract, RenameOfNothingIsNotFoundAtTheSourcesStatAndNamesTheDestination) {
+// The error of a two-location operation says which end it belongs to (`failed_location`), and the face composes
+// its path from that end: a missing source is `not_found` at the source's own stat, under the source's path.
+TEST_P(FileSystemContract, RenameOfNothingIsNotFoundAtTheSourcesStatAndNamesTheSource) {
     const auto achieved =
         files().rename(in("absent"), in("new-name"), ExistingDestination::replace, Durability::written);
 
@@ -2711,7 +2709,8 @@ TEST_P(FileSystemContract, RenameOfNothingIsNotFoundAtTheSourcesStatAndNamesTheD
     EXPECT_EQ(achieved.error().kind, ErrorKind::not_found);
     EXPECT_EQ(achieved.error().step, Step::fstatat);
     EXPECT_EQ(achieved.error().system_code, ENOENT);
-    EXPECT_EQ(achieved.error().path, path_of("new-name").string());
+    EXPECT_EQ(achieved.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(achieved.error().path, path_of("absent").string());
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
@@ -2723,8 +2722,37 @@ TEST_P(FileSystemContract, RenameIntoADirectoryThatIsNotThereIsNotFoundAndNamesT
 
     ASSERT_FALSE(achieved.has_value());
     EXPECT_EQ(achieved.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(achieved.error().failed_location, FailedLocation::second);
     EXPECT_EQ(achieved.error().path, path_of("missing/file").string());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
+}
+
+// Each refusal of a rename names its end: what the destination holds (`already_exists`, `directory_not_empty`)
+// is the destination's; a contract violation blames neither, and the face then names the destination.
+TEST_P(FileSystemContract, RenameRefusalsNameTheEndTheyBelongTo) {
+    bc::file_system_test::write_raw(path_of("staged"), "the new content", 0644);
+    bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("incoming"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("occupied"), 0755);
+    bc::file_system_test::write_raw(path_of("occupied/kept.txt"), "must survive", 0644);
+
+    const auto taken = files().rename(in("staged"), in("current"), ExistingDestination::refuse, Durability::written);
+    const auto not_empty =
+        files().rename(in("incoming"), in("occupied"), ExistingDestination::replace, Durability::written);
+    const auto relative = files().rename(Location::at(std::filesystem::path{"relative"}), in("current"),
+                                         ExistingDestination::replace, Durability::written);
+
+    ASSERT_FALSE(taken.has_value());
+    EXPECT_EQ(taken.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(taken.error().path, path_of("current").string());
+    ASSERT_FALSE(not_empty.has_value());
+    EXPECT_EQ(not_empty.error().kind, ErrorKind::directory_not_empty);
+    EXPECT_EQ(not_empty.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(not_empty.error().path, path_of("occupied").string());
+    ASSERT_FALSE(relative.has_value());
+    EXPECT_EQ(relative.error().kind, ErrorKind::invalid_argument);
+    EXPECT_FALSE(relative.error().failed_location.has_value());
+    EXPECT_EQ(relative.error().path, path_of("current").string());
 }
 
 // Under `replace` a directory replaces only an empty directory; one that is not empty is `directory_not_empty`.
@@ -2943,16 +2971,17 @@ TEST_P(FileSystemContract, CopyWritesTheSourcesBytesAndLeavesTheSource) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("copy", "source"));
 }
 
-// As for a rename of nothing: the error is composed from the destination, and the step (the source's open) and
-// the code say that it was the source that was not there. Nothing is staged.
-TEST_P(FileSystemContract, CopyOfNothingIsNotFoundAtTheSourcesOpenAndNamesTheDestination) {
+// As for a rename of nothing: the error belongs to the source (its open is the step that failed) and the face
+// composes its path from the source. Nothing is staged.
+TEST_P(FileSystemContract, CopyOfNothingIsNotFoundAtTheSourcesOpenAndNamesTheSource) {
     const auto achieved = files().copy_file(in("absent"), in("copy"), kWrittenExactly0644);
 
     ASSERT_FALSE(achieved.has_value());
     EXPECT_EQ(achieved.error().kind, ErrorKind::not_found);
     EXPECT_EQ(achieved.error().step, Step::openat);
     EXPECT_EQ(achieved.error().system_code, ENOENT);
-    EXPECT_EQ(achieved.error().path, path_of("copy").string());
+    EXPECT_EQ(achieved.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(achieved.error().path, path_of("absent").string());
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
@@ -2963,6 +2992,7 @@ TEST_P(FileSystemContract, CopyIntoADirectoryThatIsNotThereIsNotFoundAndLeavesTh
 
     ASSERT_FALSE(achieved.has_value());
     EXPECT_EQ(achieved.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(achieved.error().failed_location, FailedLocation::second);
     EXPECT_EQ(achieved.error().path, path_of("missing/copy").string());
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("source"));
 }
@@ -3007,8 +3037,12 @@ TEST_P(FileSystemContract, CopyOntoADirectoryAndOfADirectoryAreNotRegularFile) {
 
     ASSERT_FALSE(onto_directory.has_value());
     EXPECT_EQ(onto_directory.error().kind, ErrorKind::not_regular_file);
+    EXPECT_EQ(onto_directory.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(onto_directory.error().path, path_of("folder").string());
     ASSERT_FALSE(of_directory.has_value());
     EXPECT_EQ(of_directory.error().kind, ErrorKind::not_regular_file);
+    EXPECT_EQ(of_directory.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(of_directory.error().path, path_of("folder").string());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("folder/kept.txt")), "must survive");
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("folder", "source"));
 }
@@ -3189,6 +3223,424 @@ TEST_F(ObservedContract, AStopAtTheCloneMakesNothingAndAStopAtItsReopenLeavesThe
 }
 
 // -------------------------------------------------------------------------------------------------------------
+// try_lock
+// -------------------------------------------------------------------------------------------------------------
+
+// The lock is advisory and held by the open-file description the handle owns, so a second engine in the same
+// process contends like a second process would: it is refused while the first holds the lock and takes it once
+// the first lets go. The same holds for one engine asked twice.
+TEST_P(FileSystemContract, TryLockAcquiresAndASecondEngineInTheSameProcessIsRefusedUntilItIsReleased) {
+    bc::file_system_test::write_raw(path_of("file.lock"), "", 0644);
+    Result<Engine> second_engine = make_engine(GetParam());
+    ASSERT_TRUE(second_engine.has_value()) << second_engine.error().message();
+    FileSystem second(second_engine.value());
+
+    auto first = files().try_lock(in("file.lock"));
+    ASSERT_TRUE(first.has_value()) << first.error().message();
+    ASSERT_TRUE(first->has_value());
+    const auto while_held_elsewhere = second.try_lock(in("file.lock"));
+    const auto while_held_by_the_same_engine = files().try_lock(in("file.lock"));
+    first->reset();
+    const auto after_release = second.try_lock(in("file.lock"));
+
+    ASSERT_TRUE(while_held_elsewhere.has_value()) << while_held_elsewhere.error().message();
+    EXPECT_FALSE(while_held_elsewhere->has_value());
+    ASSERT_TRUE(while_held_by_the_same_engine.has_value()) << while_held_by_the_same_engine.error().message();
+    EXPECT_FALSE(while_held_by_the_same_engine->has_value());
+    ASSERT_TRUE(after_release.has_value()) << after_release.error().message();
+    EXPECT_TRUE(after_release->has_value());
+}
+
+// A directory may hold a lock as a file may: the lock opens the entry itself, read-only.
+TEST_P(FileSystemContract, TryLockOnADirectoryAcquiresAndExcludesASecondLock) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto first = files().try_lock(in("folder"));
+    const auto second = files().try_lock(in("folder"));
+
+    ASSERT_TRUE(first.has_value()) << first.error().message();
+    EXPECT_TRUE(first->has_value());
+    ASSERT_TRUE(second.has_value()) << second.error().message();
+    EXPECT_FALSE(second->has_value());
+}
+
+// A lock never creates, never follows a symlink, and never locks what is neither a file nor a directory.
+TEST_P(FileSystemContract, TryLockOnNothingIsNotFoundOnASymlinkIsRefusedAndOnAFifoIsNotRegularFile) {
+    bc::file_system_test::write_raw(path_of("target"), "", 0644);
+    bc::file_system_test::make_symlink_raw(path_of("target"), path_of("link"));
+    bc::file_system_test::make_fifo_raw(path_of("pipe"), 0600);
+
+    const auto absent = files().try_lock(in("absent.lock"));
+    const auto through_link = files().try_lock(in("link"));
+    const auto fifo = files().try_lock(in("pipe"));
+
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error().kind, ErrorKind::not_found);
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("absent.lock")));
+    ASSERT_FALSE(through_link.has_value());
+    EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
+    ASSERT_FALSE(fifo.has_value());
+    EXPECT_EQ(fifo.error().kind, ErrorKind::not_regular_file);
+    EXPECT_FALSE(fifo.error().step.has_value());
+}
+
+// What a lock costs: the leaf's open, one look at the descriptor and one flock; a scripted EWOULDBLOCK is
+// `held_elsewhere` with nothing waited for, and a platform that refuses to lock (ENOTSUP) is `unsupported`.
+TEST_F(ObservedContract, TryLockIsOneOpenOneLookAndOneFlockAndReadsTheTwoRefusals) {
+    bc::file_system_test::write_raw(path_of("file.lock"), "", 0644);
+    script(fail_step(Operation::try_lock, Step::flock, 2, EWOULDBLOCK));
+    script(fail_step(Operation::try_lock, Step::flock, 3, ENOTSUP));
+
+    const auto acquired = files().try_lock(in("file.lock"));
+    ASSERT_TRUE(acquired.has_value()) << acquired.error().message();
+    EXPECT_TRUE(acquired->has_value());
+    EXPECT_EQ(count(Operation::try_lock, Step::openat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::try_lock, Step::fstat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::try_lock, Step::flock), 1U);
+
+    const auto held_elsewhere = files().try_lock(in("file.lock"));
+    const auto unsupported = files().try_lock(in("file.lock"));
+
+    ASSERT_TRUE(held_elsewhere.has_value()) << held_elsewhere.error().message();
+    EXPECT_FALSE(held_elsewhere->has_value());
+    ASSERT_FALSE(unsupported.has_value());
+    EXPECT_EQ(unsupported.error().kind, ErrorKind::unsupported);
+    EXPECT_EQ(unsupported.error().step, Step::flock);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// create_symlink and read_symlink
+// -------------------------------------------------------------------------------------------------------------
+
+// The target goes to the system as spelled, `..` and all, and comes back the same; the link is a link.
+TEST_P(FileSystemContract, CreateSymlinkStoresTheTargetTextUnchangedAndReadSymlinkReadsItBack) {
+    bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
+
+    const auto created = files().create_symlink("../elsewhere/./target.txt", in("sub/link"));
+    const auto absolute = files().create_symlink(path_of("sub").string(), in("alias"));
+    const auto text = files().read_symlink(in("sub/link"));
+    const auto absolute_text = files().read_symlink(in("alias"));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    ASSERT_TRUE(absolute.has_value()) << absolute.error().message();
+    EXPECT_TRUE(bc::file_system_test::is_symlink_raw(path_of("sub/link")));
+    ASSERT_TRUE(text.has_value()) << text.error().message();
+    EXPECT_EQ(*text, "../elsewhere/./target.txt");
+    ASSERT_TRUE(absolute_text.has_value()) << absolute_text.error().message();
+    EXPECT_EQ(*absolute_text, path_of("sub").string());
+}
+
+TEST_P(FileSystemContract, CreateSymlinkOverAnExistingEntryIsAlreadyExistsWhateverHoldsTheName) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::make_symlink_raw("file", path_of("link"));
+
+    for (const std::string_view name : {"file", "folder", "link"}) {
+        const auto created = files().create_symlink("elsewhere", in(name));
+        ASSERT_FALSE(created.has_value()) << name;
+        EXPECT_EQ(created.error().kind, ErrorKind::already_exists) << name;
+        EXPECT_EQ(created.error().step, Step::symlinkat) << name;
+        EXPECT_EQ(created.error().system_code, EEXIST) << name;
+    }
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
+    EXPECT_EQ(files().read_symlink(in("link")).value(), "file");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file", "folder", "link"));
+}
+
+// A target the system could not hold is refused before any call: empty, a NUL inside, or PATH_MAX or longer
+// (4096 bytes is at or past the bound on every platform the suite runs on: 4096 on Linux, 1024 on Apple).
+TEST_P(FileSystemContract, CreateSymlinkRefusesAnEmptyANulBearingAndAnOverlongTargetBeforeAnyCall) {
+    const std::string with_nul("a\0b", 3);
+    const std::string overlong(4096, 't');
+
+    const auto empty = files().create_symlink("", in("link"));
+    const auto nul = files().create_symlink(with_nul, in("link"));
+    const auto too_long = files().create_symlink(overlong, in("link"));
+
+    for (const auto* refused : {&empty, &nul, &too_long}) {
+        ASSERT_FALSE(refused->has_value());
+        EXPECT_EQ(refused->error().kind, ErrorKind::invalid_argument);
+        EXPECT_FALSE(refused->error().step.has_value());
+    }
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
+}
+
+// A target as long as the system allows lands: 1000 bytes is under PATH_MAX everywhere.
+TEST_P(FileSystemContract, CreateSymlinkTakesATargetJustUnderTheSystemsBound) {
+    const std::string long_target(1000, 't');
+
+    const auto created = files().create_symlink(long_target, in("link"));
+    const auto text = files().read_symlink(in("link"));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    ASSERT_TRUE(text.has_value()) << text.error().message();
+    EXPECT_EQ(*text, long_target);
+}
+
+TEST_P(FileSystemContract, CreateSymlinkIntoAMissingDirectoryIsNotFoundAndAtTheRootIsAlreadyExists) {
+    const auto below_nothing = files().create_symlink("target", in("missing/link"));
+    const auto at_the_root = files().create_symlink("target", Location::at(std::filesystem::path{"/"}));
+
+    ASSERT_FALSE(below_nothing.has_value());
+    EXPECT_EQ(below_nothing.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(at_the_root.has_value());
+    EXPECT_EQ(at_the_root.error().kind, ErrorKind::already_exists);
+    EXPECT_FALSE(at_the_root.error().step.has_value());
+}
+
+// A dangling link reads like any other: the text is the link's, whatever it points at.
+TEST_P(FileSystemContract, ReadSymlinkReadsADanglingLinksText) {
+    bc::file_system_test::make_symlink_raw("nowhere/at/all", path_of("dangling"));
+
+    const auto text = files().read_symlink(in("dangling"));
+
+    ASSERT_TRUE(text.has_value()) << text.error().message();
+    EXPECT_EQ(*text, "nowhere/at/all");
+}
+
+// No kind of the fourteen means "not a symlink": the system's EINVAL is passed on as `io_failed` with the code,
+// as the header says, for a file, a directory and the root alike; nothing there is `not_found`.
+TEST_P(FileSystemContract, ReadSymlinkOfAFileADirectoryOrTheRootIsIoFailedWithEinvalAndOfNothingIsNotFound) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto of_file = files().read_symlink(in("file"));
+    const auto of_folder = files().read_symlink(in("folder"));
+    const auto of_root = files().read_symlink(Location::at(std::filesystem::path{"/"}));
+    const auto of_nothing = files().read_symlink(in("absent"));
+
+    for (const auto* not_a_link : {&of_file, &of_folder, &of_root}) {
+        ASSERT_FALSE(not_a_link->has_value());
+        EXPECT_EQ(not_a_link->error().kind, ErrorKind::io_failed);
+        EXPECT_EQ(not_a_link->error().system_code, EINVAL);
+        EXPECT_EQ(not_a_link->error().step, Step::readlinkat);
+    }
+    ASSERT_FALSE(of_nothing.has_value());
+    EXPECT_EQ(of_nothing.error().kind, ErrorKind::not_found);
+}
+
+// Beneath a held directory a link is made and read inside it, and a symlink on the way is refused.
+TEST_P(FileSystemContract, CreateSymlinkBeneathADirectoryMakesTheLinkInsideAndRefusesASymlinkOnTheWay) {
+    lay_out_directories(root_path());
+    const auto held = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(held.has_value()) << held.error().message();
+
+    const auto inside = files().create_symlink("../file", Location::beneath(*held, relative("sub/deeper/link")));
+    const auto through_link = files().create_symlink("file", Location::beneath(*held, relative("alias/link")));
+    const auto text = files().read_symlink(Location::beneath(*held, relative("sub/deeper/link")));
+
+    ASSERT_TRUE(inside.has_value()) << inside.error().message();
+    ASSERT_FALSE(through_link.has_value());
+    EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
+    ASSERT_TRUE(text.has_value()) << text.error().message();
+    EXPECT_EQ(*text, "../file");
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub/deeper")), ElementsAre("link"));
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// condemn and remove_condemned
+// -------------------------------------------------------------------------------------------------------------
+
+TEST_P(FileSystemContract, CondemnRenamesATreeBesideItselfAndAnswersTheCondemnedName) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    lay_out_a_small_tree(path_of("tree"));
+
+    const auto name = files().condemn(in("tree"));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_EQ(*name, ".bc-condemned-tree");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(".bc-condemned-tree"));
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(".bc-condemned-tree/sub/b.txt")), "bee");
+}
+
+// A condemned name a previous condemn left behind is never an error: the second condemn of the same name takes
+// another name, with a token of the engine's appended, and both trees wait for the sweep.
+TEST_P(FileSystemContract, CondemnTwiceWithTheSameNameYieldsTwoNamesAndKeepsBothTrees) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    bc::file_system_test::write_raw(path_of("tree/first"), "first", 0644);
+    const auto first = files().condemn(in("tree"));
+    ASSERT_TRUE(first.has_value()) << first.error().message();
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    bc::file_system_test::write_raw(path_of("tree/second"), "second", 0644);
+
+    const auto second = files().condemn(in("tree"));
+
+    ASSERT_TRUE(second.has_value()) << second.error().message();
+    EXPECT_NE(*first, *second);
+    EXPECT_TRUE(second->starts_with(".bc-condemned-tree-"));
+    std::vector<std::string> expected{*first, *second};
+    std::ranges::sort(expected);
+    EXPECT_EQ(bc::file_system_test::names_raw(root_path()), expected);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(*first + "/first")), "first");
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(*second + "/second")), "second");
+}
+
+// A file and a symlink are condemned as themselves; nothing there is `not_found`; the root is refused.
+TEST_P(FileSystemContract, CondemnTakesAFileAndASymlinkAsThemselvesRefusesTheRootAndFindsNothingNotFound) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_symlink_raw("file", path_of("link"));
+
+    const auto file = files().condemn(in("file"));
+    const auto link = files().condemn(in("link"));
+    const auto root_of_all = files().condemn(Location::at(std::filesystem::path{"/"}));
+    const auto nothing = files().condemn(in("absent"));
+
+    ASSERT_TRUE(file.has_value()) << file.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(*file)), "content");
+    ASSERT_TRUE(link.has_value()) << link.error().message();
+    EXPECT_TRUE(bc::file_system_test::is_symlink_raw(path_of(*link)));
+    EXPECT_EQ(files().read_symlink(in(*link)).value(), "file");
+    ASSERT_FALSE(root_of_all.has_value());
+    EXPECT_EQ(root_of_all.error().kind, ErrorKind::invalid_argument);
+    EXPECT_FALSE(root_of_all.error().step.has_value());
+    ASSERT_FALSE(nothing.has_value());
+    EXPECT_EQ(nothing.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(nothing.error().step, Step::rename_no_replace);
+}
+
+// A leaf as long as a name may be is cut inside the condemned name, so the name fits with a token appended.
+TEST_P(FileSystemContract, CondemnOfALeafAsLongAsANameMayBeCutsItToFit) {
+    const std::string leaf(255, 'n');
+    bc::file_system_test::write_raw(path_of(leaf), "content", 0644);
+
+    const auto first = files().condemn(in(leaf));
+    bc::file_system_test::write_raw(path_of(leaf), "again", 0644);
+    const auto second = files().condemn(in(leaf));
+
+    ASSERT_TRUE(first.has_value()) << first.error().message();
+    ASSERT_TRUE(second.has_value()) << second.error().message();
+    EXPECT_LE(first->size(), 255U);
+    EXPECT_LE(second->size(), 255U);
+    EXPECT_NE(*first, *second);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(*first)), "content");
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of(*second)), "again");
+}
+
+// A taken condemned name costs one more no-replace rename, with the token appended; the condemn is one step of
+// the platform's no-replace rename, never renameat.
+TEST_F(ObservedContract, CondemnWhoseFirstNameIsTakenAppendsATokenAndIsOneMoreNoReplaceRename) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    script(fail_step(Operation::condemn, Step::rename_no_replace, 1, EEXIST));
+
+    const auto name = files().condemn(in("tree"));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_TRUE(name->starts_with(".bc-condemned-tree-"));
+    EXPECT_EQ(count(Operation::condemn, Step::rename_no_replace), 2U);
+    EXPECT_EQ(count(Operation::condemn, Step::renameat), 0U);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(*name));
+}
+
+// The sweep clears what the engine's own marks name and nothing else: condemned trees and files, a killed
+// write's staged file, a clone's leftover under the same name shape; a temporary directory and a plain hidden
+// file are the caller's and stay.
+TEST_P(FileSystemContract, RemoveCondemnedClearsCondemnedEntriesAndStagedLeftoversAndLeavesTheRest) {
+    bc::file_system_test::make_directory_raw(path_of(".bc-condemned-tree"), 0755);
+    lay_out_a_small_tree(path_of(".bc-condemned-tree"));
+    bc::file_system_test::write_raw(path_of(".bc-condemned-file"), "", 0644);
+    bc::file_system_test::make_symlink_raw("kept", path_of(".bc-condemned-link"));
+    bc::file_system_test::write_raw(path_of(".ledger.bc-tmp-4242-7"), "a write killed before its rename", 0600);
+    bc::file_system_test::write_raw(path_of(".copy.bc-tmp-4242-8"), "a clone killed before its reopen", 0600);
+    bc::file_system_test::write_raw(path_of("kept"), "kept", 0644);
+    bc::file_system_test::write_raw(path_of(".hidden"), "hidden", 0644);
+    bc::file_system_test::make_directory_raw(path_of("tmp-4242-9"), 0700);
+    bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
+    bc::file_system_test::write_raw(path_of("sub/.bc-condemned-deeper"), "one level deep only", 0644);
+
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(".hidden", "kept", "sub", "tmp-4242-9"));
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("sub/.bc-condemned-deeper")), "one level deep only");
+}
+
+TEST_P(FileSystemContract, RemoveCondemnedOfAnEmptyDirectoryOrOneWithNothingMarkedChangesNothing) {
+    bc::file_system_test::write_raw(path_of("kept"), "kept", 0644);
+
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("kept"));
+}
+
+TEST_P(FileSystemContract, RemoveCondemnedInNothingIsNotFoundAndInAFileIsNotDirectory) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto in_nothing = files().remove_condemned(in("absent"));
+    const auto in_a_file = files().remove_condemned(in("file"));
+
+    ASSERT_FALSE(in_nothing.has_value());
+    EXPECT_EQ(in_nothing.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(in_a_file.has_value());
+    EXPECT_EQ(in_a_file.error().kind, ErrorKind::not_directory);
+}
+
+// Condemn then sweep, through the library end to end: the tree is gone and the neighbours stay.
+TEST_P(FileSystemContract, CondemnThenRemoveCondemnedClearsTheTreeAndLeavesItsNeighbours) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    lay_out_a_small_tree(path_of("tree"));
+    bc::file_system_test::write_raw(path_of("neighbour"), "stays", 0644);
+
+    const auto name = files().condemn(in("tree"));
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("neighbour"));
+}
+
+// The sweep stops at the first entry it cannot remove, names it relative to the swept directory (the face
+// composes the path), and keeps what it removed before it.
+TEST_F(ObservedContract, RemoveCondemnedStopsAtTheEntryItCannotRemoveAndNamesIt) {
+    bc::file_system_test::make_directory_raw(path_of(".bc-condemned-tree"), 0755);
+    bc::file_system_test::make_directory_raw(path_of(".bc-condemned-tree/a"), 0755);
+    bc::file_system_test::write_raw(path_of(".bc-condemned-tree/a/kept"), "content", 0644);
+    bc::file_system_test::write_raw(path_of(".bc-condemned-tree/a/gone"), "content", 0644);
+    // The two files are unlinked in the order the stream answers them: the second is the one refused.
+    script(fail_step(Operation::remove_condemned, Step::unlinkat, 2, EACCES));
+
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_FALSE(swept.has_value());
+    EXPECT_EQ(swept.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(swept.error().step, Step::unlinkat);
+    EXPECT_FALSE(swept.error().name_truncated);
+    const std::vector<std::string> remaining = bc::file_system_test::names_raw(path_of(".bc-condemned-tree/a"));
+    ASSERT_EQ(remaining.size(), 1U);
+    EXPECT_EQ(swept.error().path, path_of(".bc-condemned-tree/a/" + remaining.front()).string());
+}
+
+// A staged leftover the sweep cannot unlink ends the sweep with that file named.
+TEST_F(ObservedContract, RemoveCondemnedNamesAStagedLeftoverItCannotRemove) {
+    bc::file_system_test::write_raw(path_of(".ledger.bc-tmp-4242-7"), "leftover", 0600);
+    script(fail_step(Operation::remove_condemned, Step::unlinkat, 1, EPERM));
+
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_FALSE(swept.has_value());
+    EXPECT_EQ(swept.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(swept.error().path, path_of(".ledger.bc-tmp-4242-7").string());
+    EXPECT_TRUE(bc::file_system_test::exists_raw(path_of(".ledger.bc-tmp-4242-7")));
+}
+
+// A write stopped before its rename leaves its staged file, which the sweep then clears: the kill-safety story
+// end to end, through the library.
+TEST_F(ObservedContract, AWriteStoppedBeforeItsRenameLeavesAStagedFileTheSweepClears) {
+    bc::file_system_test::write_raw(path_of("ledger"), "the old ledger", 0644);
+    const auto bytes = bytes_of("the new ledger");
+    script(stop_at(Operation::write_file, Step::renameat, 1));
+    const auto stopped = files().write_file(in("ledger"), bytes, kWrittenExactly0644);
+    ASSERT_FALSE(stopped.has_value());
+    ASSERT_EQ(staged_names_of(root_path(), "ledger").size(), 1U);
+
+    const auto swept = files().remove_condemned(root());
+
+    ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the old ledger");
+}
+
+// -------------------------------------------------------------------------------------------------------------
 // Descriptors
 // -------------------------------------------------------------------------------------------------------------
 
@@ -3196,8 +3648,7 @@ TEST_F(ObservedContract, AStopAtTheCloneMakesNothingAndAStopAtItsReopenLeavesThe
 // each descriptor it took. The fixture checks this for every case; this case runs every operation, several
 // times, and then a write whose rename fails after the temporary file was opened, written and synced. The
 // static_casts discard results this test does not judge.
-// stage 17 locks-links-condemn
-TEST_F(ObservedContract, DISABLED_EveryOperationClosesWhatItOpened) {
+TEST_F(ObservedContract, EveryOperationClosesWhatItOpened) {
     lay_out_a_small_tree(root_path());
     const auto bytes = bytes_of("content");
     const std::vector<int> before = bc::file_system_test::open_descriptors();

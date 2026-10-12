@@ -66,7 +66,8 @@ extension FileSystemError {
             step: nil,
             systemCode: 0,
             path: String(decoding: bytes, as: UTF8.self),
-            nameTruncated: false
+            nameTruncated: false,
+            failedLocation: nil
         )
     }
 }
@@ -143,7 +144,7 @@ public struct FileSystem: Sendable {
         }
     }
 
-    /// The same over two locations; an error names the destination.
+    /// The same over two locations; an error names the end it belongs to (`FileSystemError.failedLocation`).
     private func call(
         _ called: Operation,
         from source: Location,
@@ -162,7 +163,8 @@ public struct FileSystem: Sendable {
             }
         }
         if outcome != 0 {
-            throw FileSystemError(core: coreError, called: called, locationText: destination.text)
+            throw FileSystemError(
+                core: coreError, called: called, firstLocationText: source.text, secondLocationText: destination.text)
         }
     }
 
@@ -384,7 +386,8 @@ public struct FileSystem: Sendable {
     }
 
     /// Renames `source` to `destination` in one step; see the header for what `replace` replaces. Returns the
-    /// durability achieved. An error names the destination.
+    /// durability achieved. An error names the end it belongs to: a missing source names `source`, a destination
+    /// that refuses names `destination`.
     public func rename(
         from source: Location, to destination: Location, existingDestination: ExistingDestination,
         durability: Durability
@@ -399,7 +402,7 @@ public struct FileSystem: Sendable {
     }
 
     /// Copies the regular file at `source` to `destination` with the guarantees of `writeFile`. An error names
-    /// the destination.
+    /// the end it belongs to, as `rename`'s does.
     public func copyFile(from source: Location, to destination: Location, options: WriteOptions)
         throws(FileSystemError) -> Durability
     {

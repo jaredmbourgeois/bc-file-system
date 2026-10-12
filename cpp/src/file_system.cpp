@@ -53,7 +53,8 @@ auto answer_outside_enum(Operation called, std::string_view location_text) -> Er
                  .step = std::nullopt,
                  .system_code = 0,
                  .path = std::string(location_text),
-                 .name_truncated = false};
+                 .name_truncated = false,
+                 .failed_location = std::nullopt};
 }
 
 // The buffer protocol as one loop. `call(buffer, capacity, &length, &c_error)` is the core's function with
@@ -410,7 +411,7 @@ auto FileSystem::rename(const Location& source, const Location& destination, Exi
     if (bc_file_system_rename(engine_.handle(), &c_source, &c_destination,
                               static_cast<std::int32_t>(existing_destination), static_cast<std::int32_t>(durability),
                               &achieved, &c_error) != 0) {
-        return error_from(c_error, Operation::rename, destination.text());
+        return error_from_two_locations(c_error, Operation::rename, source.text(), destination.text());
     }
     return durability_answer(achieved, Operation::rename, destination.text());
 }
@@ -423,7 +424,7 @@ auto FileSystem::copy_file(const Location& source, const Location& destination, 
     std::int32_t achieved = 0;
     bc_file_system_error c_error;
     if (bc_file_system_copy_file(engine_.handle(), &c_source, &c_destination, &c_options, &achieved, &c_error) != 0) {
-        return error_from(c_error, Operation::copy_file, destination.text());
+        return error_from_two_locations(c_error, Operation::copy_file, source.text(), destination.text());
     }
     return durability_answer(achieved, Operation::copy_file, destination.text());
 }

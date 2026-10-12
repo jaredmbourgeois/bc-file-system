@@ -4,29 +4,31 @@
  * the test observer's slot and every operation. It is C23 in the GNU dialect; the public header it implements
  * is the common subset, and the platform differences are behind platform.h.
  *
- * Where the library stands: the handles, the platform probes, the observer and the resolution layer are real,
- * and so are the operations that read (`bc_file_system_directory_open`, `bc_file_system_status_of`,
+ * Every operation of the header is real: the handles, the platform probes, the observer and the resolution
+ * layer; the operations that read (`bc_file_system_directory_open`, `bc_file_system_status_of`,
  * `bc_file_system_read_file`), the ones that write (`bc_file_system_write_file`, staged and renamed into
  * place; `bc_file_system_append`; `bc_file_system_sync`), the ones on directories (`create_directory`,
  * `create_directories`, `list_directory`, `remove_file`, `remove_directory`, `remove_tree` on held descriptors
- * with a bounded window, `create_temporary_directory`, `set_permissions`) and the ones that move and copy
+ * with a bounded window, `create_temporary_directory`, `set_permissions`), the ones that move and copy
  * (`bc_file_system_rename` in one step, `bc_file_system_copy_file` staged like a write, by the platform's clone
- * or in-kernel copy where it has one and the read-and-write loop otherwise); every other operation is an honest
- * stub. Each one validates its arguments exactly as the header promises (a contract violation is
- * `invalid_argument` and touches nothing) and announces itself to the observer; a stub then answers
- * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
- * until the stage that builds it. A real operation resolves its location once through resolve.h to (parent
- * descriptor, leaf name) and makes only `*at` calls on that pair from then on, each through calls.h (behind
- * the observer's `before_step`, asked again on EINTR, the errno copied on the line after the call); every
- * descriptor it holds is an owned_descriptor under the cleanup idiom of owned.h, a directory it reads is an
- * owned_directory_stream, and a file or directory it created and still owns is a staged_file or a
- * created_directory under the same idiom, unlinked on a failing path and kept on a stop.
+ * or in-kernel copy where it has one and the read-and-write loop otherwise), and the locks, links and the
+ * condemned sweep (`bc_file_system_try_lock` over an open of its own, `create_symlink` and `read_symlink`,
+ * `condemn` as one no-replace rename beside the entry and `remove_condemned` as the tree removal over every
+ * entry carrying one of the engine's own marks, which names.h holds). Each one validates its arguments exactly
+ * as the header promises (a contract violation is `invalid_argument` and touches nothing) and announces itself
+ * to the observer, then resolves its location once through resolve.h to (parent descriptor, leaf name) and
+ * makes only `*at` calls on that pair from then on, each through calls.h (behind the observer's `before_step`,
+ * asked again on EINTR, the errno copied on the line after the call); every descriptor it holds is an
+ * owned_descriptor under the cleanup idiom of owned.h, a directory it reads is an owned_directory_stream, and
+ * a file or directory it created and still owns is a staged_file or a created_directory under the same idiom,
+ * unlinked on a failing path and kept on a stop.
  */
 #include <bc_file_system/bc_file_system.h>
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -41,6 +43,7 @@
 
 #include "calls.h"
 #include "engine.h"
+#include "names.h"
 #include "owned.h"
 #include "path.h"
 #include "platform.h"
@@ -52,8 +55,10 @@
  * face (C++ static_assert, a Swift MemoryLayout test, a Rust const assertion) repeats the same numbers and a
  * field added here fails every face's build. A location holds two pointers, so its numbers depend on the
  * pointer width: both widths the library ships for are pinned. */
-static_assert(sizeof(bc_file_system_error) == 280, "bc_file_system_error layout changed; bump the faces");
+static_assert(sizeof(bc_file_system_error) == 284, "bc_file_system_error layout changed; bump the faces");
 static_assert(offsetof(bc_file_system_error, name) == 21, "bc_file_system_error layout changed; bump the faces");
+static_assert(offsetof(bc_file_system_error, failed_location) == 280,
+              "bc_file_system_error layout changed; bump the faces");
 static_assert(sizeof(bc_file_system_location) == (sizeof(void *) == 8 ? 32 : 16),
               "bc_file_system_location layout changed; bump the faces");
 static_assert(offsetof(bc_file_system_location, length) == (sizeof(void *) == 8 ? 24 : 12),
@@ -113,9 +118,7 @@ enum : uint32_t {
     directory_create_mode = 0700
 };
 
-/* The infix of a staged file's name (`.<leaf>.bc-tmp-<process id>-<token>`); a later stage decides whether the
- * condemned sweep clears leftovers that carry it. */
-static const char staging_infix[] = ".bc-tmp-";
+/* The staging infix and the condemned prefix are names.h's: the sweep reads them from the same table. */
 
 enum : size_t {
     /* The most digits a 64-bit number spells in decimal. */
@@ -146,7 +149,10 @@ enum : int32_t {
     sync_open_flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
     /* How a directory the walk holds for search is opened again to be synced: read-only, as `.` beneath it,
      * because a search-only descriptor (O_PATH on Linux) cannot be synced. */
-    directory_read_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC
+    directory_read_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+    /* How the entry a lock is taken on is opened: read-only (a lock reads nothing and writes nothing through it),
+     * never through a symlink, never inherited by a child's exec, and never blocking on the open itself. */
+    lock_open_flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
 };
 
 /* The last enumerator of each closed enum, so a range check reads `is_in_enum(value, operation_last)`. Every
@@ -2600,12 +2606,26 @@ int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_f
 
 /* ---- Moves and copies ---------------------------------------------------------------------------------------- */
 
-/* The two operations below take two locations. Their error names no entry, and the faces compose its path from
- * the destination, the location every two-location operation of the faces reports against (the C++ and Swift
- * binding suites pin it); the kind and the step say what happened, and a missing source is `not_found` at the
- * source's own stat, before any other call. Which of the two locations a failure belongs to has no field in the
- * error struct, and a convention smuggled through `name` would mislead a C consumer reading the header's words
- * for it, so the destination stays the one answer until the header gains a field for the other. */
+/* The two operations below take two locations, and every failure of theirs says which one it belongs to in
+ * `error.failed_location`: the source is the first location, the destination the second, and the faces compose
+ * the error's path from the one named. A refusal of the arguments themselves names neither (0), like every
+ * one-location operation's error. The field is set where the operation reads a helper's failure, since the
+ * helpers (the resolver, the staged write's steps) serve one-location operations too and know nothing of it. */
+
+enum : int32_t {
+    /* The values of `bc_file_system_error.failed_location`, as the header numbers them. */
+    first_location = 1,
+    second_location = 2
+};
+
+/* Names the location a failing helper acted on, and answers the kind so a call reads
+ * `return failed_at(error, kind, first_location)`; a success (0) passes through untouched. */
+static int32_t failed_at(bc_file_system_error *error, int32_t kind, int32_t location) {
+    if (kind != 0) {
+        error->failed_location = location;
+    }
+    return kind;
+}
 
 /* ---- rename -------------------------------------------------------------------------------------------------- */
 
@@ -2635,9 +2655,10 @@ static int32_t kind_of_rename_failure(int code, int32_t existing_destination) {
     return bc_file_system_call_kind_of_errno(code);
 }
 
-/* Whether two open directories are one directory, by identity (`st_dev` and `st_ino`, read with fstat on each
- * unless they are one descriptor already): how a durable rename knows whether its two parents take one sync or
- * two. Asked before the rename, so a failure is an error with nothing changed. */
+/* Whether the two parents of a rename, the source's (`first`) and the destination's (`second`), are one
+ * directory, by identity (`st_dev` and `st_ino`, read with fstat on each unless they are one descriptor
+ * already): how a durable rename knows whether its two parents take one sync or two. Asked before the rename,
+ * so a failure is an error with nothing changed, named for the location whose parent refused the stat. */
 static int32_t same_directory(bc_file_system_engine *engine, int32_t operation, int first, int second, bool *same,
                               bc_file_system_error *error) {
     if (first == second) {
@@ -2647,14 +2668,18 @@ static int32_t same_directory(bc_file_system_engine *engine, int32_t operation, 
     struct stat first_info;
     const bc_file_system_call_outcome first_read = bc_file_system_call_fstat(engine, operation, first, &first_info);
     if (!first_read.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_fstat, &first_read,
-                              bc_file_system_call_kind_of_errno(first_read.code));
+        return failed_at(error,
+                         report_outcome(error, operation, bc_file_system_step_fstat, &first_read,
+                                        bc_file_system_call_kind_of_errno(first_read.code)),
+                         first_location);
     }
     struct stat second_info;
     const bc_file_system_call_outcome second_read = bc_file_system_call_fstat(engine, operation, second, &second_info);
     if (!second_read.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_fstat, &second_read,
-                              bc_file_system_call_kind_of_errno(second_read.code));
+        return failed_at(error,
+                         report_outcome(error, operation, bc_file_system_step_fstat, &second_read,
+                                        bc_file_system_call_kind_of_errno(second_read.code)),
+                         second_location);
     }
     if ((uint64_t)first_info.st_dev != (uint64_t)second_info.st_dev) {
         *same = false;
@@ -2666,7 +2691,9 @@ static int32_t same_directory(bc_file_system_engine *engine, int32_t operation, 
 
 /* The one step that moves the entry: renameat under `replace` (a file replaces a file, a directory an empty
  * directory), the platform's no-replace rename under `refuse`. EXDEV is the table's `cross_device`: the header
- * promises one step, so a rename across devices is refused, never copied and deleted. */
+ * promises one step, so a rename across devices is refused, never copied and deleted. The step acts on both
+ * ends, so its failure is named for the destination (what it holds, or the device it is on, is what refuses),
+ * except `not_found`: both parents are held open, so what is missing can only be the source's entry. */
 static int32_t move_entry(bc_file_system_engine *engine, int32_t operation, const bc_file_system_resolved *source,
                           const bc_file_system_resolved *destination, int32_t existing_destination,
                           bc_file_system_error *error) {
@@ -2682,8 +2709,9 @@ static int32_t move_entry(bc_file_system_engine *engine, int32_t operation, cons
             bc_file_system_call_rename_no_replace(engine, operation, source->parent, from, destination->parent, to);
     }
     if (!outcome.succeeded) {
-        return report_outcome(error, operation, step, &outcome,
-                              kind_of_rename_failure(outcome.code, existing_destination));
+        const int32_t kind = kind_of_rename_failure(outcome.code, existing_destination);
+        const int32_t location = kind == bc_file_system_error_kind_not_found ? first_location : second_location;
+        return failed_at(error, report_outcome(error, operation, step, &outcome, kind), location);
     }
     return 0;
 }
@@ -2707,15 +2735,18 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
     int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, first_location);
     }
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved to = bc_file_system_resolved_empty();
     kind = bc_file_system_resolve(engine, operation, destination, &to, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, second_location);
     }
-    if (from.leaf_length == 0 || to.leaf_length == 0) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    if (from.leaf_length == 0) {
+        return failed_at(error, refuse(error, bc_file_system_error_kind_invalid_argument, operation), first_location);
+    }
+    if (to.leaf_length == 0) {
+        return failed_at(error, refuse(error, bc_file_system_error_kind_invalid_argument, operation), second_location);
     }
     /* The source is looked at first, never followed (a symlink is moved as itself): a source that is not there
      * is `not_found` at its own stat, with nothing else asked. The look decides nothing about what is moved; the
@@ -2724,12 +2755,14 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
     const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
         engine, operation, from.parent, (const char *)from.leaf, AT_SYMLINK_NOFOLLOW, &source_info);
     if (!looked.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
-                              bc_file_system_call_kind_of_errno(looked.code));
+        return failed_at(error,
+                         report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
+                                        bc_file_system_call_kind_of_errno(looked.code)),
+                         first_location);
     }
     bool one_directory = true;
     if (durability == bc_file_system_durability_durable) {
-        kind = same_directory(engine, operation, to.parent, from.parent, &one_directory, error);
+        kind = same_directory(engine, operation, from.parent, to.parent, &one_directory, error);
         if (kind != 0) {
             return kind;
         }
@@ -2740,18 +2773,18 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
     }
     /* The name has moved: from here every failure lowers the answer. The destination's directory holds the new
      * name and is synced first; the source's held the old one and is synced too when it is another directory,
-     * unless the first sync already lowered the answer, which decides it. */
+     * unless the first sync already lowered the answer, which decides it. Only a stop ends either sync. */
     int32_t achieved = durability;
     if (achieved == bc_file_system_durability_durable) {
         kind = sync_directory_after_change(engine, operation, to.parent, &achieved, error);
         if (kind != 0) {
-            return kind;
+            return failed_at(error, kind, second_location);
         }
     }
     if (achieved == bc_file_system_durability_durable && !one_directory) {
         kind = sync_directory_after_change(engine, operation, from.parent, &achieved, error);
         if (kind != 0) {
-            return kind;
+            return failed_at(error, kind, first_location);
         }
     }
     *durability_achieved = achieved;
@@ -2960,12 +2993,12 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
     int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, first_location);
     }
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved to = bc_file_system_resolved_empty();
     kind = bc_file_system_resolve(engine, operation, destination, &to, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, second_location);
     }
     /* The source is open and known to be a regular file before the destination is judged, so a copy of nothing
      * or of a directory touches nothing at the destination. */
@@ -2973,71 +3006,54 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
     struct stat source_info;
     kind = open_source_file(engine, operation, &from, options->final_symlink, &file, &source_info, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, first_location);
     }
     /* The destination follows every rule of a staged write: a regular file is replaced (its mode kept under
      * `preserve_or`; the source's mode plays no part), a symlink refused or followed, anything else refused. */
     destination_entry existing;
     kind = judge_destination(engine, operation, destination, options->final_symlink, &to, &existing, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, second_location);
     }
     /* A destination that is the source itself, under either name of the same file (a hard link included), is
      * refused before anything is staged: there is nothing to copy, and staging would only replace the file with
-     * itself. */
+     * itself. The destination is what is refused: it is the source under another name. */
     if (existing.present && existing.device == (uint64_t)source_info.st_dev &&
         existing.inode == (uint64_t)source_info.st_ino) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+        return failed_at(error, refuse(error, bc_file_system_error_kind_invalid_argument, operation), second_location);
     }
     uint32_t mode = options->permissions.mode;
     if (options->permissions.policy == bc_file_system_permissions_policy_preserve_or && existing.present) {
         mode = existing.mode;
     }
+    /* From here every step acts beside the destination: the staged file lives in its directory, and the
+     * source is only read from. A read of the source that fails is still reported there, under the source. */
     [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(to.parent);
     kind = stage_copied_bytes(engine, operation, &staged, file.value, to.leaf, to.leaf_length, error);
     if (kind != 0) {
-        return kind;
+        if (error->step == bc_file_system_step_pread) {
+            return failed_at(error, kind, first_location);
+        }
+        return failed_at(error, kind, second_location);
     }
     int32_t achieved = options->durability;
     kind = place_staged_file(engine, operation, &staged, to.leaf, mode, options, &achieved, error);
     if (kind != 0) {
-        return kind;
+        return failed_at(error, kind, second_location);
     }
     *durability_achieved = achieved;
     return succeed(error);
 }
 
-/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+/* ---- try_lock ------------------------------------------------------------------------------------------------ */
 
-/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
- * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
- * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
- * names. */
-
-int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,
-                                      const bc_file_system_location *location, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_create_symlink;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
+/* Whether `flock` answered that another open-file description holds the lock: EWOULDBLOCK, which is EAGAIN on
+ * every platform the library ships for (an if-chain, since one number cannot be two cases of a switch). */
+static bool means_lock_held_elsewhere(int code) {
+    if (code == EWOULDBLOCK) {
+        return true;
     }
-    if (engine == nullptr || !is_byte_span(target, target_length) || !is_valid_location(location)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
-}
-
-int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                    uint8_t *buffer, size_t capacity, size_t *length, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_read_symlink;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
+    return code == EAGAIN;
 }
 
 int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -3050,7 +3066,182 @@ int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_sys
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
+
+    /* A platform whose flock is a stub (Emscripten: every caller "acquires") offers no lock at all, and the
+     * library refuses before any call rather than hand out a lock that excludes nobody. */
+    if (!bc_file_system_platform_enforces_locks()) {
+        return refuse(error, bc_file_system_error_kind_unsupported, operation);
+    }
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The lock opens the entry itself, read-only and never through a symlink (ELOOP is the table's
+     * `symlink_refused`), so the descriptor the handle owns is the open-file description the lock is held by;
+     * the walk's search-only descriptor could not hold one (flock on an O_PATH descriptor is EBADF). A regular
+     * file or a directory may be locked, the root included, as `.` beneath the descriptor the walk opened;
+     * anything else (a FIFO, a device) is refused after a look at the descriptor, with no step, like a refusal. */
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor file = {.value = -1};
+    const bc_file_system_call_outcome opened =
+        bc_file_system_call_openat(engine, operation, resolved.parent, name, lock_open_flags, &file.value);
+    if (!opened.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_openat, &opened,
+                              bc_file_system_call_kind_of_errno(opened.code));
+    }
+    struct stat info;
+    const bc_file_system_call_outcome looked = bc_file_system_call_fstat(engine, operation, file.value, &info);
+    if (!looked.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &looked,
+                              bc_file_system_call_kind_of_errno(looked.code));
+    }
+    if (!S_ISREG(info.st_mode) && !S_ISDIR(info.st_mode)) {
+        return refuse(error, bc_file_system_error_kind_not_regular_file, operation);
+    }
+    /* Exclusive and without waiting: a lock held elsewhere is an answer, not an error, and nothing is waited
+     * for. A platform or volume that refuses to lock (ENOTSUP) is the table's `unsupported`. */
+    const bc_file_system_call_outcome locked =
+        bc_file_system_call_flock(engine, operation, file.value, LOCK_EX | LOCK_NB);
+    if (!locked.succeeded) {
+        if (!locked.stopped && means_lock_held_elsewhere(locked.code)) {
+            *lock = nullptr;
+            *outcome = bc_file_system_lock_outcome_held_elsewhere;
+            return succeed(error);
+        }
+        return report_outcome(error, operation, bc_file_system_step_flock, &locked,
+                              bc_file_system_call_kind_of_errno(locked.code));
+    }
+    /* The handle owns the descriptor from here; closing it is how the lock is let go, so a handle that cannot
+     * be allocated lets the lock go through the descriptor's owner. */
+    bc_file_system_lock *created = malloc(sizeof *created);
+    if (created == nullptr) {
+        return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
+    }
+    created->descriptor = release_descriptor(&file);
+    *lock = created;
+    *outcome = bc_file_system_lock_outcome_acquired;
+    return succeed(error);
+}
+
+/* ---- create_symlink and read_symlink -------------------------------------------------------------------------- */
+
+/* Whether `target` is text the system can take as a symlink's: at least one byte, no NUL inside (the NUL that
+ * ends it is the engine's), and short enough for the bounded buffer it is terminated into, which is the bound
+ * of any path the system opens (PATH_MAX, the terminator included). */
+static bool is_symlink_target(const uint8_t *target, size_t length) {
+    if (target == nullptr || length == 0 || length >= PATH_MAX) {
+        return false;
+    }
+    return memchr(target, 0, length) == nullptr;
+}
+
+int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,
+                                      const bc_file_system_location *location, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_create_symlink;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_symlink_target(target, target_length) || !is_valid_location(location)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root is always there; a link cannot take its name. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_already_exists, operation);
+    }
+    /* The target goes to the system as the caller spelled it, NUL-terminated and nothing more: never resolved,
+     * never normalised, so a relative text or a `..` is the link's to mean. The one PATH_MAX buffer of this
+     * call. */
+    uint8_t text[PATH_MAX];
+    memcpy(text, target, target_length);
+    text[target_length] = 0;
+    const bc_file_system_call_outcome made = bc_file_system_call_symlinkat(
+        engine, operation, (const char *)text, resolved.parent, (const char *)resolved.leaf);
+    if (!made.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_symlinkat, &made,
+                              bc_file_system_call_kind_of_errno(made.code));
+    }
+    return succeed(error);
+}
+
+int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                    uint8_t *buffer, size_t capacity, size_t *length, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_read_symlink;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* readlinkat cuts a text short silently when the buffer is too small, so the text is read whole into a
+     * scratch as large as any path the system holds (the one PATH_MAX buffer of this call) and only then held
+     * against the caller's capacity, under the buffer protocol. The root is a directory, which readlinkat
+     * refuses with EINVAL like any entry that is not a symlink, as the header says. */
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+    uint8_t text[PATH_MAX];
+    size_t text_length = 0;
+    const bc_file_system_call_outcome read =
+        bc_file_system_call_readlinkat(engine, operation, resolved.parent, name, text, sizeof text, &text_length);
+    if (!read.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_readlinkat, &read,
+                              bc_file_system_call_kind_of_errno(read.code));
+    }
+    /* A text that filled the scratch may have been cut short: longer than any path the system opens, which
+     * no system of the library's makes, and refused rather than answered in part. */
+    if (text_length == sizeof text) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    if (text_length > capacity) {
+        *length = text_length;
+        return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+    }
+    if (text_length > 0) {
+        memcpy(buffer, text, text_length);
+    }
+    *length = text_length;
+    return succeed(error);
+}
+
+/* ---- condemn ------------------------------------------------------------------------------------------------- */
+
+enum : size_t {
+    /* What a condemned name holds beside the leaf: the prefix, and the dash and token a retry appends. */
+    condemned_name_overhead = (sizeof condemned_prefix - 1) + 1 + decimal_digit_capacity,
+    /* How much of the leaf a condemned name keeps, so that the name fits NAME_MAX with a token appended. */
+    condemned_leaf_capacity = NAME_MAX - condemned_name_overhead
+};
+
+/* The condemned name of `leaf`, NUL-terminated into `name` (which holds NAME_MAX + 1 bytes): the prefix and the
+ * leaf, cut to what leaves room for a token; then, when `token` is not 0, a dash and the token, which is how a
+ * name a previous condemn left behind is told apart from this one. Answers the length. */
+static size_t spell_condemned_name(uint8_t *name, const uint8_t *leaf, size_t leaf_length, uint64_t token) {
+    const size_t leaf_prefix = leaf_length < condemned_leaf_capacity ? leaf_length : condemned_leaf_capacity;
+    size_t position = 0;
+    memcpy(name, condemned_prefix, sizeof condemned_prefix - 1);
+    position += sizeof condemned_prefix - 1;
+    memcpy(name + position, leaf, leaf_prefix);
+    position += leaf_prefix;
+    if (token != 0) {
+        name[position] = '-';
+        position += 1;
+        position += spell_decimal(name + position, token);
+    }
+    name[position] = 0;
+    return position;
 }
 
 int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_system_location *location, uint8_t *buffer,
@@ -3063,7 +3254,145 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root of the file system is neither renamed nor swept. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    /* One step, the platform's no-replace rename within the one parent, so a condemned entry is whole under its
+     * new name or untouched under its old one. The plain condemned name is tried first; one that is taken (a
+     * previous condemn the sweep never cleared) is tried again with a token of the engine's own appended, a
+     * bounded number of times, so a stale leftover never fails a condemn. The name is held against the caller's
+     * capacity before each try, so a size query renames nothing and a name that outgrew the buffer on a retry
+     * is answered with nothing moved. ENOENT is the entry's absence; EINVAL, which a Linux file system without
+     * the no-replace rename answers, is `unsupported`, as it is for a rename under `refuse`. */
+    uint8_t name[NAME_MAX + 1];
+    uint64_t token = 0;
+    for (uint32_t attempt = 0; attempt < staging_attempts; ++attempt) {
+        const size_t name_length = spell_condemned_name(name, resolved.leaf, resolved.leaf_length, token);
+        if (name_length > capacity) {
+            *length = name_length;
+            return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+        }
+        const bc_file_system_call_outcome moved = bc_file_system_call_rename_no_replace(
+            engine, operation, resolved.parent, (const char *)resolved.leaf, resolved.parent, (const char *)name);
+        if (moved.succeeded) {
+            memcpy(buffer, name, name_length);
+            *length = name_length;
+            return succeed(error);
+        }
+        if (!moved.stopped && moved.code == EEXIST) {
+            token = atomic_fetch_add_explicit(&engine->staging_counter, (uint64_t)1, memory_order_relaxed) + 1;
+            continue;
+        }
+        return report_outcome(error, operation, bc_file_system_step_rename_no_replace, &moved,
+                              kind_of_rename_failure(moved.code, bc_file_system_existing_destination_refuse));
+    }
+    /* Every name tried was taken: the system's refusal, not the entry's existence. */
+    const bc_file_system_call_outcome taken = {.succeeded = false, .code = EEXIST, .stopped = false};
+    return report_outcome(error, operation, bc_file_system_step_rename_no_replace, &taken,
+                          bc_file_system_error_kind_io_failed);
+}
+
+/* ---- remove_condemned ---------------------------------------------------------------------------------------- */
+
+/* Whether a name is one `condemn` made: it starts with the condemned prefix. */
+static bool is_condemned_name(const uint8_t *name, size_t length) {
+    if (length < sizeof condemned_prefix - 1) {
+        return false;
+    }
+    return memcmp(name, condemned_prefix, sizeof condemned_prefix - 1) == 0;
+}
+
+/* Whether a name is a staged file's, left by a write or a copy that was killed between staging and renaming
+ * into place (a clone's leftover carries the same infix): the infix sits after the leaf, so anywhere inside. */
+static bool is_staged_name(const uint8_t *name) {
+    return strstr((const char *)name, staging_infix) != nullptr;
+}
+
+/* Puts `entry` and a slash before the name the error carries, so an error inside a condemned tree names its
+ * entry relative to the swept directory; a name the field cannot hold is cut at the end and `name_truncated`
+ * says so. An error that named nothing (the entry itself refused) names the entry alone. */
+static void name_entry_before_error_name(bc_file_system_error *error, const uint8_t *entry) {
+    const size_t entry_length = strlen((const char *)entry);
+    if (error->name_length == 0) {
+        memcpy(error->name, entry, entry_length);
+        error->name_length = (uint32_t)entry_length;
+        return;
+    }
+    /* An entry's name is at most NAME_MAX, one byte less than the field, so the entry and its slash fit and
+     * only the tail is at stake. */
+    const size_t room = sizeof error->name - entry_length - 1;
+    size_t kept = error->name_length;
+    if (kept > room) {
+        kept = room;
+        error->name_truncated = 1;
+    }
+    memmove(error->name + entry_length + 1, error->name, kept);
+    memcpy(error->name, entry, entry_length);
+    error->name[entry_length] = '/';
+    error->name_length = (uint32_t)(entry_length + 1 + kept);
+}
+
+/* Removes the condemned entry `name` of the directory `parent`, as `remove_tree` removes a location: what the
+ * entry is comes from a stat on the held directory, never followed; a directory is opened read-only, bracketed,
+ * and emptied through a stream of its own, by the same bounded walk; anything else is unlinked as itself; one
+ * that vanished since the listing answered it is nothing to do. An error names the entry it failed on,
+ * relative to the swept directory. */
+static int32_t remove_condemned_entry(bc_file_system_engine *engine, int32_t operation, int parent, const uint8_t *name,
+                                      bc_file_system_error *error) {
+    bc_file_system_expected_entry expected;
+    int32_t kind = bc_file_system_resolve_expect_entry(engine, operation, parent, (const char *)name,
+                                                       bc_file_system_final_symlink_refuse, &expected, error);
+    if (kind == bc_file_system_error_kind_not_found && error->system_code == ENOENT) {
+        return 0;
+    }
+    if (kind != 0) {
+        name_entry_before_error_name(error, name);
+        return kind;
+    }
+    if (!expected.is_directory) {
+        const bc_file_system_call_outcome removed =
+            bc_file_system_call_unlinkat(engine, operation, parent, (const char *)name, 0);
+        if (removed.succeeded) {
+            return 0;
+        }
+        if (!removed.stopped && removed.code == ENOENT) {
+            return 0;
+        }
+        kind = report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
+                              bc_file_system_call_kind_of_errno(removed.code));
+        name_entry_before_error_name(error, name);
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    kind = bc_file_system_resolve_open_expected_directory(
+        engine, operation, parent, (const char *)name, bc_file_system_final_symlink_refuse,
+        bc_file_system_directory_access_read, &expected, &opened, error);
+    if (kind != 0) {
+        name_entry_before_error_name(error, name);
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_directory_stream)]] owned_directory_stream top = {.value = nullptr};
+    const bc_file_system_call_outcome streamed =
+        bc_file_system_call_fdopendir(engine, operation, opened.value, &top.value);
+    if (!streamed.succeeded) {
+        kind = report_outcome(error, operation, bc_file_system_step_fdopendir, &streamed,
+                              bc_file_system_call_kind_of_errno(streamed.code));
+        name_entry_before_error_name(error, name);
+        return kind;
+    }
+    (void)release_descriptor(&opened);
+    kind = remove_directory_tree(engine, operation, parent, name, top.value, expected.device, error);
+    if (kind != 0) {
+        name_entry_before_error_name(error, name);
+    }
+    return kind;
 }
 
 int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_file_system_location *parent,
@@ -3076,5 +3405,61 @@ int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 17 locks-links-condemn */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, parent, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The directory is opened read-only, bracketed, and read through a stream whose descriptor serves every
+     * removal inside it: a final symlink is the system's to resolve under `at` and refused under `beneath`, as
+     * for any component. */
+    bc_file_system_expected_entry expected;
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    kind = open_resolved_directory(engine, operation, &resolved, symlink_choice_of(parent),
+                                   bc_file_system_directory_access_read, &expected, &opened, error);
+    if (kind != 0) {
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_directory_stream)]] owned_directory_stream stream = {.value = nullptr};
+    const bc_file_system_call_outcome streamed =
+        bc_file_system_call_fdopendir(engine, operation, opened.value, &stream.value);
+    if (!streamed.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fdopendir, &streamed,
+                              bc_file_system_call_kind_of_errno(streamed.code));
+    }
+    (void)release_descriptor(&opened);
+    /* One pass over the stream: an entry carrying either of the engine's marks is removed as it is reached (a
+     * condemned one as a tree, a staged leftover as the one file it is), everything else is left alone, and the
+     * first entry that refuses ends the sweep with that entry named, what was removed before it kept. The
+     * stream is read on while entries it already answered are removed, which every system the library ships for
+     * takes. */
+    for (;;) {
+        uint8_t name[NAME_MAX + 1];
+        size_t name_length = 0;
+        unsigned char d_type = DT_UNKNOWN;
+        bool found = false;
+        kind = next_entry_name(engine, operation, stream.value, name, &name_length, &d_type, &found, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (!found) {
+            return succeed(error);
+        }
+        if (is_condemned_name(name, name_length)) {
+            kind = remove_condemned_entry(engine, operation, dirfd(stream.value), name, error);
+            if (kind != 0) {
+                return kind;
+            }
+        } else if (is_staged_name(name)) {
+            const bc_file_system_call_outcome removed =
+                bc_file_system_call_unlinkat(engine, operation, dirfd(stream.value), (const char *)name, 0);
+            if (!removed.succeeded && !(removed.code == ENOENT && !removed.stopped)) {
+                kind = report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
+                                      bc_file_system_call_kind_of_errno(removed.code));
+                name_entry_before_error_name(error, name);
+                return kind;
+            }
+        }
+    }
 }

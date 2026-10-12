@@ -21,8 +21,9 @@ on:
 # `aarch64-unknown-linux-musl` (clang-19 `--target=aarch64-linux-musl` over musl-dev:arm64 headers, named per
 # target through CC_<triple>; no cargo-zigbuild on the Mac either); memory-sanitized; build-clang's sanitized
 # leg (clang-19's compiler-rt, libclang-rt-19-dev: without it the sanitized link fails on libclang_rt.asan*.a);
-# and the `fuzz-smoke` leg (libFuzzer is in that same compiler-rt package), which runs on the Mac by hand
-# (`bash scripts/verify.sh fuzz-smoke`) until then. Each lands as its own job when its packages do. The wasm32
+# and the `fuzz-smoke` leg (libFuzzer is in that same compiler-rt package; its three targets are
+# bc_file_system_path_fuzz, bc_file_system_abi_arguments_fuzz and bc_file_system_operation_sequence_fuzz), which
+# runs on the Mac by hand (`bash scripts/verify.sh fuzz-smoke`) until then. Each lands as its own job when its packages do. The wasm32
 # freestanding compile of the path module needs no package: clang-19 has the target, so the path-freestanding
 # job below runs under it.
 jobs:

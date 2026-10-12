@@ -34,7 +34,8 @@ auto answer_outside_enum(Operation called, std::string_view text) -> Error {
                  .step = std::nullopt,
                  .system_code = 0,
                  .path = std::string(text),
-                 .name_truncated = false};
+                 .name_truncated = false,
+                 .failed_location = std::nullopt};
 }
 
 // The buffer protocol for a pure function: the size first (a capacity of 0), then exactly that much. A path

@@ -95,6 +95,11 @@ int bc_file_system_platform_access_check_flags(void) {
     return AT_EACCESS;
 }
 
+/* flock is the BSD lock the kernel keeps per open-file description. */
+bool bc_file_system_platform_enforces_locks(void) {
+    return true;
+}
+
 /* O_NOFOLLOW_ANY makes the kernel refuse a symlink at any depth of `relative` with ELOOP (measured: in the middle
  * and at the end alike), so one openat relative to the held root resolves the whole path contained. */
 int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor) {
@@ -193,6 +198,11 @@ bool bc_file_system_platform_search_open_checks_permission(void) {
 
 int bc_file_system_platform_access_check_flags(void) {
     return AT_EACCESS;
+}
+
+/* flock returns 0 to every caller on both backends (measured under Node): no lock is held by anyone. */
+bool bc_file_system_platform_enforces_locks(void) {
+    return false;
 }
 
 /* No kernel call opens a path contained beneath a descriptor here; the engine never asks, since containment is
@@ -319,6 +329,11 @@ int bc_file_system_platform_access_check_flags(void) {
     return AT_EACCESS;
 }
 #endif
+
+/* flock is the kernel's per-open-file-description lock on glibc, musl and bionic alike. */
+bool bc_file_system_platform_enforces_locks(void) {
+    return true;
+}
 
 #if defined(__ANDROID__) || !__has_include(<linux/openat2.h>)
 /* The engine never calls this where the probe answered no (Android, or headers older than kernel 5.6); the

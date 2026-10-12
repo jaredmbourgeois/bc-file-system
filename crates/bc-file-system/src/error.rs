@@ -347,6 +347,23 @@ impl Step {
     }
 }
 
+/// Which of the two locations of `rename` and `copy_file` an error belongs to: the source is the first, the
+/// destination the second. The discriminants are the header's; 0 (an operation over one location) is `None` on
+/// the typed error, not a variant.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FailedLocation {
+    /// The first location: the source.
+    First = 1,
+    /// The second location: the destination.
+    Second = 2,
+}
+
+impl FailedLocation {
+    /// Both locations, in the header's order.
+    pub const ALL: [Self; 2] = [Self::First, Self::Second];
+}
+
 /// An integer the core answered that is outside the enum this face knows. It cannot happen for a core and a
 /// face built from one checkout, which this crate's build script guarantees; it is reported rather than
 /// guessed at because a guess would be a silent default.
@@ -396,6 +413,12 @@ impl From<Step> for i32 {
     }
 }
 
+impl From<FailedLocation> for i32 {
+    fn from(location: FailedLocation) -> Self {
+        location as Self
+    }
+}
+
 impl TryFrom<i32> for ErrorKind {
     type Error = UnknownValue;
 
@@ -420,6 +443,14 @@ impl TryFrom<i32> for Step {
     }
 }
 
+impl TryFrom<i32> for FailedLocation {
+    type Error = UnknownValue;
+
+    fn try_from(value: i32) -> Result<Self, UnknownValue> {
+        variant_of(&Self::ALL, value, "bc_file_system_error.failed_location")
+    }
+}
+
 /// Why a call failed, as the core reported it: the kind to act on, the operation and the step that failed, the
 /// errno for the log, and the entry the step acted on. The text a consumer reads is [`fmt::Display`]'s, rendered
 /// here with the host's own errno text; the core never formats.
@@ -438,9 +469,14 @@ pub struct Error {
     pub name: Vec<u8>,
     /// Whether `name` was cut short by the core's fixed field.
     pub name_truncated: bool,
+    /// Which end of a two-location operation (`rename`, `copy_file`) the failure belongs to, and so which
+    /// location `name` is relative to; `None` for an operation over one location and for a refusal of the
+    /// arguments, which blames neither.
+    pub failed_location: Option<FailedLocation>,
     /// Set when the core answered an integer outside an enum this face knows: the field it stands in for was
     /// filled with a documented stand-in (`InvalidArgument` for the kind, the operation that was called for the
-    /// operation, `None` for the step) and the raw value is kept here so the mismatch is visible, never silent.
+    /// operation, `None` for the step and the failed location) and the raw value is kept here so the mismatch
+    /// is visible, never silent.
     pub unknown_value: Option<UnknownValue>,
 }
 
@@ -470,6 +506,17 @@ impl Error {
                 Some,
             )
         };
+        let failed_location = if c_error.failed_location == 0 {
+            None
+        } else {
+            FailedLocation::try_from(c_error.failed_location).map_or_else(
+                |unknown| {
+                    unknown_value.get_or_insert(unknown);
+                    None
+                },
+                Some,
+            )
+        };
         // The core bounds `name_length` by the field; the minimum keeps a face honest should it ever not.
         let name_length = usize::try_from(c_error.name_length)
             .unwrap_or(usize::MAX)
@@ -481,6 +528,7 @@ impl Error {
             system_code: c_error.system_code,
             name: c_error.name[..name_length].to_vec(),
             name_truncated: c_error.name_truncated != 0,
+            failed_location,
             unknown_value,
         }
     }
@@ -509,6 +557,11 @@ impl fmt::Display for Error {
                 " (entry {}{suffix})",
                 String::from_utf8_lossy(&self.name)
             )?;
+        }
+        match self.failed_location {
+            Some(FailedLocation::First) => write!(formatter, " (at the source)")?,
+            Some(FailedLocation::Second) => write!(formatter, " (at the destination)")?,
+            None => {}
         }
         if let Some(unknown) = self.unknown_value {
             write!(formatter, " [the core answered {unknown}]")?;

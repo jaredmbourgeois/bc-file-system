@@ -99,8 +99,9 @@ CONFIGURATION: Final = Configuration(
     reach_is_legal_in={
         # The body of the seam's one live implementation (the engine, the resolution layer, the unit that makes
         # every gated system call, and the cleanup idiom they open descriptors through, its platform header and
-        # the platform bodies), the one composition root in C (the consumer example's `main`), and the C-only
-        # test that plants a tree under the root it is handed.
+        # the platform bodies), the one composition root in C (the consumer example's `main`), the C-only test
+        # that plants a tree under the root it is handed, and the two engine fuzzers with their harness, which
+        # make their roots under the directory the build hands them and count their own descriptors.
         "c": (
             "core/src/bc_file_system.c",
             "core/src/calls.c",
@@ -112,6 +113,9 @@ CONFIGURATION: Final = Configuration(
             "core/src/resolve.h",
             "core/tests/resolve_test.c",
             "examples/consumer/main.c",
+            "fuzz/harness.h",
+            "fuzz/abi_arguments_fuzz.c",
+            "fuzz/operation_sequence_fuzz.c",
         ),
         # The one C++ file that names `bc_file_system_engine_create_live` (the face's live factory), and the tests'
         # own file system: the temporary directory and the descriptor-balance fixture.
@@ -168,6 +172,7 @@ CONFIGURATION: Final = Configuration(
         "crates/bc-file-system/src/ffi.rs",
         "crates/bc-file-system/src/live.rs",
         "crates/bc-file-system/tests/",
+        "fuzz/",
         "Sources/BCFileSystemTestFixtures/",
         "Tests/",
     ),

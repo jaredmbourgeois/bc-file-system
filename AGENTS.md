@@ -25,13 +25,13 @@ wrong even when it compiles and passes.
 | Path | What it is | CMake target | SwiftPM target | Cargo crate |
 |---|---|---|---|---|
 | `core/include/bc_file_system/` | The public C header, included as `<bc_file_system/bc_file_system.h>` | `bc::file_system_core` | `CBCFileSystem` | — |
-| `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier: the handles, the observer and every operation, with the `staged_file` a write or a copy owns until it is renamed into place, the `created_directory` a creation owns until it has its mode, and the tree removal's bounded window of directory streams, each under the cleanup idiom) with its private face `engine.h` (the observer's two hooks and the probed fast paths, for the C-only test, and the vocabulary of a gated system call: the outcome, the reading of a verdict, the report), `calls.c` every gated system call the core makes, one loop each named for the call (`bc_file_system_call_openat`, …, behind the observer, asked again on EINTR, the errno copied on the next line; `close` made once) and the one errno table, behind `calls.h`, `resolve.c` the resolution layer (a location to a parent descriptor and a leaf name, with containment enforced by the kernel: the walk, whose components open for search only, the fast paths, the identity check) behind `resolve.h`, `owned.h` the one cleanup idiom (`owned_descriptor`, `owned_directory_stream`, `owned_buffer` under `[[gnu::cleanup]]`), `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` with `platform.c` the only files that name the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | compiled by `bc-file-system`'s `build.rs` |
+| `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier: the handles, the observer and every operation, with the `staged_file` a write or a copy owns until it is renamed into place, the `created_directory` a creation owns until it has its mode, the tree removal's bounded window of directory streams, each under the cleanup idiom, the lock over an open of its own, and the condemned sweep over the same tree removal) with its private face `engine.h` (the observer's two hooks and the probed fast paths, for the C-only test, and the vocabulary of a gated system call: the outcome, the reading of a verdict, the report), `calls.c` every gated system call the core makes, one loop each named for the call (`bc_file_system_call_openat`, …, behind the observer, asked again on EINTR, the errno copied on the next line; `close` made once) and the one errno table, behind `calls.h`, `resolve.c` the resolution layer (a location to a parent descriptor and a leaf name, with containment enforced by the kernel: the walk, whose components open for search only, the fast paths, the identity check) behind `resolve.h`, `owned.h` the one cleanup idiom (`owned_descriptor`, `owned_directory_stream`, `owned_buffer` under `[[gnu::cleanup]]`), `names.h` the one table of the names the engine makes up (the staging infix, the condemned prefix), which the sweep and the fuzzers read, `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` with `platform.c` the only files that name the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | compiled by `bc-file-system`'s `build.rs` |
 | `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach; `resolve_test.c` drives the resolution layer through `resolve.h` over a tree it plants under the root `add_test` hands it | `bc_file_system_path_test`, `bc_file_system_engine_test`, `bc_file_system_resolve_test` | not built | — |
 | `cpp/include/bc_file_system/`, `cpp/src/` | The C++ face, a thin wrapper over the header (`.clang-tidy`: the C++ set) | `bc::file_system` | not built | — |
 | `cpp/tests/` | The contract suite (the specification every face is held to, driving C through the C++ face), the C++ binding suite, the observer and path-value suites, and `support/` (the temporary directory, the descriptor-balance fixture, the generated `test_paths.hpp`) | `bc_file_system_test` | not built | — |
 | `Sources/CBCFileSystem/`, `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module, its test fixtures (the temporary directory and the observed engine), and its binding suite and source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
 | `crates/` | The Rust face, a virtual workspace with one `Cargo.lock` and `publish = false` (consumers pin a git SHA): `bc-file-system/` compiles the core through `cc` (`build.rs`), spells the ABI by hand (`src/ffi.rs`, the layout pins beside it), holds the engine, the observer and the error vocabulary (`src/live.rs`, `src/error.rs`), and proves the declarations against the core in `tests/abi_smoke.rs`; the typed operations and `bc-file-system-testing` arrive at stage `rust-crates` | — | — | `bc-file-system` (`bc-file-system-testing` at `rust-crates`) |
-| `fuzz/` | The libFuzzer targets, behind `BC_FILE_SYSTEM_BUILD_FUZZERS` (on in the `fuzz` preset): `path_fuzz.c` over the path module now; the ABI-argument and operation-sequence targets arrive at `locks-links-condemn` | `bc_file_system_path_fuzz` | — | — |
+| `fuzz/` | The libFuzzer targets, behind `BC_FILE_SYSTEM_BUILD_FUZZERS` (on in the `fuzz` preset): `path_fuzz.c` over the path module; `abi_arguments_fuzz.c` over every public function with fuzzed arguments, and `operation_sequence_fuzz.c` over sequences of operations on one tree with faults scripted into them, each over a root it makes once under the directory the generated `fuzz_paths.h` hands it, sharing `harness.h` (the trap, the reader of fuzzed bytes, the root, the count of descriptors open under it) | `bc_file_system_path_fuzz`, `bc_file_system_abi_arguments_fuzz`, `bc_file_system_operation_sequence_fuzz` | — | — |
 | `examples/consumer/` | A separate CMake project that consumes the core through FetchContent | its own project | — | — |
 | `cmake/helpers.cmake` | The compile-options helper, the toolchain-knob list, the build posture, the four-way header check | included by the root | — | — |
 | `scripts/check_house_rules.py` | The guard for the three rules, over every language here | run by `scripts/verify.sh` | — | — |
@@ -82,7 +82,10 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
    root `test_paths.hpp` hands in) and `cpp/tests/support/descriptor_balance.cpp` (the open-descriptor sweep the
    fixture takes before and after every case); `core/tests/resolve_test.c` (the C-only test of the resolution
    layer, which plants its tree with `mkdirat`, `symlinkat` and `openat` on held descriptors under the root
-   `add_test` hands it and removes it when it ends); `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
+   `add_test` hands it and removes it when it ends); the two engine fuzzers and their harness (`fuzz/harness.h`,
+   `fuzz/abi_arguments_fuzz.c`, `fuzz/operation_sequence_fuzz.c`), which make their roots under the directory
+   the generated `fuzz_paths.h` hands them and read their own descriptors' paths to prove nothing leaked;
+   `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
    one place `swift test` reads where its root is, and the only Swift file that names `FileManager`); and
    `crates/bc-file-system/tests/abi_smoke.rs`, the ABI smoke, which creates a live engine because proving the
    declarations against the real core is the whole of its job.
@@ -101,7 +104,8 @@ observer is installed by one factory, `bc_file_system_engine_create_observed_for
 in C++, `FileSystem.observed(root:)` in Swift, `ObservedEngine::observed_for_tests()` in Rust until
 `bc-file-system-testing` takes it), and the guard's `test-only-factory` leg confines its callers to the header,
 the core, the one wrapper per face (`cpp/src/engine.cpp`; `crates/bc-file-system/src/ffi.rs` and `src/live.rs`),
-`core/tests/`, `cpp/tests/`, `crates/bc-file-system/tests/`, `Sources/BCFileSystemTestFixtures/` and `Tests/`.
+`core/tests/`, `cpp/tests/`, `crates/bc-file-system/tests/`, `fuzz/` (the engine fuzzers drive the observed
+engine so a fuzzed fault scripts real refusals), `Sources/BCFileSystemTestFixtures/` and `Tests/`.
 **In a script, the path handed in is the injection**: a function may open the path and write the stream it
 was given, and `main(argv, …)` reads the command line and passes everything down.
 
@@ -236,8 +240,8 @@ comment that explains it. Brevity is never worth obscurity.
 - **One cleanup idiom**: `[[gnu::cleanup]]` on the owned-resource structs (`owned_descriptor`,
   `owned_directory_stream`, `owned_buffer`), with `release_*` for transfer out. No `goto`, no `alloca`, no VLA.
 - **Errors are enums and integers**: every public function returns a status and fills a caller-owned error
-  struct of fixed-width fields (the kind, the operation, the step, the system code, a bounded name); the faces
-  render text. A contract violation (NULL, an out-of-range enum, NUL in a path) returns `invalid_argument` and
+  struct of fixed-width fields (the kind, the operation, the step, the system code, a bounded name, and which
+  of a two-location operation's ends the failure belongs to); the faces render text. A contract violation (NULL, an out-of-range enum, NUL in a path) returns `invalid_argument` and
   touches nothing; `assert` only on `static` internals; no `abort`, `exit` or `unreachable()` in the library;
   the library allocates nothing for answers and only bounded scratch.
 - **Every external symbol starts `bc_file_system_`; everything else is `static`.** Strict prototypes; no pointer
@@ -347,10 +351,16 @@ comment that explains it. Brevity is never worth obscurity.
   the `at` walk and the `beneath` walk, the fast path and the walk it falls back to when the fast path's step is
   scripted to refuse, and the identity check against a directory swapped between the stat and the open, made
   deterministic by calling the two halves of a checked open one at a time), counting the open descriptors
-  before and after every case. `fuzz/path_fuzz.c` is a
-  libFuzzer target over the module, built by the `fuzz` preset (clang with libFuzzer: Homebrew LLVM on a Mac)
-  and run for ten seconds per target by the `fuzz-smoke` leg; its invariants are asserted with a trap, never a
-  print.
+  before and after every case. The three libFuzzer targets under `fuzz/` are built by the `fuzz` preset (clang
+  with libFuzzer: Homebrew LLVM on a Mac) and run for ten seconds each by the `fuzz-smoke` leg, their
+  invariants asserted with a trap, never a print: `path_fuzz.c` over the path module; `abi_arguments_fuzz.c`
+  over every public function with fuzzed arguments (enums outside their range, NULL and zero-capacity pairs,
+  bounds near `INT64_MAX`, NUL and slashes in paths), holding that the status is the error's kind, a success
+  zeroes the error, a failure leaves every out-parameter untouched, and no descriptor is left behind;
+  `operation_sequence_fuzz.c` over sequences of operations on one tree with faults scripted into them, holding
+  after every operation that the descriptors balance, that nothing was created outside the root, and that no
+  regular file under a live name holds a partial payload (a staged file, named with the engine's infix, is a
+  killed write's and never a live name).
 - **A failure is provoked for real where that is possible** (a missing file, a symlink, a directory without
   permission) and injected through the observer where it is not (the disk filling up mid-write).
 - **A test checks its outcome without the code under test**, through the test support's raw helpers, and
@@ -364,6 +374,14 @@ comment that explains it. Brevity is never worth obscurity.
   commit, and a case disabled to make a run pass is a finding.
 - **A guard must be able to fail.** The guard scripts have `--selftest` and the Swift scan planted cases for
   every rule; a new rule comes with a plant that proves it fires and a near miss that proves it does not.
+- **Appending a step, an operation or an error field touches a closed list**, and the full `scripts/verify.sh`
+  runs after every member of it, never only its first legs: the header; `step_last` (or `operation_last`) and
+  the layout pins in `core/src/bc_file_system.c`; `cpp/include/bc_file_system/error.hpp` (the enum and its
+  pin) and `cpp/src/error.cpp` (the name and the range bound); the C++ binding suite's name table (its size and
+  its out-of-range value); `Sources/BCFileSystem/FileSystemError.swift` (the case) and the Swift binding
+  suite's pairs, count and out-of-range value; `crates/bc-file-system/src/error.rs` (the variant, the `ALL`
+  array's size, the name) and `crates/bc-file-system/tests/abi_smoke.rs` (the count, the last value, the
+  out-of-range value); for a field, every face's `Error`, its conversion and the layout pins in all three.
 
 ## Verification
 

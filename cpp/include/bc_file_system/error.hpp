@@ -203,6 +203,13 @@ static_assert(static_cast<std::int32_t>(Step::openat_nofollow_any) == bc_file_sy
 static_assert(static_cast<std::int32_t>(Step::fchmodat) == bc_file_system_step_fchmodat);
 static_assert(static_cast<std::int32_t>(Step::faccessat) == bc_file_system_step_faccessat);
 
+/// Which of the two locations of `rename` and `copy_file` an error belongs to: the source is the first, the
+/// destination the second. The values are the header's.
+enum class FailedLocation : std::int32_t {
+    first = 1,
+    second = 2,
+};
+
 /// Why an operation failed. A plain value: no inheritance, and no source location, because a library does not
 /// decide its caller's diagnostics. The core reports enums and integers; the face composes `path` from the
 /// `Location` it holds and renders text on request.
@@ -219,6 +226,9 @@ struct Error {
     std::string path;
     /// True when the entry's name was longer than the core's bounded name field, so `path` ends early.
     bool name_truncated;
+    /// Which end of a two-location operation the failure belongs to, and so which location `path` was composed
+    /// from; empty for an operation over one location and for a refusal of the arguments, which blames neither.
+    std::optional<FailedLocation> failed_location;
 
     /// "<operation>: <path>: <the system's message, or the kind's name>"; the path segment is left out when
     /// the call took no location.
@@ -237,12 +247,21 @@ struct Error {
 [[nodiscard]] auto error_kind_from(std::int32_t value) noexcept -> std::optional<ErrorKind>;
 [[nodiscard]] auto operation_from(std::int32_t value) noexcept -> std::optional<Operation>;
 [[nodiscard]] auto step_from(std::int32_t value) noexcept -> std::optional<Step>;
+/// Empty for 0 (an operation over one location) and for a value outside the enum.
+[[nodiscard]] auto failed_location_from(std::int32_t value) noexcept -> std::optional<FailedLocation>;
 
 /// The face's one conversion of a C error, with the full path composed from `location_text` (empty for a call
 /// that took no location) and the entry name the core reported. The core names the operation itself; `called`
 /// is the operation this face invoked and stands in only if the core's value were outside the enum, which the
 /// pins above make impossible for a core and a face built together.
 [[nodiscard]] auto error_from(const bc_file_system_error& c_error, Operation called, std::string_view location_text)
+    -> Error;
+
+/// The same conversion for an operation over two locations (`rename`, `copy_file`): the path is composed from
+/// the location the core's `failed_location` names, the first (the source) or the second (the destination), and
+/// from the second when it names neither, which only a refusal of the arguments does.
+[[nodiscard]] auto error_from_two_locations(const bc_file_system_error& c_error, Operation called,
+                                            std::string_view first_location_text, std::string_view second_location_text)
     -> Error;
 
 } // namespace bc::file_system

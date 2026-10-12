@@ -73,5 +73,12 @@ not read is a parent like any other. Stage 16 `moves-and-copies-in-c` is in: `re
 delete, a durable rename syncing both directories) and `copy_file` (staged like a write and atomic at the
 destination; the bytes by the platform's clone where it has one, the kernel's `copy_file_range` next, the
 read-and-write loop otherwise, with the kill-point table holding the destination whole or replaced at every step)
-are real on every face. The remaining operations land in C in the next stage (locks and links); `0.1.0` is tagged
-when every face is green on every platform.
+are real on every face. Stage 17 `locks-links-condemn` is in: `try_lock` (the platform's `flock` over an open of
+the entry's own, `held_elsewhere` an answer and never a wait, `unsupported` where `flock` is a stub),
+`create_symlink` and `read_symlink` (the target passed to the system unchanged and read back whole under the
+buffer protocol), `condemn` (one no-replace rename to `.bc-condemned-<name>` beside the entry, a stale leftover
+told apart by a token) and `remove_condemned` (the tree removal over every condemned entry and every staged file a
+killed write left) are real on every face, so every operation of the header is; the error struct says which end of
+a `rename` or `copy_file` a failure belongs to (`failed_location`, 280 to 284 bytes, every face's pin moved); the
+ABI-argument and operation-sequence fuzzers run beside the path fuzzer under the `fuzz` preset; and nothing of the
+draft facade reached this repository. `0.1.0` is tagged when every face is green on every platform.

@@ -11,9 +11,8 @@ import Testing
 #endif
 
 /// The Swift binding suite: the face's contract with the C header, apart from what the operations do to the file
-/// system (the contract suite's job). Each operation reaches the core once (a real operation answers from the
-/// file system; a stub's `unsupported` names the operation it reached), the mapping of every enum is total in
-/// both directions, each value type makes one
+/// system (the contract suite's job). Each operation reaches the core once and answers from the file system,
+/// the mapping of every enum is total in both directions, each value type makes one
 /// round trip across the ABI, every struct has the layout the core pins, the error struct is converted and
 /// rendered, and the face's own compositions do what the design doc says. Green from this stage: it tests the
 /// face, not the engine.
@@ -27,26 +26,6 @@ struct BindingTests {
 
     private func observedFileSystem() throws -> ObservedFileSystem {
         try FileSystem.observed(root: TemporaryDirectory.create())
-    }
-
-    /// The stub answers `unsupported` from the operation it reached, with no step and no system code: the one
-    /// answer that proves the call crossed into C and came back through the face's conversion.
-    private func expectUnsupported<T>(
-        _ operation: Operation,
-        path: String,
-        sourceLocation: SourceLocation = #_sourceLocation,
-        from body: () throws(FileSystemError) -> T
-    ) {
-        do {
-            _ = try body()
-            Issue.record("expected unsupported from \(operation)", sourceLocation: sourceLocation)
-        } catch {
-            #expect(error.kind == .unsupported, sourceLocation: sourceLocation)
-            #expect(error.operation == operation, sourceLocation: sourceLocation)
-            #expect(error.step == nil, sourceLocation: sourceLocation)
-            #expect(error.systemCode == 0, sourceLocation: sourceLocation)
-            #expect(error.path == path, sourceLocation: sourceLocation)
-        }
     }
 
     // MARK: - Every operation reaches C
@@ -188,9 +167,9 @@ struct BindingTests {
         #expect(try observed.root.rawMode(of: "parent/" + String(decoding: name, as: UTF8.self)) == 0o700)
     }
 
-    /// A rename is real, and the error of a two-location operation names the destination (the face's convention
-    /// for both of them, whichever end the failing step acted on).
-    @Test func renameReachesCAndItsErrorNamesTheDestination() throws {
+    /// A rename is real, and the error of a two-location operation names the end it belongs to: the face reads
+    /// the core's `failed_location` and composes the path from the source or the destination accordingly.
+    @Test func renameReachesCAndItsErrorNamesTheEndThatFailed() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("content", to: "from", mode: 0o644)
 
@@ -201,19 +180,26 @@ struct BindingTests {
         #expect(achieved == .written)
         #expect(try observed.root.rawRead("to") == "content")
         #expect(observed.root.rawExists("from") == false)
-        do {
-            _ = try observed.fileSystem.rename(
+        let ofNothing = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.rename(
                 from: try observed.location("from"), to: try observed.location("to"), existingDestination: .replace,
                 durability: .written)
-            Issue.record("expected not_found from a rename of nothing")
-        } catch {
-            #expect(error.kind == .notFound)
-            #expect(error.operation == .rename)
-            #expect(error.path == observed.root.absolutePath(of: "to"))
         }
+        let intoNothing = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.rename(
+                from: try observed.location("to"), to: try observed.location("missing/to"),
+                existingDestination: .replace, durability: .written)
+        }
+        #expect(ofNothing?.kind == .notFound)
+        #expect(ofNothing?.operation == .rename)
+        #expect(ofNothing?.failedLocation == .first)
+        #expect(ofNothing?.path == observed.root.absolutePath(of: "from"))
+        #expect(intoNothing?.kind == .notFound)
+        #expect(intoNothing?.failedLocation == .second)
+        #expect(intoNothing?.path == observed.root.absolutePath(of: "missing/to"))
     }
 
-    @Test func copyFileReachesCAndItsErrorNamesTheDestination() throws {
+    @Test func copyFileReachesCAndItsErrorNamesTheEndThatFailed() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("content", to: "from", mode: 0o644)
 
@@ -223,16 +209,22 @@ struct BindingTests {
         #expect(achieved == .written)
         #expect(try observed.root.rawRead("to") == "content")
         #expect(try observed.root.rawRead("from") == "content")
-        do {
-            _ = try observed.fileSystem.copyFile(
+        let ofNothing = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.copyFile(
                 from: try observed.location("absent"), to: try observed.location("to"),
                 options: Self.writtenExactly0644)
-            Issue.record("expected not_found from a copy of nothing")
-        } catch {
-            #expect(error.kind == .notFound)
-            #expect(error.operation == .copyFile)
-            #expect(error.path == observed.root.absolutePath(of: "to"))
         }
+        let intoNothing = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.copyFile(
+                from: try observed.location("from"), to: try observed.location("missing/to"),
+                options: Self.writtenExactly0644)
+        }
+        #expect(ofNothing?.kind == .notFound)
+        #expect(ofNothing?.operation == .copyFile)
+        #expect(ofNothing?.failedLocation == .first)
+        #expect(ofNothing?.path == observed.root.absolutePath(of: "absent"))
+        #expect(intoNothing?.failedLocation == .second)
+        #expect(intoNothing?.path == observed.root.absolutePath(of: "missing/to"))
     }
 
     @Test func setPermissionsReachesC() throws {
@@ -244,40 +236,64 @@ struct BindingTests {
         #expect(try observed.root.rawMode(of: "file") == 0o600)
     }
 
+    /// The link operations are real: the target crosses as bytes, lands, and comes back through the grow loop.
     @Test func createSymlinkReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.createSymlink, path: observed.root.absolutePath(of: "link")) { () throws(FileSystemError) in
-            try observed.fileSystem.createSymlink(target: Array("target".utf8), at: try observed.location("link"))
-        }
+
+        try observed.fileSystem.createSymlink(target: Array("target".utf8), at: try observed.location("link"))
+
+        #expect(try observed.fileSystem.readSymlink(try observed.location("link")) == Array("target".utf8))
     }
 
     @Test func readSymlinkReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.readSymlink, path: observed.root.absolutePath(of: "link")) { () throws(FileSystemError) in
-            try observed.fileSystem.readSymlink(try observed.location("link"))
-        }
+        try observed.root.rawMakeSymlink(at: "link", pointingAt: "target")
+
+        let text = try observed.fileSystem.readSymlink(try observed.location("link"))
+
+        #expect(text == Array("target".utf8))
     }
 
+    /// The lock is real: the handle comes back under `acquired`, a second ask answers nil for `heldElsewhere`,
+    /// and the handle going away lets the lock go.
     @Test func tryLockReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.tryLock, path: observed.root.absolutePath(of: "file.lock")) { () throws(FileSystemError) in
-            try observed.fileSystem.tryLock(try observed.location("file.lock"))
+        try observed.root.rawWrite("", to: "file.lock", mode: 0o644)
+        let location = try observed.location("file.lock")
+
+        var refusedWhileHeld: Lock?
+        do {
+            let held = try observed.fileSystem.tryLock(location)
+            #expect(held != nil)
+            refusedWhileHeld = try observed.fileSystem.tryLock(location)
         }
+        let again = try observed.fileSystem.tryLock(location)
+
+        #expect(refusedWhileHeld == nil)
+        #expect(again != nil)
     }
 
     @Test func condemnReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.condemn, path: observed.root.absolutePath(of: "tree")) { () throws(FileSystemError) in
-            try observed.fileSystem.condemn(try observed.location("tree"))
-        }
+        try observed.root.rawMakeDirectory("tree", mode: 0o755)
+
+        let name = try observed.fileSystem.condemn(try observed.location("tree"))
+
+        #expect(String(decoding: name, as: UTF8.self) == ".bc-condemned-tree")
+        #expect(observed.root.rawExists(".bc-condemned-tree"))
     }
 
     @Test func removeCondemnedReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.removeCondemned, path: observed.root.absolutePath(of: "parent")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.removeCondemned(in: try observed.location("parent"))
-        }
+        try observed.root.rawMakeDirectory("parent", mode: 0o755)
+        try observed.root.rawMakeDirectory("parent/.bc-condemned-tree", mode: 0o755)
+        try observed.root.rawWrite("kept", to: "parent/kept", mode: 0o644)
+
+        try observed.fileSystem.removeCondemned(in: try observed.location("parent"))
+
+        #expect(try observed.root.rawNames() == ["parent"])
+        #expect(observed.root.rawExists("parent/.bc-condemned-tree") == false)
+        #expect(observed.root.rawExists("parent/kept"))
     }
 
     /// The observer's three calls reach C: each succeeds on an observed engine, and a fresh engine has counted
@@ -485,6 +501,12 @@ struct BindingTests {
         #expect(LockOutcome.heldElsewhere.rawValue == Int32(bc_file_system_lock_outcome_held_elsewhere.rawValue))
         #expect(FaultAction.fail.rawValue == Int32(bc_file_system_fault_action_fail.rawValue))
         #expect(FaultAction.stop.rawValue == Int32(bc_file_system_fault_action_stop.rawValue))
+        // The header numbers the two locations in a comment at the field, not in an enum: 1 and 2, 0 for none.
+        #expect(FailedLocation.first.rawValue == 1)
+        #expect(FailedLocation.second.rawValue == 2)
+        #expect(FailedLocation(rawValue: 0) == nil)
+        #expect(FailedLocation(rawValue: 3) == nil)
+        #expect(FailedLocation.allCases.count == 2)
         #expect(FinalSymlink.allCases.count == 2)
         #expect(ExistingDestination.allCases.count == 2)
         #expect(Durability.allCases.count == 2)
@@ -549,6 +571,43 @@ struct BindingTests {
         #expect(error.message == "writeFile: relative.txt: invalidArgument")
     }
 
+    /// The field that says which end of a two-location operation failed crosses as itself, and the two-location
+    /// conversion composes the path from the end it names: the first, the second, or the second when it names
+    /// neither.
+    @Test func theFailedLocationCrossesAndChoosesThePathOfATwoLocationError() {
+        var atTheSource = coreError(
+            kind: Int32(bc_file_system_error_kind_not_found.rawValue),
+            operation: Int32(bc_file_system_operation_rename.rawValue),
+            step: Int32(bc_file_system_step_fstatat.rawValue), systemCode: ENOENT, name: "")
+        atTheSource.failed_location = 1
+        var atTheDestination = coreError(
+            kind: Int32(bc_file_system_error_kind_already_exists.rawValue),
+            operation: Int32(bc_file_system_operation_rename.rawValue),
+            step: Int32(bc_file_system_step_rename_no_replace.rawValue), systemCode: EEXIST, name: "")
+        atTheDestination.failed_location = 2
+        let atNeither = coreError(
+            kind: Int32(bc_file_system_error_kind_invalid_argument.rawValue),
+            operation: Int32(bc_file_system_operation_rename.rawValue), step: 0, systemCode: 0, name: "")
+        let from = Array("/from".utf8)
+        let to = Array("/to".utf8)
+
+        let source = FileSystemError(
+            core: atTheSource, called: .rename, firstLocationText: from, secondLocationText: to)
+        let destination = FileSystemError(
+            core: atTheDestination, called: .rename, firstLocationText: from, secondLocationText: to)
+        let neither = FileSystemError(core: atNeither, called: .rename, firstLocationText: from, secondLocationText: to)
+        let oneLocation = FileSystemError(core: atNeither, called: .rename, locationText: Array("/one".utf8))
+
+        #expect(source.failedLocation == .first)
+        #expect(source.path == "/from")
+        #expect(destination.failedLocation == .second)
+        #expect(destination.path == "/to")
+        #expect(neither.failedLocation == nil)
+        #expect(neither.path == "/to")
+        #expect(oneLocation.failedLocation == nil)
+        #expect(oneLocation.path == "/one")
+    }
+
     /// The core's name field is bounded; a longer name arrives cut short and flagged, never silently.
     @Test func aNameLongerThanTheFieldArrivesCutShortAndFlagged() {
         let longName = String(repeating: "n", count: 256)
@@ -579,10 +638,10 @@ struct BindingTests {
     @Test func theMessageNamesTheOperationThePathTheKindAndTheErrno() {
         let error = FileSystemError(
             kind: .notFound, operation: .readFile, step: .openat, systemCode: ENOENT, path: "/etc/config.toml",
-            nameTruncated: false)
+            nameTruncated: false, failedLocation: nil)
         let withoutLocation = FileSystemError(
             kind: .resourceExhausted, operation: .engineCreateLive, step: nil, systemCode: 0, path: "",
-            nameTruncated: false)
+            nameTruncated: false, failedLocation: nil)
 
         #expect(error.message == "readFile: /etc/config.toml: notFound (errno \(ENOENT))")
         #expect(withoutLocation.message == "engineCreateLive: resourceExhausted")
@@ -718,8 +777,9 @@ struct BindingTests {
     /// The numbers the core asserts (the header-and-faces report's table): a face built against a header whose
     /// layout moved fails here.
     @Test func everyStructHasThePinnedLayout() {
-        #expect(MemoryLayout<bc_file_system_error>.size == 280)
+        #expect(MemoryLayout<bc_file_system_error>.size == 284)
         #expect(MemoryLayout<bc_file_system_error>.offset(of: \.name) == 21)
+        #expect(MemoryLayout<bc_file_system_error>.offset(of: \.failed_location) == 280)
         #expect(MemoryLayout<bc_file_system_location>.size == (MemoryLayout<OpaquePointer>.size == 8 ? 32 : 16))
         #expect(
             MemoryLayout<bc_file_system_location>.offset(of: \.length)
@@ -754,6 +814,7 @@ struct BindingTests {
         withUnsafeMutableBytes(of: &error.name) { field in
             _ = field.initializeMemory(as: UInt8.self, repeating: 0x78)
         }
+        error.failed_location = 99
         return error
     }
 

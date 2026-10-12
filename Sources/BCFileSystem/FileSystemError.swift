@@ -109,6 +109,13 @@ public enum Step: Int32, CaseIterable, Sendable {
     case faccessat = 27
 }
 
+/// Which of the two locations of `rename` and `copyFile` an error belongs to: the source is the first, the
+/// destination the second. The raw values are the header's.
+public enum FailedLocation: Int32, CaseIterable, Sendable {
+    case first = 1
+    case second = 2
+}
+
 /// Why an operation failed. A plain value: the core reports enums and integers; the face composes `path` from
 /// the location it holds and renders the text.
 public struct FileSystemError: Error, Equatable, Sendable {
@@ -124,6 +131,9 @@ public struct FileSystemError: Error, Equatable, Sendable {
     public let path: String
     /// True when the entry's name was longer than the core's bounded name field, so `path` ends early.
     public let nameTruncated: Bool
+    /// Which end of a two-location operation the failure belongs to, and so which location `path` was composed
+    /// from; nil for an operation over one location and for a refusal of the arguments, which blames neither.
+    public let failedLocation: FailedLocation?
 
     /// Public so that a consumer's test can build the error its own double throws.
     public init(
@@ -132,7 +142,8 @@ public struct FileSystemError: Error, Equatable, Sendable {
         step: Step?,
         systemCode: Int32,
         path: String,
-        nameTruncated: Bool
+        nameTruncated: Bool,
+        failedLocation: FailedLocation?
     ) {
         self.kind = kind
         self.operation = operation
@@ -140,6 +151,7 @@ public struct FileSystemError: Error, Equatable, Sendable {
         self.systemCode = systemCode
         self.path = path
         self.nameTruncated = nameTruncated
+        self.failedLocation = failedLocation
     }
 
     /// "<operation>: <path>: <kind>", with the errno after the kind when a system call failed, and without
@@ -199,8 +211,18 @@ extension FileSystemError {
             step: Step(rawValue: core.step),
             systemCode: core.system_code,
             path: String(decoding: pathBytes, as: UTF8.self),
-            nameTruncated: core.name_truncated != 0
+            nameTruncated: core.name_truncated != 0,
+            failedLocation: FailedLocation(rawValue: core.failed_location)
         )
+    }
+
+    /// The same conversion for an operation over two locations (`rename`, `copyFile`): the path is composed from
+    /// the location the core's `failed_location` names, the first (the source) or the second (the destination),
+    /// and from the second when it names neither, which only a refusal of the arguments does.
+    package init(core: bc_file_system_error, called: Operation, firstLocationText: [UInt8], secondLocationText: [UInt8])
+    {
+        let firstFailed = FailedLocation(rawValue: core.failed_location) == .first
+        self.init(core: core, called: called, locationText: firstFailed ? firstLocationText : secondLocationText)
     }
 
     /// The error the face answers when the core's answer holds a value outside one of its enums, which a core
@@ -212,7 +234,8 @@ extension FileSystemError {
             step: nil,
             systemCode: 0,
             path: String(decoding: locationText, as: UTF8.self),
-            nameTruncated: false
+            nameTruncated: false,
+            failedLocation: nil
         )
     }
 }

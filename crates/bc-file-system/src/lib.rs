@@ -22,5 +22,5 @@ mod error;
 pub mod ffi;
 mod live;
 
-pub use error::{Error, ErrorKind, Operation, Step, UnknownValue};
+pub use error::{Error, ErrorKind, FailedLocation, Operation, Step, UnknownValue};
 pub use live::{Engine, EntryType, Fault, FaultAction, FinalSymlink, ObservedEngine, Status};

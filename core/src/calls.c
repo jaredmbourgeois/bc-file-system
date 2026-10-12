@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h> /* only for renameat, which POSIX declares here; no stream is touched */
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -475,6 +476,50 @@ bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *e
             *entry = read;
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+/* ---- Links and locks ----------------------------------------------------------------------------------------- */
+
+bc_file_system_call_outcome bc_file_system_call_symlinkat(bc_file_system_engine *engine, int32_t operation,
+                                                          const char *target, int parent, const char *name) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_symlinkat);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        if (symlinkat(target, parent, name) == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+bc_file_system_call_outcome bc_file_system_call_flock(bc_file_system_engine *engine, int32_t operation, int descriptor,
+                                                      int how) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_flock);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        if (flock(descriptor, how) == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
         outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;

@@ -134,13 +134,14 @@ public:
         -> Result<std::string>;
 
     /// Renames `source` to `destination` in one step; see the header for what `replace` replaces. Returns the
-    /// durability achieved. An error names `destination`.
+    /// durability achieved. An error names the end it belongs to (`Error::failed_location`): a missing source
+    /// names `source`, a destination that refuses names `destination`.
     [[nodiscard]] auto rename(const Location& source, const Location& destination,
                               ExistingDestination existing_destination, Durability durability) noexcept
         -> Result<Durability>;
 
     /// Copies the regular file at `source` to `destination` with the guarantees of `write_file`. An error names
-    /// `destination`.
+    /// the end it belongs to, as `rename`'s does.
     [[nodiscard]] auto copy_file(const Location& source, const Location& destination,
                                  const WriteOptions& options) noexcept -> Result<Durability>;
 

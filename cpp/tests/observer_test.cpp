@@ -49,6 +49,7 @@ using bc::file_system::Durability;
 using bc::file_system::Engine;
 using bc::file_system::ErrorKind;
 using bc::file_system::ExistingDestination;
+using bc::file_system::FailedLocation;
 using bc::file_system::Fault;
 using bc::file_system::FaultAction;
 using bc::file_system::FileSystem;
@@ -375,7 +376,9 @@ TEST_F(ObserverTest, ARenameCanFailAfterTheStagedFileWasWritten) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("staged")), "the new content");
 }
 
-TEST_F(ObserverTest, RenameAndCopyErrorsNameTheirDestination) {
+// A scripted failure of a two-location operation is reported under the end it struck: the copy's first openat
+// is the walk to its source, so the error names the source; the rename's one step names the destination.
+TEST_F(ObserverTest, RenameAndCopyErrorsNameTheEndTheyBelongTo) {
     bc::file_system_test::write_raw(path_of("source"), "content", 0644);
     script(fail_step(Operation::copy_file, Step::openat, 1, ENOSPC));
     script(fail_step(Operation::rename, Step::renameat, 1, EACCES));
@@ -385,9 +388,11 @@ TEST_F(ObserverTest, RenameAndCopyErrorsNameTheirDestination) {
 
     ASSERT_FALSE(copied.has_value());
     EXPECT_EQ(copied.error().kind, ErrorKind::no_space);
-    EXPECT_EQ(copied.error().path, path_of("copy").string());
+    EXPECT_EQ(copied.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(copied.error().path, path_of("source").string());
     ASSERT_FALSE(renamed.has_value());
     EXPECT_EQ(renamed.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(renamed.error().failed_location, FailedLocation::second);
     EXPECT_EQ(renamed.error().path, path_of("renamed").string());
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("source"));
 }
@@ -415,8 +420,7 @@ TEST_F(ObserverTest, EveryStepIsCountedAcrossTheEnginesLifetime) {
 
 // Each operation counts under its own name: resolving a location opens its parent directory, so every
 // operation reaches `open` at least once.
-// stage 17 locks-links-condemn
-TEST_F(ObserverTest, DISABLED_EachOperationCountsUnderItsOwnName) {
+TEST_F(ObserverTest, EachOperationCountsUnderItsOwnName) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
     const auto bytes = bytes_of("more");
     const Location root = Location::at(root_path());

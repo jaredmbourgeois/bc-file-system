@@ -15,9 +15,8 @@ import Testing
 /// reach (the disk filling up mid-write, which system call a durable write syncs with) are scripted through the
 /// observer and proven in the C++ suite.
 ///
-/// Every case that needs the engine is disabled with the stage that turns it on; the core is an honest stub
-/// until then. A case of a permission failure returns early where the process reads what its permission bits
-/// forbid (the superuser), because no such failure can happen there.
+/// A case of a permission failure returns early where the process reads what its permission bits forbid (the
+/// superuser), because no such failure can happen there.
 struct ContractTests {
     // The options every case states, built once here so a field added later fails in one place.
     static let wholeFileRefusingSymlink = ReadOptions(limit: .wholeFile, finalSymlink: .refuse)
@@ -485,7 +484,8 @@ struct ContractTests {
         let current = try observed.location("current")
 
         let refused = errorThrown { () throws(FileSystemError) in
-            try observed.fileSystem.rename(from: staged, to: current, existingDestination: .refuse, durability: .written)
+            try observed.fileSystem.rename(
+                from: staged, to: current, existingDestination: .refuse, durability: .written)
         }
         let achieved = try observed.fileSystem.rename(
             from: staged, to: current, existingDestination: .replace, durability: .durable)
@@ -513,6 +513,106 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "copy") == 0o600)
         #expect(try observed.root.rawMode(of: "source") == 0o644)
         #expect(try observed.root.rawNames() == ["copy", "source"])
+    }
+
+    // MARK: - Locks, links and the condemned sweep
+
+    /// The lock is held by the open-file description the handle owns, so a second engine in the same process
+    /// (a second observed file system over the same directory) is refused while the first holds it and takes it
+    /// once the first handle is gone.
+    @Test
+    func tryLockAcquiresAndASecondEngineInTheSameProcessIsRefusedUntilItIsReleased() throws {
+        let observed = try observedFileSystem()
+        let second = try FileSystem.observed(root: observed.root)
+        try observed.root.rawWrite("", to: "file.lock", mode: 0o644)
+        let location = try observed.location("file.lock")
+
+        var whileHeld: Lock?
+        do {
+            let first = try observed.fileSystem.tryLock(location)
+            #expect(first != nil)
+            whileHeld = try second.fileSystem.tryLock(location)
+        }
+        let afterRelease = try second.fileSystem.tryLock(location)
+
+        #expect(whileHeld == nil)
+        #expect(afterRelease != nil)
+    }
+
+    @Test
+    func tryLockOnASymlinkIsRefusedAndOnNothingIsNotFound() throws {
+        let observed = try observedFileSystem()
+        try observed.root.rawWrite("", to: "target", mode: 0o644)
+        try observed.root.rawMakeSymlink(at: "link", pointingAt: "target")
+        let link = try observed.location("link")
+        let absent = try observed.location("absent.lock")
+
+        let throughLink = errorThrown { () throws(FileSystemError) in try observed.fileSystem.tryLock(link) }
+        let ofNothing = errorThrown { () throws(FileSystemError) in try observed.fileSystem.tryLock(absent) }
+
+        #expect(throughLink?.kind == .symlinkRefused)
+        #expect(ofNothing?.kind == .notFound)
+        #expect(observed.root.rawExists("absent.lock") == false)
+    }
+
+    /// The target goes to the system as spelled and comes back the same; an existing entry refuses the link.
+    @Test
+    func createSymlinkStoresTheTargetUnchangedAndReadSymlinkReadsItBack() throws {
+        let observed = try observedFileSystem()
+        let target = Array("../elsewhere/./target.txt".utf8)
+        let link = try observed.location("link")
+
+        try observed.fileSystem.createSymlink(target: target, at: link)
+        let text = try observed.fileSystem.readSymlink(link)
+        let again = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.createSymlink(target: target, at: link)
+        }
+
+        #expect(text == target)
+        #expect(again?.kind == .alreadyExists)
+        #expect(again?.step == .symlinkat)
+    }
+
+    /// A dangling link reads like any other; a file is no link, which the system answers with EINVAL and the
+    /// face passes on as `ioFailed`.
+    @Test
+    func readSymlinkReadsADanglingLinkAndRefusesAFileWithEinval() throws {
+        let observed = try observedFileSystem()
+        try observed.root.rawMakeSymlink(at: "dangling", pointingAt: "nowhere/at/all")
+        try observed.root.rawWrite("content", to: "file", mode: 0o644)
+        let file = try observed.location("file")
+
+        let text = try observed.fileSystem.readSymlink(try observed.location("dangling"))
+        let ofFile = errorThrown { () throws(FileSystemError) in try observed.fileSystem.readSymlink(file) }
+
+        #expect(String(decoding: text, as: UTF8.self) == "nowhere/at/all")
+        #expect(ofFile?.kind == .ioFailed)
+        #expect(ofFile?.systemCode == EINVAL)
+    }
+
+    /// Condemn twice under one name yields two names; the sweep clears both and the staged leftover, and leaves
+    /// the neighbour.
+    @Test
+    func condemnTwiceYieldsTwoNamesAndRemoveCondemnedClearsThemAndAStagedLeftover() throws {
+        let observed = try observedFileSystem()
+        try observed.root.rawMakeDirectory("tree", mode: 0o755)
+        try observed.root.rawWrite("first", to: "tree/file", mode: 0o644)
+        let tree = try observed.location("tree")
+        let first = try observed.fileSystem.condemn(tree)
+        try observed.root.rawMakeDirectory("tree", mode: 0o755)
+        try observed.root.rawWrite("second", to: "tree/file", mode: 0o644)
+        let second = try observed.fileSystem.condemn(tree)
+        try observed.root.rawWrite("leftover", to: ".ledger.bc-tmp-4242-7", mode: 0o600)
+        try observed.root.rawWrite("stays", to: "neighbour", mode: 0o644)
+        let firstName = String(decoding: first, as: UTF8.self)
+        let secondName = String(decoding: second, as: UTF8.self)
+        #expect(firstName == ".bc-condemned-tree")
+        #expect(secondName.hasPrefix(".bc-condemned-tree-"))
+        #expect(try observed.root.rawNames() == [firstName, secondName, ".ledger.bc-tmp-4242-7", "neighbour"].sorted())
+
+        try observed.fileSystem.removeCondemned(in: try rootLocation(of: observed))
+
+        #expect(try observed.root.rawNames() == ["neighbour"])
     }
 
     // MARK: - The core's buffer protocol

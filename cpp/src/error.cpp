@@ -212,6 +212,16 @@ auto step_from(std::int32_t value) noexcept -> std::optional<Step> {
     return std::nullopt;
 }
 
+auto failed_location_from(std::int32_t value) noexcept -> std::optional<FailedLocation> {
+    if (value == 1) {
+        return FailedLocation::first;
+    }
+    if (value == 2) {
+        return FailedLocation::second;
+    }
+    return std::nullopt;
+}
+
 auto error_from(const bc_file_system_error& c_error, Operation called, std::string_view location_text) -> Error {
     // The core writes only values of its own enums, and the pins hold the two sides equal; an unknown kind is
     // still answered honestly as "a system failure we could not classify" rather than ending the process.
@@ -234,7 +244,14 @@ auto error_from(const bc_file_system_error& c_error, Operation called, std::stri
                  .step = step_from(c_error.step),
                  .system_code = c_error.system_code,
                  .path = std::move(path),
-                 .name_truncated = c_error.name_truncated != 0};
+                 .name_truncated = c_error.name_truncated != 0,
+                 .failed_location = failed_location_from(c_error.failed_location)};
+}
+
+auto error_from_two_locations(const bc_file_system_error& c_error, Operation called,
+                              std::string_view first_location_text, std::string_view second_location_text) -> Error {
+    const bool first_failed = failed_location_from(c_error.failed_location) == FailedLocation::first;
+    return error_from(c_error, called, first_failed ? first_location_text : second_location_text);
 }
 
 auto Error::message() const -> std::string {

@@ -31,9 +31,8 @@
 #include "test_paths.hpp"
 
 // The C++ binding suite: the face's contract with the C header, apart from what the operations do to the file
-// system (the contract suite's job). Each operation reaches the core once (a real operation answers from the
-// file system; a stub's `unsupported` names the operation it reached), the mapping of every enum is total in
-// both directions, each value type makes one
+// system (the contract suite's job). Each operation reaches the core once and answers from the file system,
+// the mapping of every enum is total in both directions, each value type makes one
 // round trip across the ABI, the error struct is converted and rendered, and the face's own compositions
 // (`read_file_if_present`, the grow loop, `lines_of`) do what the design doc says. The C-level cases prove
 // the header's own promises: zero is never a valid enum, NULL where forbidden is refused, a success zeroes the
@@ -65,6 +64,7 @@ using bc::file_system::EntryType;
 using bc::file_system::Error;
 using bc::file_system::ErrorKind;
 using bc::file_system::ExistingDestination;
+using bc::file_system::FailedLocation;
 using bc::file_system::Fault;
 using bc::file_system::FaultAction;
 using bc::file_system::FileSystem;
@@ -113,8 +113,9 @@ constexpr WriteOptions kWrittenPreserveOr0600{.durability = Durability::written,
 
 // The layout pins of the public structs, as the core asserts them: a face built against a header whose layout
 // moved fails here before it fails at run time.
-static_assert(sizeof(bc_file_system_error) == 280);
+static_assert(sizeof(bc_file_system_error) == 284);
 static_assert(offsetof(bc_file_system_error, name) == 21);
+static_assert(offsetof(bc_file_system_error, failed_location) == 280);
 static_assert(sizeof(bc_file_system_location) == (sizeof(void*) == 8 ? 32 : 16));
 static_assert(offsetof(bc_file_system_location, length) == (sizeof(void*) == 8 ? 24 : 12));
 static_assert(sizeof(bc_file_system_read_limit) == 16);
@@ -131,18 +132,6 @@ static_assert(sizeof(bc_file_system_entry) == 264);
 static_assert(offsetof(bc_file_system_entry, name) == 8);
 static_assert(sizeof(bc_file_system_fault) == 20);
 static_assert(offsetof(bc_file_system_fault, system_code) == 16);
-
-// The stub answers `unsupported` from the operation it reached, with no step and no system code: the one
-// answer that proves the call crossed into C and came back through the face's conversion.
-template <class T>
-auto expect_unsupported(const Result<T>& result, Operation operation, std::string_view path) -> void {
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error().kind, ErrorKind::unsupported);
-    EXPECT_EQ(result.error().operation, operation);
-    EXPECT_FALSE(result.error().step.has_value());
-    EXPECT_EQ(result.error().system_code, 0);
-    EXPECT_EQ(result.error().path, path);
-}
 
 auto a_c_error(std::int32_t kind, std::int32_t operation, std::int32_t step, std::int32_t system_code,
                std::string_view name) -> bc_file_system_error {
@@ -166,6 +155,7 @@ auto a_dirty_c_error() -> bc_file_system_error {
     c_error.name_length = 99;
     c_error.name_truncated = 1;
     std::memset(static_cast<void*>(c_error.name), 'x', sizeof(c_error.name));
+    c_error.failed_location = 99;
     return c_error;
 }
 
@@ -342,13 +332,15 @@ TEST_F(BindingTest, CreateTemporaryDirectoryReachesC) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("parent") / *name), 0700U);
 }
 
-// A rename is real, and the error of a two-location operation names the destination (the face's convention for
-// both of them, whichever end the failing step acted on).
-TEST_F(BindingTest, RenameReachesCAndItsErrorNamesTheDestination) {
+// A rename is real, and the error of a two-location operation names the end it belongs to: the face reads the
+// core's `failed_location` and composes the path from the source or the destination accordingly.
+TEST_F(BindingTest, RenameReachesCAndItsErrorNamesTheEndThatFailed) {
     bc::file_system_test::write_raw(path_of("from"), "content", 0644);
 
     const auto moved = files().rename(in("from"), in("to"), ExistingDestination::replace, Durability::written);
     const auto of_nothing = files().rename(in("from"), in("to"), ExistingDestination::replace, Durability::written);
+    const auto into_nothing =
+        files().rename(in("to"), in("missing/to"), ExistingDestination::replace, Durability::written);
 
     ASSERT_TRUE(moved.has_value()) << moved.error().message();
     EXPECT_EQ(*moved, Durability::written);
@@ -357,14 +349,20 @@ TEST_F(BindingTest, RenameReachesCAndItsErrorNamesTheDestination) {
     ASSERT_FALSE(of_nothing.has_value());
     EXPECT_EQ(of_nothing.error().kind, ErrorKind::not_found);
     EXPECT_EQ(of_nothing.error().operation, Operation::rename);
-    EXPECT_EQ(of_nothing.error().path, path_text_of("to"));
+    EXPECT_EQ(of_nothing.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(of_nothing.error().path, path_text_of("from"));
+    ASSERT_FALSE(into_nothing.has_value());
+    EXPECT_EQ(into_nothing.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(into_nothing.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(into_nothing.error().path, path_text_of("missing/to"));
 }
 
-TEST_F(BindingTest, CopyFileReachesCAndItsErrorNamesTheDestination) {
+TEST_F(BindingTest, CopyFileReachesCAndItsErrorNamesTheEndThatFailed) {
     bc::file_system_test::write_raw(path_of("from"), "content", 0644);
 
     const auto copied = files().copy_file(in("from"), in("to"), kWrittenExactly0644);
     const auto of_nothing = files().copy_file(in("absent"), in("to"), kWrittenExactly0644);
+    const auto into_nothing = files().copy_file(in("from"), in("missing/to"), kWrittenExactly0644);
 
     ASSERT_TRUE(copied.has_value()) << copied.error().message();
     EXPECT_EQ(*copied, Durability::written);
@@ -373,7 +371,11 @@ TEST_F(BindingTest, CopyFileReachesCAndItsErrorNamesTheDestination) {
     ASSERT_FALSE(of_nothing.has_value());
     EXPECT_EQ(of_nothing.error().kind, ErrorKind::not_found);
     EXPECT_EQ(of_nothing.error().operation, Operation::copy_file);
-    EXPECT_EQ(of_nothing.error().path, path_text_of("to"));
+    EXPECT_EQ(of_nothing.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(of_nothing.error().path, path_text_of("absent"));
+    ASSERT_FALSE(into_nothing.has_value());
+    EXPECT_EQ(into_nothing.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(into_nothing.error().path, path_text_of("missing/to"));
 }
 
 TEST_F(BindingTest, SetPermissionsReachesC) {
@@ -385,24 +387,62 @@ TEST_F(BindingTest, SetPermissionsReachesC) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0600U);
 }
 
+// The link operations are real: the target text crosses as bytes, lands, and comes back through the buffer
+// protocol.
 TEST_F(BindingTest, CreateSymlinkReachesC) {
-    expect_unsupported(files().create_symlink("target", in("link")), Operation::create_symlink, path_text_of("link"));
+    const auto created = files().create_symlink("target", in("link"));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    EXPECT_TRUE(bc::file_system_test::is_symlink_raw(path_of("link")));
 }
 
 TEST_F(BindingTest, ReadSymlinkReachesC) {
-    expect_unsupported(files().read_symlink(in("link")), Operation::read_symlink, path_text_of("link"));
+    bc::file_system_test::make_symlink_raw("target", path_of("link"));
+
+    const auto text = files().read_symlink(in("link"));
+
+    ASSERT_TRUE(text.has_value()) << text.error().message();
+    EXPECT_EQ(*text, "target");
 }
 
+// The lock is real: the handle comes back under `acquired`, a second ask answers `held_elsewhere` as an empty
+// optional, and the handle's destructor lets the lock go.
 TEST_F(BindingTest, TryLockReachesC) {
-    expect_unsupported(files().try_lock(in("file.lock")), Operation::try_lock, path_text_of("file.lock"));
+    bc::file_system_test::write_raw(path_of("file.lock"), "", 0644);
+
+    {
+        const auto held = files().try_lock(in("file.lock"));
+        ASSERT_TRUE(held.has_value()) << held.error().message();
+        EXPECT_TRUE(held->has_value());
+        const auto refused = files().try_lock(in("file.lock"));
+        ASSERT_TRUE(refused.has_value()) << refused.error().message();
+        EXPECT_FALSE(refused->has_value());
+    }
+    const auto again = files().try_lock(in("file.lock"));
+
+    ASSERT_TRUE(again.has_value()) << again.error().message();
+    EXPECT_TRUE(again->has_value());
 }
 
 TEST_F(BindingTest, CondemnReachesC) {
-    expect_unsupported(files().condemn(in("tree")), Operation::condemn, path_text_of("tree"));
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+
+    const auto name = files().condemn(in("tree"));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_EQ(*name, ".bc-condemned-tree");
+    EXPECT_TRUE(bc::file_system_test::exists_raw(path_of(".bc-condemned-tree")));
 }
 
 TEST_F(BindingTest, RemoveCondemnedReachesC) {
-    expect_unsupported(files().remove_condemned(in("parent")), Operation::remove_condemned, path_text_of("parent"));
+    bc::file_system_test::make_directory_raw(path_of("parent"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("parent/.bc-condemned-tree"), 0755);
+    bc::file_system_test::write_raw(path_of("parent/kept"), "kept", 0644);
+
+    const auto swept = files().remove_condemned(in("parent"));
+
+    ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("parent")), ElementsAre("kept"));
 }
 
 // The observer's three calls reach C: on an observed engine each succeeds, and a fresh engine has counted
@@ -655,6 +695,14 @@ TEST(ErrorMappingTest, EverySmallEnumIsPinnedToTheHeader) {
     EXPECT_EQ(static_cast<std::int32_t>(FaultAction::stop), bc_file_system_fault_action_stop);
 }
 
+TEST(ErrorMappingTest, TheFailedLocationIsEmptyForZeroAndForAValueOutsideItsRange) {
+    EXPECT_FALSE(bc::file_system::failed_location_from(0).has_value());
+    EXPECT_EQ(bc::file_system::failed_location_from(1), FailedLocation::first);
+    EXPECT_EQ(bc::file_system::failed_location_from(2), FailedLocation::second);
+    EXPECT_FALSE(bc::file_system::failed_location_from(3).has_value());
+    EXPECT_FALSE(bc::file_system::failed_location_from(-1).has_value());
+}
+
 TEST(ErrorMappingTest, TheSmallEnumsRefuseAValueOutsideTheirRange) {
     EXPECT_FALSE(bc::file_system::durability_from(0).has_value());
     EXPECT_EQ(bc::file_system::durability_from(2), Durability::durable);
@@ -706,6 +754,36 @@ TEST(ErrorConversionTest, ThePathIsTheNameAloneWhenTheCallTookNoLocation) {
     EXPECT_FALSE(error.step.has_value());
 }
 
+// The field that says which end of a two-location operation failed crosses as itself, and the two-location
+// conversion composes the path from the end it names: the first, the second, or the second when it names
+// neither.
+TEST(ErrorConversionTest, TheFailedLocationCrossesAndChoosesThePathOfATwoLocationError) {
+    bc_file_system_error at_the_source = a_c_error(bc_file_system_error_kind_not_found, bc_file_system_operation_rename,
+                                                   bc_file_system_step_fstatat, ENOENT, "");
+    at_the_source.failed_location = 1;
+    bc_file_system_error at_the_destination =
+        a_c_error(bc_file_system_error_kind_already_exists, bc_file_system_operation_rename,
+                  bc_file_system_step_rename_no_replace, EEXIST, "");
+    at_the_destination.failed_location = 2;
+    const bc_file_system_error at_neither =
+        a_c_error(bc_file_system_error_kind_invalid_argument, bc_file_system_operation_rename, 0, 0, "");
+
+    const Error source = bc::file_system::error_from_two_locations(at_the_source, Operation::rename, "/from", "/to");
+    const Error destination =
+        bc::file_system::error_from_two_locations(at_the_destination, Operation::rename, "/from", "/to");
+    const Error neither = bc::file_system::error_from_two_locations(at_neither, Operation::rename, "/from", "/to");
+    const Error one_location = bc::file_system::error_from(at_neither, Operation::rename, "/one");
+
+    EXPECT_EQ(source.failed_location, FailedLocation::first);
+    EXPECT_EQ(source.path, "/from");
+    EXPECT_EQ(destination.failed_location, FailedLocation::second);
+    EXPECT_EQ(destination.path, "/to");
+    EXPECT_FALSE(neither.failed_location.has_value());
+    EXPECT_EQ(neither.path, "/to");
+    EXPECT_FALSE(one_location.failed_location.has_value());
+    EXPECT_EQ(one_location.path, "/one");
+}
+
 // The core's name field is bounded; a longer name arrives cut short and flagged, never silently.
 TEST(ErrorConversionTest, ANameLongerThanTheFieldArrivesCutShortAndFlagged) {
     const std::string long_name(sizeof(bc_file_system_error::name), 'n');
@@ -737,7 +815,8 @@ TEST(ErrorConversionTest, TheMessageNamesTheOperationThePathAndTheSystemsWording
                       .step = Step::openat,
                       .system_code = ENOENT,
                       .path = "/etc/config.toml",
-                      .name_truncated = false};
+                      .name_truncated = false,
+                      .failed_location = std::nullopt};
 
     EXPECT_EQ(error.message(), "read_file: /etc/config.toml: " + std::system_category().message(ENOENT));
 }
@@ -748,7 +827,8 @@ TEST(ErrorConversionTest, TheMessageNamesTheKindWhenNoSystemCallFailed) {
                       .step = std::nullopt,
                       .system_code = 0,
                       .path = "relative.txt",
-                      .name_truncated = false};
+                      .name_truncated = false,
+                      .failed_location = std::nullopt};
 
     EXPECT_EQ(error.message(), "write_file: relative.txt: invalid_argument");
 }
@@ -759,7 +839,8 @@ TEST(ErrorConversionTest, TheMessageDropsThePathSegmentWhenTheCallTookNoLocation
                       .step = std::nullopt,
                       .system_code = 0,
                       .path = "",
-                      .name_truncated = false};
+                      .name_truncated = false,
+                      .failed_location = std::nullopt};
 
     EXPECT_EQ(error.message(), "engine_create_live: resource_exhausted");
 }
@@ -911,7 +992,8 @@ auto a_failure() -> Error {
                  .step = Step::openat,
                  .system_code = ENOENT,
                  .path = "/some/path",
-                 .name_truncated = false};
+                 .name_truncated = false,
+                 .failed_location = std::nullopt};
 }
 
 TEST(ResultTest, HoldsAValue) {
@@ -1154,7 +1236,8 @@ TEST_F(CoreBindingTest, ANullBufferIsLegalOnlyWithZeroCapacity) {
     const std::int32_t lying_about_capacity =
         bc_file_system_read_symlink(engine(), &location, nullptr, 16, &length, &c_error);
 
-    EXPECT_EQ(asking_for_the_size, bc_file_system_error_kind_unsupported);
+    // Nothing is at `link`, so the size query reaches the core and answers its absence; the lie is refused first.
+    EXPECT_EQ(asking_for_the_size, bc_file_system_error_kind_not_found);
     EXPECT_EQ(lying_about_capacity, bc_file_system_error_kind_invalid_argument);
 }
 
@@ -1238,8 +1321,7 @@ TEST_F(CoreBindingTest, ReadFileOfAnEmptyFileNeedsNoBuffer) {
     EXPECT_TRUE(is_all_zero(c_error));
 }
 
-// stage 17 locks-links-condemn
-TEST_F(CoreBindingTest, DISABLED_ReadSymlinkFollowsTheSameProtocol) {
+TEST_F(CoreBindingTest, ReadSymlinkFollowsTheSameProtocol) {
     bc::file_system_test::make_symlink_raw("target.txt", path_of("link"));
     const std::string path = path_text_of("link");
     const bc_file_system_location location = at(path);

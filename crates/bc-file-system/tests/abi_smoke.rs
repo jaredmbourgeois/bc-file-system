@@ -6,8 +6,8 @@
 
 use bc_file_system::ffi;
 use bc_file_system::{
-    Engine, EntryType, Error, ErrorKind, Fault, FaultAction, FinalSymlink, ObservedEngine,
-    Operation, Step, UnknownValue,
+    Engine, EntryType, Error, ErrorKind, FailedLocation, Fault, FaultAction, FinalSymlink,
+    ObservedEngine, Operation, Step, UnknownValue,
 };
 
 #[test]
@@ -111,8 +111,12 @@ fn a_fault_crosses_as_the_header_lays_it_out() {
 #[test]
 fn the_layout_pins_hold_at_run_time() {
     // The same numbers the core asserts and ffi.rs pins at compile time; a run-time witness beside them.
-    assert_eq!(size_of::<ffi::bc_file_system_error>(), 280);
+    assert_eq!(size_of::<ffi::bc_file_system_error>(), 284);
     assert_eq!(core::mem::offset_of!(ffi::bc_file_system_error, name), 21);
+    assert_eq!(
+        core::mem::offset_of!(ffi::bc_file_system_error, failed_location),
+        280
+    );
     assert_eq!(
         size_of::<ffi::bc_file_system_location>(),
         if size_of::<usize>() == 8 { 32 } else { 16 }
@@ -259,6 +263,48 @@ fn an_error_renders_its_step_its_errno_text_and_its_entry() {
     );
     assert!(rendered.contains("(os error 28)"), "{rendered}");
     assert!(rendered.ends_with(" (entry ledger…)"), "{rendered}");
+}
+
+#[test]
+fn the_failed_location_crosses_as_itself_and_zero_is_none() {
+    let mut at_the_source = ffi::bc_file_system_error::zeroed();
+    at_the_source.kind = ErrorKind::NotFound as i32;
+    at_the_source.operation = Operation::Rename as i32;
+    at_the_source.step = Step::Fstatat as i32;
+    at_the_source.system_code = 2;
+    at_the_source.failed_location = 1;
+    let mut at_the_destination = at_the_source;
+    at_the_destination.failed_location = 2;
+    let mut at_neither = at_the_source;
+    at_neither.failed_location = 0;
+    let mut outside = at_the_source;
+    outside.failed_location = 3;
+
+    let source = Error::from_c(&at_the_source, Operation::Rename);
+    let destination = Error::from_c(&at_the_destination, Operation::Rename);
+    let neither = Error::from_c(&at_neither, Operation::Rename);
+    let unknown = Error::from_c(&outside, Operation::Rename);
+
+    assert_eq!(source.failed_location, Some(FailedLocation::First));
+    assert!(source.to_string().ends_with(" (at the source)"), "{source}");
+    assert_eq!(destination.failed_location, Some(FailedLocation::Second));
+    assert!(
+        destination.to_string().ends_with(" (at the destination)"),
+        "{destination}"
+    );
+    assert_eq!(neither.failed_location, None);
+    assert_eq!(neither.unknown_value, None);
+    assert_eq!(unknown.failed_location, None);
+    assert_eq!(
+        unknown.unknown_value,
+        Some(UnknownValue {
+            enumeration: "bc_file_system_error.failed_location",
+            value: 3
+        })
+    );
+    assert_eq!(FailedLocation::ALL.len(), 2);
+    assert_eq!(FailedLocation::try_from(2), Ok(FailedLocation::Second));
+    assert!(FailedLocation::try_from(0).is_err());
 }
 
 #[test]

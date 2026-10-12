@@ -1,0 +1,8 @@
+/* fuzz_paths.h — rendered by fuzz/CMakeLists.txt into the build tree (build/<preset>/fuzz/generated/fuzz_paths.h)
+ * and reached through the fuzzers' include path as "fuzz_paths.h". The value is captured when CMake configures;
+ * a plain rebuild does not refresh it. The one build-time value the fuzzers read, handed in as a declaration a
+ * reader can open rather than a compile definition (AGENTS.md, "No macros"). */
+#pragma once
+
+/* The directory each engine fuzzer makes its own root under. It exists once CMake has configured. */
+static const char bc_file_system_fuzz_temporary_root[] = "@BC_FILE_SYSTEM_FUZZ_TEMPORARY_ROOT@";

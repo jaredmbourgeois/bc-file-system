@@ -123,6 +123,17 @@ bc_file_system_call_outcome bc_file_system_call_fdopendir(bc_file_system_engine 
 bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *engine, int32_t operation, DIR *stream,
                                                         struct dirent **entry);
 
+/* ---- Links and locks ----------------------------------------------------------------------------------------- */
+
+/* `symlinkat`: makes `name` under `parent` a symlink whose text is `target`, NUL-terminated and passed to the
+ * system unchanged. EEXIST means the name is taken, by anything. */
+bc_file_system_call_outcome bc_file_system_call_symlinkat(bc_file_system_engine *engine, int32_t operation,
+                                                          const char *target, int parent, const char *name);
+/* `flock` with `how` (LOCK_EX | LOCK_NB for the lock the engine takes): EWOULDBLOCK means another open-file
+ * description holds the lock; ENOTSUP, a volume or platform that locks nothing. */
+bc_file_system_call_outcome bc_file_system_call_flock(bc_file_system_engine *engine, int32_t operation, int descriptor,
+                                                      int how);
+
 /* ---- Copying ------------------------------------------------------------------------------------------------ */
 
 /* The platform's clone (`bc_file_system_platform_clone_file`, step `clone_file`): one step that makes the whole

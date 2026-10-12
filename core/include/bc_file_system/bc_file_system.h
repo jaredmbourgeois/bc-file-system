@@ -60,7 +60,11 @@ typedef struct bc_file_system_engine bc_file_system_engine;
  * it. */
 typedef struct bc_file_system_directory bc_file_system_directory;
 
-/* An advisory lock held on a file; released by `bc_file_system_lock_release`, which also releases the lock. */
+/* An advisory lock held on a file or a directory; released by `bc_file_system_lock_release`, which also releases
+ * the lock. What a lock is: the platform's `flock`, advisory (a process that does not ask sees nothing), held by
+ * the open-file description the handle owns rather than by the process, so two handles in one process (two
+ * engines, or one engine twice) contend like two processes do, and the lock passes to a child across `fork` while
+ * the description is shared and never across `exec`, since the descriptor is `O_CLOEXEC`. */
 typedef struct bc_file_system_lock bc_file_system_lock;
 
 /* ---- Enums ------------------------------------------------------------------------------------------------- */
@@ -299,16 +303,20 @@ typedef enum bc_file_system_library_kind {
 /* Why a call failed: enums and integers only. The face that holds the location renders the text and composes
  * the full path; the core never formats. Caller-allocated; zeroed on success; filled on failure. */
 typedef struct bc_file_system_error {
-    int32_t kind;           /* a bc_file_system_error_kind; 0 is success */
-    int32_t operation;      /* the bc_file_system_operation that failed */
-    int32_t step;           /* the bc_file_system_step that failed, or 0 when no call failed: a refusal before any
-                               system call, or an answer decided from what a call reported (not a regular file,
-                               too large, a buffer too small) */
-    int32_t system_code;    /* the errno, copied on the line after the failing call, or 0 */
-    uint32_t name_length;   /* how many bytes of `name` are meaningful */
-    uint8_t name_truncated; /* 1 when the entry's name did not fit in `name` */
-    uint8_t name[256];      /* the entry the step acted on, relative to the location; empty when it was the
-                               location itself */
+    int32_t kind;            /* a bc_file_system_error_kind; 0 is success */
+    int32_t operation;       /* the bc_file_system_operation that failed */
+    int32_t step;            /* the bc_file_system_step that failed, or 0 when no call failed: a refusal before any
+                                system call, or an answer decided from what a call reported (not a regular file,
+                                too large, a buffer too small) */
+    int32_t system_code;     /* the errno, copied on the line after the failing call, or 0 */
+    uint32_t name_length;    /* how many bytes of `name` are meaningful */
+    uint8_t name_truncated;  /* 1 when the entry's name did not fit in `name` */
+    uint8_t name[256];       /* the entry the step acted on, relative to the location; empty when it was the
+                                location itself */
+    int32_t failed_location; /* which location of an operation over two (`rename`, `copy_file`) the failure
+                                belongs to: 1 the first (the source), 2 the second (the destination); 0 for an
+                                operation over one location, and for a contract violation, which blames neither.
+                                `name` is relative to that location, so a face composes the path from it. */
 } bc_file_system_error;
 
 /* Where an operation acts. Built with one of the two constructors below. */
@@ -568,7 +576,8 @@ int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_f
                                        uint32_t mode, int32_t final_symlink, bc_file_system_error *error);
 
 /* Creates a symlink at `location` whose text is the `target_length` bytes of `target`, passed to the system
- * unchanged. An existing entry is `already_exists`. */
+ * unchanged: never validated, never resolved. An empty target, a NUL inside it or a text the system could not
+ * hold (PATH_MAX or longer) is `invalid_argument`. An existing entry is `already_exists`. */
 int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,
                                       const bc_file_system_location *location, bc_file_system_error *error);
 
@@ -578,18 +587,24 @@ int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8
 int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file_system_location *location,
                                     uint8_t *buffer, size_t capacity, size_t *length, bc_file_system_error *error);
 
-/* Tries to take an advisory exclusive lock on the file at `location` without waiting. `*outcome` receives a
- * bc_file_system_lock_outcome; `*lock` receives the handle under `acquired` and NULL under `held_elsewhere`.
- * Where the platform's flock is a stub (Emscripten) the answer is `unsupported`. */
+/* Tries to take an advisory exclusive lock on the file or directory at `location` without waiting. The lock
+ * opens the entry itself, read-only and never through a symlink (one is `symlink_refused`; absence is
+ * `not_found`: a lock never creates), so a lock on a directory holds while the handle lives. `*outcome` receives
+ * a bc_file_system_lock_outcome; `*lock` receives the handle under `acquired` and NULL under `held_elsewhere`.
+ * Where the platform's flock is a stub (Emscripten) the answer is `unsupported` before any system call. */
 int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_system_location *location,
                                 bc_file_system_lock **lock, int32_t *outcome, bc_file_system_error *error);
 
-/* Renames the tree at `location` to `.bc-condemned-<name>` beside it, so a later sweep removes it, and stores
- * the condemned name (one component) under the buffer protocol. */
+/* Renames the entry at `location` (a file, a symlink or a directory tree) to `.bc-condemned-<name>` beside it,
+ * in one step that replaces nothing, so a later sweep removes it, and stores the condemned name (one component)
+ * under the buffer protocol. A condemned name a previous condemn left behind is never an error: the name is
+ * tried again with a token of the engine's own appended, so the answer may be longer than the first name. */
 int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_system_location *location, uint8_t *buffer,
                                size_t capacity, size_t *length, bc_file_system_error *error);
 
-/* Removes every `.bc-condemned-` entry directly inside `parent`, as `bc_file_system_remove_tree` would. */
+/* Removes every `.bc-condemned-` entry directly inside `parent`, as `bc_file_system_remove_tree` would, and every
+ * staged file a killed write or copy left there (its name carries `.bc-tmp-`). An entry the sweep cannot remove
+ * ends it, named in the error relative to `parent`; the entries removed before it stay removed. */
 int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_file_system_location *parent,
                                         bc_file_system_error *error);
 
