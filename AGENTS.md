@@ -25,12 +25,13 @@ wrong even when it compiles and passes.
 | Path | What it is | CMake target | SwiftPM target | Cargo crate |
 |---|---|---|---|---|
 | `core/include/bc_file_system/` | The public C header, included as `<bc_file_system/bc_file_system.h>` | `bc::file_system_core` | `CBCFileSystem` | — |
-| `core/src/` | The C implementation; `platform.h` is the only file that names the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | — |
+| `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier), `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` the only file that names the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | — |
+| `core/tests/` | The C-only test of the path module: a `.c` main over tables of cases, registered with `add_test`, so the module is proven through the public header alone | `bc_file_system_path_test` | not built | — |
 | `cpp/include/bc_file_system/`, `cpp/src/` | The C++ face, a thin wrapper over the header (`.clang-tidy`: the C++ set) | `bc::file_system` | not built | — |
 | `cpp/tests/` | The contract suite (the specification every face is held to, driving C through the C++ face), the C++ binding suite, the observer and path-value suites, and `support/` (the temporary directory, the descriptor-balance fixture, the generated `test_paths.hpp`) | `bc_file_system_test` | not built | — |
 | `Sources/CBCFileSystem/`, `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module, its test fixtures (the temporary directory and the observed engine), and its binding suite and source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
 | `crates/` | The Rust face: `bc-file-system` and `bc-file-system-testing`, one `Cargo.lock`, `publish = false` (arrives at stage `rust-crates`) | — | — | `bc-file-system`, `bc-file-system-testing` |
-| `fuzz/` | The path, ABI-argument and operation-sequence fuzz targets (arrive at stages `path-module` and `locks-links-condemn`) | — | — | — |
+| `fuzz/` | The libFuzzer targets, behind `BC_FILE_SYSTEM_BUILD_FUZZERS` (on in the `fuzz` preset): `path_fuzz.c` over the path module now; the ABI-argument and operation-sequence targets arrive at `locks-links-condemn` | `bc_file_system_path_fuzz` | — | — |
 | `examples/consumer/` | A separate CMake project that consumes the core through FetchContent | its own project | — | — |
 | `cmake/helpers.cmake` | The compile-options helper, the toolchain-knob list, the build posture, the four-way header check | included by the root | — | — |
 | `scripts/check_house_rules.py` | The guard for the three rules, over every language here | run by `scripts/verify.sh` | — | — |
@@ -291,6 +292,11 @@ comment that explains it. Brevity is never worth obscurity.
   the crate's at `rust-crates`): every operation reaches the core once, the error mapping is total, one ABI round
   trip per value type. `cpp/tests/observer_test.cpp` holds the observer's own cases (a fault takes effect at the
   scripted step; a live engine refuses the observer calls with `invalid_argument`).
+- **The path module is tested in C first**: `core/tests/path_test.c` is a `.c` main over tables of cases
+  (every public path function, every refusal, every edge), registered with `add_test`, and the C++ suite
+  `cpp/tests/path_test.cpp` runs the same table through the face. `fuzz/path_fuzz.c` is a libFuzzer target over
+  the module, built by the `fuzz` preset (clang with libFuzzer: Homebrew LLVM on a Mac) and run for ten seconds
+  per target by the `fuzz-smoke` leg; its invariants are asserted with a trap, never a print.
 - **A failure is provoked for real where that is possible** (a missing file, a symlink, a directory without
   permission) and injected through the observer where it is not (the disk filling up mid-write).
 - **A test checks its outcome without the code under test**, through the test support's raw helpers, and
@@ -315,14 +321,17 @@ leg, in order; CI calls it once per job with that job's leg names:
 bash scripts/verify.sh build-debug        # cmake --preset debug, build, ctest
 bash scripts/verify.sh build-sanitized    # the same under the sanitized posture
 bash scripts/verify.sh header-four-ways   # the public header as strict C11, gnu11, C++20 and C++23
+bash scripts/verify.sh path-freestanding  # the path module as a freestanding object: -ffreestanding on the host, bare wasm32 where the compiler has it
 bash scripts/verify.sh guards             # each guard's --selftest, then its scan of the tree
 bash scripts/verify.sh consumer           # examples/consumer through FetchContent, from this checkout
 bash scripts/verify.sh swift              # swift test
 bash scripts/verify.sh clang-tidy         # core/ and cpp/ under their own .clang-tidy; report-only this stage
+bash scripts/verify.sh fuzz-smoke         # each libFuzzer target for ten seconds under the fuzz preset (clang with libFuzzer)
 ```
 
 CI runs it on Linux (Debian 13: GCC 14 and clang 19, Swift 6.4); macOS, iOS and the cross targets (Android,
-Emscripten, musl) run by hand until CI has runners and packages for them.
+Emscripten, musl) run by hand until CI has runners and packages for them, and so does `fuzz-smoke`, which needs
+clang's compiler-rt (named in `ci.yml`'s gated list beside the clang sanitized leg).
 
 ## Changing a rule
 

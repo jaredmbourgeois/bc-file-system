@@ -15,9 +15,12 @@ on:
 #
 # Not here yet, gated on workstation `ci-forgejo-runner-posture` stage `bc-file-system-job-packages` (the runner
 # has no musl, NDK or Emscripten): the NDK compile legs at API 30, 33 and 35; Emscripten (MEMFS and NODERAWFS
-# under Node); x86_64 musl native and aarch64 musl under qemu-user-static; wasm32 freestanding for the path
-# module; memory-sanitized; and build-clang's sanitized leg (clang-19's compiler-rt, libclang-rt-19-dev: without it
-# the sanitized link fails on libclang_rt.asan*.a). Each lands as its own job when its packages do.
+# under Node); x86_64 musl native and aarch64 musl under qemu-user-static; memory-sanitized; build-clang's
+# sanitized leg (clang-19's compiler-rt, libclang-rt-19-dev: without it the sanitized link fails on
+# libclang_rt.asan*.a); and the `fuzz-smoke` leg (libFuzzer is in that same compiler-rt package), which runs on
+# the Mac by hand (`bash scripts/verify.sh fuzz-smoke`) until then. Each lands as its own job when its packages
+# do. The wasm32 freestanding compile of the path module needs no package: clang-19 has the target, so the
+# path-freestanding job below runs under it.
 jobs:
   build-gcc:
     runs-on: debian-13
@@ -42,6 +45,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/verify.sh header-four-ways
+
+  path-freestanding:
+    runs-on: debian-13
+    env:
+      CC: clang-19
+      CXX: clang++-19
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh path-freestanding
 
   guards:
     runs-on: debian-13

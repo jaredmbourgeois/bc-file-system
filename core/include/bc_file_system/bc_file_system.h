@@ -103,9 +103,10 @@ typedef enum bc_file_system_error_kind {
     bc_file_system_error_kind_buffer_too_small = 15
 } bc_file_system_error_kind;
 
-/* Which public function an error came from, in this header's order. The last two name the path module's
- * validating constructors, whose C functions arrive with the path module; the values exist now so every face can
- * report a refused path value with an operation. */
+/* Which public function an error came from, in this header's order. 28 and 29 are the path module's two
+ * validators (`bc_file_system_relative_path_validate`, `bc_file_system_absolute_path_validate`), named for the
+ * face constructors that call them; 30 onward are the rest of the module. A later stage may append a value;
+ * none is ever renumbered. */
 typedef enum bc_file_system_operation {
     bc_file_system_operation_engine_create_live = 1,
     bc_file_system_operation_engine_create_observed_for_tests = 2,
@@ -135,7 +136,17 @@ typedef enum bc_file_system_operation {
     bc_file_system_operation_condemn = 26,
     bc_file_system_operation_remove_condemned = 27,
     bc_file_system_operation_relative_path_from = 28,
-    bc_file_system_operation_absolute_path_from = 29
+    bc_file_system_operation_absolute_path_from = 29,
+    bc_file_system_operation_path_join = 30,
+    bc_file_system_operation_path_parent = 31,
+    bc_file_system_operation_path_last_component = 32,
+    bc_file_system_operation_path_next_component = 33,
+    bc_file_system_operation_path_stem = 34,
+    bc_file_system_operation_path_extension = 35,
+    bc_file_system_operation_path_relate = 36,
+    bc_file_system_operation_path_lexically_normalize = 37,
+    bc_file_system_operation_path_resolve_against = 38,
+    bc_file_system_operation_path_library_name = 39
 } bc_file_system_operation;
 
 /* The system call an operation was making when it failed, and the observer's vocabulary: one enumerator per
@@ -245,6 +256,30 @@ typedef enum bc_file_system_fault_action {
     /* The operation returns from the step without any cleanup, as if the process had been killed there. */
     bc_file_system_fault_action_stop = 2
 } bc_file_system_fault_action;
+
+/* Where one path stands with respect to another, lexically (`bc_file_system_path_relate`). Advisory: a lexical
+ * answer knows nothing of symlinks or the disk; `beneath` is what guards an access. */
+typedef enum bc_file_system_path_relation {
+    /* The path names something strictly beneath the other. */
+    bc_file_system_path_relation_inside = 1,
+    bc_file_system_path_relation_same = 2,
+    /* Neither beneath the other nor the other itself; the other being beneath the path is `outside` too. */
+    bc_file_system_path_relation_outside = 3,
+    /* One path is absolute and the other relative, or one of them climbs out of its own start with `..`. */
+    bc_file_system_path_relation_undecidable = 4
+} bc_file_system_path_relation;
+
+/* What a component spells when it spells a library file (`bc_file_system_path_library_name`). */
+typedef enum bc_file_system_library_kind {
+    /* Not one of the platform spellings. */
+    bc_file_system_library_kind_none = 1,
+    /* `libX.so`, `libX.so.1.2`, `libX.dylib`, `X.dll`. */
+    bc_file_system_library_kind_shared = 2,
+    /* `libX.a`. */
+    bc_file_system_library_kind_static = 3,
+    /* `X.framework`. */
+    bc_file_system_library_kind_framework = 4
+} bc_file_system_library_kind;
 
 /* ---- Structs ----------------------------------------------------------------------------------------------- */
 
@@ -539,6 +574,120 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
 /* Removes every `.bc-condemned-` entry directly inside `parent`, as `bc_file_system_remove_tree` would. */
 int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_file_system_location *parent,
                                         bc_file_system_error *error);
+
+/* ---- Path text --------------------------------------------------------------------------------------------- */
+
+/* The path module: the lexical rules of path text, with nothing consulted, not the working directory, the home
+ * directory, the environment, the disk or a Unicode table. It is the library's freestanding tier (nothing but
+ * <stddef.h> and <stdint.h>, no allocation, caller buffers), so it builds for wasm32 and under -ffreestanding as
+ * well as on every hosted target. Each function validates its pointers and lengths first and answers
+ * `invalid_argument`, touching nothing, when text breaks the rules below; an answer of variable length follows the
+ * buffer protocol at the top of this header. The operations reported are `relative_path_from`,
+ * `absolute_path_from` and the `bc_file_system_operation_path_*` values.
+ *
+ * A RELATIVE PATH has one spelling, so equality is a byte compare: at least one component, no leading slash, no
+ * NUL, no empty component (`a//b`, a trailing slash), no `.` and no `..` component, no component over 255 bytes
+ * (NAME_MAX on every platform the library ships for). An ABSOLUTE PATH starts with a slash: `/` alone is the
+ * root; otherwise the same component rules, except that `..` is allowed: it is reported, never resolved against
+ * the disk. A COMPONENT is one entry name: 1 to 255 bytes, no slash, no NUL (`.` and `..` are components on
+ * their own; the path rules are what refuse them inside a path). LOOSE TEXT, which only `lexically_normalize`,
+ * `relate` and `resolve_against` accept, is any non-empty text without a NUL whose components are at most 255
+ * bytes: `.`, `..` and empty components are what normalisation removes. Every `path` or `component` below is
+ * `length` bytes and may be NULL only when `length` is 0; the empty text is refused by every function here, so
+ * a NULL answers `invalid_argument` either way. */
+
+/* Whether `path` is a relative path by the rules above. Reports `bc_file_system_operation_relative_path_from`. */
+int32_t bc_file_system_relative_path_validate(const uint8_t *path, size_t length, bc_file_system_error *error);
+
+/* Whether `path` is an absolute path by the rules above. Reports `bc_file_system_operation_absolute_path_from`. */
+int32_t bc_file_system_absolute_path_validate(const uint8_t *path, size_t length, bc_file_system_error *error);
+
+/* `base`, a slash and `relative`, under the buffer protocol; the root already ends in its slash, so `/` and `a`
+ * join as `/a`. `base` is a valid absolute or relative path and `relative` a valid relative path, so the answer
+ * is a valid path of `base`'s kind. A sum of lengths that does not fit `size_t` is `too_large`. */
+int32_t bc_file_system_path_join(const uint8_t *base, size_t base_length, const uint8_t *relative,
+                                 size_t relative_length, uint8_t *buffer, size_t capacity, size_t *length,
+                                 bc_file_system_error *error);
+
+/* The parent of a valid path is a prefix of it. `*present` receives 1 and `*parent_length` how many leading
+ * bytes of `path` spell the parent (`/` for `/a`, `a/b` for `a/b/c`). The root and a one-component relative path
+ * have none: `*present` receives 0 and `*parent_length` is untouched.
+ *
+ * `present`        must not be NULL.
+ * `parent_length`  must not be NULL. */
+int32_t bc_file_system_path_parent(const uint8_t *path, size_t length, int32_t *present, size_t *parent_length,
+                                   bc_file_system_error *error);
+
+/* The last component of a valid path, located inside it: `*offset` and `*component_length`. The root has no
+ * component and is `invalid_argument`.
+ *
+ * `offset`            must not be NULL.
+ * `component_length`  must not be NULL. */
+int32_t bc_file_system_path_last_component(const uint8_t *path, size_t length, size_t *offset, size_t *component_length,
+                                           bc_file_system_error *error);
+
+/* The components of a valid path, one per call. `*cursor` is 0 before the first call and advances with each;
+ * while `*present` receives 1, `*offset` and `*component_length` locate the next component inside `path`; at the
+ * end `*present` receives 0 and the other two are untouched. A `*cursor` that is neither 0 nor a value a previous
+ * call stored is `invalid_argument`.
+ *
+ * `cursor`, `offset`, `component_length`, `present`  must not be NULL. */
+int32_t bc_file_system_path_next_component(const uint8_t *path, size_t length, size_t *cursor, size_t *offset,
+                                           size_t *component_length, int32_t *present, bc_file_system_error *error);
+
+/* The stem of one component: the bytes before its extension, or all of them when it has none. `*stem_length`
+ * receives how many leading bytes of `component` the stem is.
+ *
+ * `stem_length`  must not be NULL. */
+int32_t bc_file_system_path_stem(const uint8_t *component, size_t length, size_t *stem_length,
+                                 bc_file_system_error *error);
+
+/* The extension of one component: the bytes after its last dot, when that dot is neither the first byte
+ * (`.bashrc` has no extension) nor the last (`archive.` has none); the dot itself is excluded. `*present`
+ * receives 1 with `*offset` and `*extension_length` locating it inside `component`, or 0 with the other two
+ * untouched.
+ *
+ * `offset`, `extension_length`, `present`  must not be NULL. */
+int32_t bc_file_system_path_extension(const uint8_t *component, size_t length, size_t *offset, size_t *extension_length,
+                                      int32_t *present, bc_file_system_error *error);
+
+/* Where `path` stands with respect to `other`, lexically. Both are loose text, each normalised as
+ * `bc_file_system_path_lexically_normalize` would and then compared component by component; `*relation` receives
+ * a bc_file_system_path_relation. Two absolute or two relative paths compare; one of each is `undecidable`, and
+ * so is a relative path that still begins with `..` once normalised, since no lexical rule knows where that
+ * climbs to. Advisory: nothing here guards an access; `beneath` does.
+ *
+ * `relation`  must not be NULL. */
+int32_t bc_file_system_path_relate(const uint8_t *path, size_t length, const uint8_t *other, size_t other_length,
+                                   int32_t *relation, bc_file_system_error *error);
+
+/* Loose text reduced to one spelling, under the buffer protocol, with `*normalized` the answer's length: doubled
+ * slashes collapse, `.` components go, `a/..` folds away, a trailing slash goes, a `..` at the root is dropped
+ * (`/..` is `/`), and a leading `..` of a relative path stays. A relative path with nothing left is `.`. The
+ * disk is never consulted, so a `..` folded through a symlink names a different entry than the system would:
+ * that is the trade of a lexical rule, and `relate` is advisory for the same reason. Idempotent.
+ *
+ * `normalized`  must not be NULL. */
+int32_t bc_file_system_path_lexically_normalize(const uint8_t *path, size_t length, uint8_t *buffer, size_t capacity,
+                                                size_t *normalized, bc_file_system_error *error);
+
+/* `relative`, loose text with no leading slash, resolved against the valid absolute path `absolute_base`: the
+ * two joined and normalised, so the answer is a valid absolute path, under the buffer protocol. How a composition
+ * root turns a command-line argument into an `at` location against the working directory it was handed. A sum
+ * of lengths that does not fit `size_t` is `too_large`. */
+int32_t bc_file_system_path_resolve_against(const uint8_t *absolute_base, size_t base_length, const uint8_t *relative,
+                                            size_t relative_length, uint8_t *buffer, size_t capacity, size_t *length,
+                                            bc_file_system_error *error);
+
+/* Whether one component spells a library file the way a platform names one, and the library's own name inside
+ * it: `libX.so`, `libX.so.1`, `libX.so.1.2.3` and `libX.dylib` (shared), `libX.a` (static), `X.framework`
+ * (framework), `X.dll` (shared), with X at least one byte, byte for byte (`libX.SO` is none). `*kind` receives a
+ * bc_file_system_library_kind; `*stem_offset` and `*stem_length` locate X inside `component`, and under `none`
+ * are untouched.
+ *
+ * `kind`, `stem_offset`, `stem_length`  must not be NULL. */
+int32_t bc_file_system_path_library_name(const uint8_t *component, size_t length, int32_t *kind, size_t *stem_offset,
+                                         size_t *stem_length, bc_file_system_error *error);
 
 #ifdef __cplusplus
 }

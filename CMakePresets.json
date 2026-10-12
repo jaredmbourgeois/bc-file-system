@@ -41,6 +41,17 @@
                 "CMAKE_BUILD_TYPE": "Debug",
                 "BC_FILE_SYSTEM_BUILD_POSTURE": "sanitized"
             }
+        },
+        {
+            "name": "fuzz",
+            "inherits": "base",
+            "displayName": "Debug + ASan/UBSan + the libFuzzer targets (clang with libFuzzer only: Homebrew LLVM on a Mac)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "sanitized",
+                "BC_FILE_SYSTEM_BUILD_FUZZERS": "ON",
+                "BUILD_TESTING": "OFF"
+            }
         }
     ],
     "buildPresets": [
@@ -66,6 +77,18 @@
                 "bc_file_system_core_header_cxx20",
                 "bc_file_system_core_header_cxx23"
             ]
+        },
+        {
+            "name": "path-freestanding",
+            "displayName": "The path module as a freestanding object on the host compiler (the wasm32 object is built by verify.sh when the compiler has the target)",
+            "configurePreset": "debug",
+            "targets": [
+                "bc_file_system_path_freestanding_host"
+            ]
+        },
+        {
+            "name": "fuzz",
+            "configurePreset": "fuzz"
         }
     ],
     "testPresets": [

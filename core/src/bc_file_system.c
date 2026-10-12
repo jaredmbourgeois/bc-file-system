@@ -14,11 +14,13 @@
 
 #include <unistd.h>
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "path.h"
 #include "platform.h"
 
 /* ---- Layout pins -------------------------------------------------------------------------------------------- */
@@ -54,6 +56,10 @@ static_assert(offsetof(bc_file_system_entry, name) == 8, "bc_file_system_entry l
 static_assert(sizeof(bc_file_system_fault) == 20, "bc_file_system_fault layout changed; bump the faces");
 static_assert(offsetof(bc_file_system_fault, system_code) == 16, "bc_file_system_fault layout changed; bump the faces");
 
+/* The path module names no system header, so its component limit is a number of its own; the hosted engine is
+ * where that number meets the platform's. */
+static_assert(bc_file_system_path_component_capacity == NAME_MAX, "the path module's component limit is not NAME_MAX");
+
 /* ---- Constants and handles ---------------------------------------------------------------------------------- */
 
 enum : uint32_t {
@@ -66,7 +72,7 @@ enum : uint32_t {
 /* The last enumerator of each closed enum, so a range check reads `is_in_enum(value, operation_last)`. Every
  * enum in the header runs from 1 to its last value without a gap. */
 enum : int32_t {
-    operation_last = bc_file_system_operation_absolute_path_from,
+    operation_last = bc_file_system_operation_path_library_name,
     step_last = bc_file_system_step_identity_check,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
@@ -145,31 +151,24 @@ static bool is_answer_buffer(const uint8_t *buffer, size_t capacity, const size_
     return capacity == 0;
 }
 
+/* The path's text is the path module's to judge (a NUL, an empty or `.` component, a trailing slash, relative
+ * text under `at`, which would resolve against the working directory); the engine checks only what belongs to
+ * the location: its kind and whether it holds the directory that kind needs. */
 static bool is_valid_location(const bc_file_system_location *location) {
-    if (location == nullptr || !is_byte_span(location->path, location->length)) {
-        return false;
-    }
-    /* A NUL inside a path would end the system call's view of it early: refused once, here. */
-    for (size_t index = 0; index < location->length; ++index) {
-        if (location->path[index] == 0) {
-            return false;
-        }
-    }
-    if (location->length == 0) {
+    if (location == nullptr) {
         return false;
     }
     if (location->kind == bc_file_system_location_kind_at) {
-        /* Relative text would resolve against the working directory, which is ambient state. */
         if (location->directory != nullptr) {
             return false;
         }
-        return location->path[0] == '/';
+        return bc_file_system_path_text_is_valid_absolute(location->path, location->length);
     }
     if (location->kind == bc_file_system_location_kind_beneath) {
         if (location->directory == nullptr) {
             return false;
         }
-        return location->path[0] != '/';
+        return bc_file_system_path_text_is_valid_relative(location->path, location->length);
     }
     return false;
 }

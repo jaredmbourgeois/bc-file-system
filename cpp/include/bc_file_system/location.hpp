@@ -15,9 +15,10 @@ class FileSystem;
 
 /// Path text relative to a directory, as bytes, one spelling per path so equality is a byte compare.
 ///
-/// Validated once at construction by the lexical rules the path module will own (stage `path-module` moves
-/// them into C; until then they live here, minimal): not empty, no NUL byte, no leading slash, no empty
-/// component (`a//b`, a trailing slash) and no `..` component. Nothing on disk is consulted.
+/// Validated once at construction by the path module in C (`bc_file_system_relative_path_validate`): at least
+/// one component, no NUL byte, no leading slash, no empty component (`a//b`, a trailing slash), no `.` and no
+/// `..` component, no component over 255 bytes. Nothing on disk is consulted. The free functions over path
+/// values are in `<bc_file_system/path.hpp>`.
 class RelativePath {
 public:
     [[nodiscard]] static auto from(std::string_view bytes) -> Result<RelativePath>;
@@ -34,7 +35,8 @@ private:
 
 /// Absolute path text, as bytes. `..` is allowed and reported by the path module, never resolved here.
 ///
-/// Validated once at construction: starts with a slash, no NUL byte.
+/// Validated once at construction by the path module in C (`bc_file_system_absolute_path_validate`): a leading
+/// slash, `/` alone the root, otherwise the relative rules with `..` allowed.
 class AbsolutePath {
 public:
     [[nodiscard]] static auto from(std::string_view bytes) -> Result<AbsolutePath>;

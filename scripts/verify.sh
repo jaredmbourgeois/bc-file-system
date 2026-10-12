@@ -8,10 +8,11 @@
 #
 # Every leg prints PASS <leg> or FAIL <leg>; the first FAIL ends the run with a non-zero status. A leg whose tool
 # is missing is a FAIL, never a silent skip, except clang-tidy, which is report-only this stage and announces its
-# absence on standard error.
+# absence on standard error. A leg that can prove less on this machine (path-freestanding without a wasm32
+# target) says so on standard error before its PASS.
 set -euo pipefail
 
-ALL_LEGS="build-debug build-sanitized header-four-ways guards consumer swift clang-tidy"
+ALL_LEGS="build-debug build-sanitized header-four-ways path-freestanding guards consumer swift clang-tidy fuzz-smoke"
 
 pass() {
     printf 'PASS %s\n' "$1"
@@ -45,6 +46,21 @@ leg_header_four_ways() {
     { cmake --preset debug && cmake --build --preset header-four-ways; } \
         || fail header-four-ways "the public header does not compile in one of its four modes"
     pass header-four-ways
+}
+
+# The path module compiled as a freestanding object: on the host compiler under -ffreestanding always, and for
+# bare wasm32 when the configured compiler has that target (CMake recorded the answer at configure time).
+# Both objects are part of `all`, so the build legs prove the same; this leg names the proof.
+leg_path_freestanding() {
+    { cmake --preset debug && cmake --build --preset path-freestanding; } \
+        || fail path-freestanding "the path module does not compile as a freestanding object on the host compiler"
+    if grep -q '^BC_FILE_SYSTEM_C_COMPILER_ACCEPTS_WASM32:INTERNAL=1$' build/debug/CMakeCache.txt; then
+        cmake --build build/debug --target bc_file_system_path_freestanding_wasm32 \
+            || fail path-freestanding "the path module does not compile for bare wasm32"
+    else
+        printf 'NOTE path-freestanding: this C compiler has no wasm32 target; only the host -ffreestanding object was built\n' >&2
+    fi
+    pass path-freestanding
 }
 
 # Each guard proves first that it can fail, then scans the tree.
@@ -99,6 +115,29 @@ leg_clang_tidy() {
     pass clang-tidy
 }
 
+# Each libFuzzer target under the fuzz preset, for ten seconds: a smoke that the target builds and finds
+# nothing at once, not a campaign. libFuzzer is compiler-rt's, so this needs a clang that ships it: Apple's
+# does not, so on a Mac the Homebrew LLVM compilers are chosen when installed; elsewhere the environment's
+# compiler is used, and a compiler without libFuzzer is a FAIL, never a skip (CI names this leg in its gated
+# list until the runner has clang's compiler-rt).
+leg_fuzz_smoke() {
+    local homebrew_clang=/opt/homebrew/opt/llvm/bin/clang
+    if [ "$(uname)" = Darwin ] && [ -x "$homebrew_clang" ]; then
+        export CC="$homebrew_clang"
+        export CXX="${homebrew_clang}++"
+    fi
+    { cmake --preset fuzz && cmake --build --preset fuzz; } \
+        || fail fuzz-smoke "the fuzz preset did not configure or build (a clang with libFuzzer is required)"
+    local target name
+    for target in build/fuzz/fuzz/bc_file_system_*_fuzz; do
+        name=$(basename "$target")
+        "$target" -max_total_time=10 -max_len=4096 -artifact_prefix="build/fuzz/${name}-" > "build/fuzz/${name}.log" 2>&1 \
+            || fail fuzz-smoke "${name} found a failing input; see build/fuzz/${name}.log and build/fuzz/${name}-crash-*"
+        printf '%s: %s\n' "$name" "$(tail -n 1 "build/fuzz/${name}.log")"
+    done
+    pass fuzz-smoke
+}
+
 run_leg() {
     local leg=$1
     local root=$2
@@ -106,10 +145,12 @@ run_leg() {
         build-debug) leg_build_debug ;;
         build-sanitized) leg_build_sanitized ;;
         header-four-ways) leg_header_four_ways ;;
+        path-freestanding) leg_path_freestanding ;;
         guards) leg_guards ;;
         consumer) leg_consumer "$root" ;;
         swift) leg_swift ;;
         clang-tidy) leg_clang_tidy ;;
+        fuzz-smoke) leg_fuzz_smoke ;;
         *) fail "$leg" "unknown leg; the legs are: $ALL_LEGS" ;;
     esac
 }

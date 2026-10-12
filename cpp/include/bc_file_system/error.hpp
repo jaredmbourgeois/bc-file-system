@@ -78,6 +78,16 @@ enum class Operation : std::int32_t {
     remove_condemned = 27,
     relative_path_from = 28,
     absolute_path_from = 29,
+    path_join = 30,
+    path_parent = 31,
+    path_last_component = 32,
+    path_next_component = 33,
+    path_stem = 34,
+    path_extension = 35,
+    path_relate = 36,
+    path_lexically_normalize = 37,
+    path_resolve_against = 38,
+    path_library_name = 39,
 };
 
 static_assert(static_cast<std::int32_t>(Operation::engine_create_live) == bc_file_system_operation_engine_create_live);
@@ -114,6 +124,20 @@ static_assert(static_cast<std::int32_t>(Operation::condemn) == bc_file_system_op
 static_assert(static_cast<std::int32_t>(Operation::remove_condemned) == bc_file_system_operation_remove_condemned);
 static_assert(static_cast<std::int32_t>(Operation::relative_path_from) == bc_file_system_operation_relative_path_from);
 static_assert(static_cast<std::int32_t>(Operation::absolute_path_from) == bc_file_system_operation_absolute_path_from);
+static_assert(static_cast<std::int32_t>(Operation::path_join) == bc_file_system_operation_path_join);
+static_assert(static_cast<std::int32_t>(Operation::path_parent) == bc_file_system_operation_path_parent);
+static_assert(static_cast<std::int32_t>(Operation::path_last_component) ==
+              bc_file_system_operation_path_last_component);
+static_assert(static_cast<std::int32_t>(Operation::path_next_component) ==
+              bc_file_system_operation_path_next_component);
+static_assert(static_cast<std::int32_t>(Operation::path_stem) == bc_file_system_operation_path_stem);
+static_assert(static_cast<std::int32_t>(Operation::path_extension) == bc_file_system_operation_path_extension);
+static_assert(static_cast<std::int32_t>(Operation::path_relate) == bc_file_system_operation_path_relate);
+static_assert(static_cast<std::int32_t>(Operation::path_lexically_normalize) ==
+              bc_file_system_operation_path_lexically_normalize);
+static_assert(static_cast<std::int32_t>(Operation::path_resolve_against) ==
+              bc_file_system_operation_path_resolve_against);
+static_assert(static_cast<std::int32_t>(Operation::path_library_name) == bc_file_system_operation_path_library_name);
 
 /// The system call an operation was making when it failed, and the observer's vocabulary.
 enum class Step : std::int32_t {

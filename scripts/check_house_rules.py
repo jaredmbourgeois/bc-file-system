@@ -110,7 +110,8 @@ CONFIGURATION: Final = Configuration(
         # The fixtures' temporary directory: the one place `swift test` reads where its root is.
         "swift": ("Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift",),
     },
-    library_directories=("core/", "cpp/include/", "cpp/src/"),
+    # The library proper, what a consumer compiles and links; core/tests/ is the C-only test, which may print.
+    library_directories=("core/include/", "core/src/", "cpp/include/", "cpp/src/"),
     # BC_FILE_SYSTEM_TOOLCHAIN_KNOBS in cmake/helpers.cmake (_GLIBCXX_ASSERTIONS), the hardened posture's
     # _FORTIFY_SOURCE, and the two the Linux translation unit defines at its top.
     toolchain_knobs=("_FILE_OFFSET_BITS", "_FORTIFY_SOURCE", "_GLIBCXX_ASSERTIONS", "_GNU_SOURCE"),
@@ -124,7 +125,9 @@ CONFIGURATION: Final = Configuration(
     # bc_file_system_status_of -> FileSystem::status, bc_file_system_directory_opened_as -> Directory::opened_as,
     # bc_file_system_engine_release / directory_release / lock_release -> the three destructors,
     # bc_file_system_observed_fault_add / faults_clear / step_count -> Engine::add_fault / clear_faults / step_count.
-    face_parity_faces={"C++": ("cpp/src/engine.cpp", "cpp/src/error.cpp", "cpp/src/file_system.cpp")},
+    face_parity_faces={
+        "C++": ("cpp/src/engine.cpp", "cpp/src/error.cpp", "cpp/src/file_system.cpp", "cpp/src/path.cpp"),
+    },
     test_only_factory_patterns=(
         r"\bbc_file_system_engine_create_observed_for_tests\b",
         r"\bobserved_for_tests\b",

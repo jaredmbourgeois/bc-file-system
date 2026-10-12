@@ -20,8 +20,8 @@
 
 // The path values of the C++ face: what RelativePath and AbsolutePath accept and refuse, how a Location holds
 // its bytes and crosses to C, and how the core refuses an `at` location whose bytes are not an absolute path.
-// The lexical rules live in the face until stage `path-module` moves them into C; these cases hold the rules,
-// not their home.
+// The lexical rules live in the path module in C (core/src/path.c, proven by core/tests/path_test.c); these
+// cases are the face's witness that its value types carry each rule across unchanged.
 
 namespace bc::file_system {
 
@@ -131,6 +131,20 @@ TEST(RelativePathTest, RefusesADotDotComponent) {
     EXPECT_EQ(last.error().kind, ErrorKind::invalid_argument);
 }
 
+// One spelling per path: `.` names nothing a directory entry does not already name.
+TEST(RelativePathTest, RefusesADotComponent) {
+    const Result<RelativePath> alone = RelativePath::from(".");
+    const Result<RelativePath> inside = RelativePath::from("a/./b");
+    const Result<RelativePath> leading = RelativePath::from("./a");
+
+    ASSERT_FALSE(alone.has_value());
+    EXPECT_EQ(alone.error().kind, ErrorKind::invalid_argument);
+    ASSERT_FALSE(inside.has_value());
+    EXPECT_EQ(inside.error().kind, ErrorKind::invalid_argument);
+    ASSERT_FALSE(leading.has_value());
+    EXPECT_EQ(leading.error().kind, ErrorKind::invalid_argument);
+}
+
 TEST(RelativePathTest, RefusesANulByte) {
     const std::string bytes = with_a_nul_inside("a", "b");
 
@@ -194,6 +208,24 @@ TEST(AbsolutePathTest, RefusesRelativeText) {
     EXPECT_EQ(climbing.error().kind, ErrorKind::invalid_argument);
 }
 
+// The root is the one absolute path with an empty component; anywhere else an empty one (`//`, a trailing
+// slash) or a `.` is refused, so an absolute path too has one spelling short of `..`.
+TEST(AbsolutePathTest, RefusesAnEmptyOrDotComponentBelowTheRoot) {
+    const Result<AbsolutePath> doubled = AbsolutePath::from("/a//b");
+    const Result<AbsolutePath> trailing = AbsolutePath::from("/a/");
+    const Result<AbsolutePath> two_slashes = AbsolutePath::from("//");
+    const Result<AbsolutePath> dot = AbsolutePath::from("/a/./b");
+
+    ASSERT_FALSE(doubled.has_value());
+    EXPECT_EQ(doubled.error().kind, ErrorKind::invalid_argument);
+    ASSERT_FALSE(trailing.has_value());
+    EXPECT_EQ(trailing.error().kind, ErrorKind::invalid_argument);
+    ASSERT_FALSE(two_slashes.has_value());
+    EXPECT_EQ(two_slashes.error().kind, ErrorKind::invalid_argument);
+    ASSERT_FALSE(dot.has_value());
+    EXPECT_EQ(dot.error().kind, ErrorKind::invalid_argument);
+}
+
 TEST(AbsolutePathTest, RefusesANulByte) {
     const std::string bytes = with_a_nul_inside("/a", "b");
 
@@ -216,7 +248,7 @@ TEST(AbsolutePathTest, ARefusalNamesTheOperationAndTheBytes) {
 TEST(AbsolutePathTest, EqualityIsAByteCompare) {
     const Result<AbsolutePath> first = AbsolutePath::from("/a/b");
     const Result<AbsolutePath> same = AbsolutePath::from("/a/b");
-    const Result<AbsolutePath> other = AbsolutePath::from("/a/b/");
+    const Result<AbsolutePath> other = AbsolutePath::from("/a/c");
 
     ASSERT_TRUE(first.has_value() && same.has_value() && other.has_value());
     EXPECT_EQ(*first, *same);
@@ -311,6 +343,19 @@ TEST_F(LocationRefusalTest, ANulByteUnderAtIsInvalidArgument) {
     ASSERT_FALSE(status.has_value());
     EXPECT_EQ(status.error().kind, ErrorKind::invalid_argument);
     EXPECT_EQ(status.error().operation, Operation::status);
+}
+
+// The path module's rules reach every operation through the core's location check: a trailing slash is not
+// one spelling of a path, so an `at` location carrying one is refused at the door, before any system call.
+TEST_F(LocationRefusalTest, ATrailingSlashUnderAtIsInvalidArgument) {
+    const Location trailing = Location::at(std::filesystem::path{"/tmp/"});
+
+    const auto status = files().status(trailing, FinalSymlink::refuse);
+
+    ASSERT_FALSE(status.has_value());
+    EXPECT_EQ(status.error().kind, ErrorKind::invalid_argument);
+    EXPECT_EQ(status.error().operation, Operation::status);
+    EXPECT_FALSE(status.error().step.has_value());
 }
 
 // The refusal is the operation's, so every operation refuses the same text the same way.

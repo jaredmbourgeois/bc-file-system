@@ -88,41 +88,25 @@ auto durability_answer(std::int32_t achieved, Operation called, std::string_view
     return *durability;
 }
 
-auto refused_path(Operation called, std::string_view bytes) -> Error {
-    return Error{.kind = ErrorKind::invalid_argument,
-                 .operation = called,
-                 .step = std::nullopt,
-                 .system_code = 0,
-                 .path = std::string(bytes),
-                 .name_truncated = false};
-}
-
 } // namespace
 
 // ---- Path values ---------------------------------------------------------------------------------------------
 
+// The rules live in the path module; the value type holds what the core accepted, and a refusal is the core's
+// error with the bytes it refused as its path.
+
 auto RelativePath::from(std::string_view bytes) -> Result<RelativePath> {
-    if (bytes.empty() || bytes.front() == '/' || bytes.find('\0') != std::string_view::npos) {
-        return refused_path(Operation::relative_path_from, bytes);
-    }
-    // Each component is the text between two slashes: an empty one (`a//b`, a trailing slash) or `..` has no
-    // one spelling beneath a directory and is refused.
-    std::size_t start = 0;
-    while (start <= bytes.size()) {
-        const std::size_t slash = bytes.find('/', start);
-        const std::size_t end = slash == std::string_view::npos ? bytes.size() : slash;
-        const std::string_view component = bytes.substr(start, end - start);
-        if (component.empty() || component == "..") {
-            return refused_path(Operation::relative_path_from, bytes);
-        }
-        start = end + 1;
+    bc_file_system_error c_error;
+    if (bc_file_system_relative_path_validate(bytes_of(bytes), bytes.size(), &c_error) != 0) {
+        return error_from(c_error, Operation::relative_path_from, bytes);
     }
     return RelativePath{std::string(bytes)};
 }
 
 auto AbsolutePath::from(std::string_view bytes) -> Result<AbsolutePath> {
-    if (bytes.empty() || bytes.front() != '/' || bytes.find('\0') != std::string_view::npos) {
-        return refused_path(Operation::absolute_path_from, bytes);
+    bc_file_system_error c_error;
+    if (bc_file_system_absolute_path_validate(bytes_of(bytes), bytes.size(), &c_error) != 0) {
+        return error_from(c_error, Operation::absolute_path_from, bytes);
     }
     return AbsolutePath{std::string(bytes)};
 }

@@ -6,12 +6,14 @@ add_library(bc_file_system STATIC
     include/bc_file_system/file_system.hpp
     include/bc_file_system/location.hpp
     include/bc_file_system/options.hpp
+    include/bc_file_system/path.hpp
     include/bc_file_system/required.hpp
     include/bc_file_system/result.hpp
     include/bc_file_system/status.hpp
     src/engine.cpp
     src/error.cpp
     src/file_system.cpp
+    src/path.cpp
 )
 add_library(bc::file_system ALIAS bc_file_system)
 
@@ -48,11 +50,12 @@ if(BUILD_TESTING)
     bc_file_system_set_compile_options(bc_file_system_test_support)
 
     # The contract suite (the specification every face is held to, driving C through the C++ face), the C++
-    # binding suite, the observer suite and the path-value suite, in one binary.
+    # binding suite, the observer suite, the path-value suite and the path module's binding suite, in one binary.
     add_executable(bc_file_system_test
         tests/binding_test.cpp
         tests/contract_test.cpp
         tests/observer_test.cpp
+        tests/path_test.cpp
         tests/path_values_test.cpp
     )
     target_link_libraries(bc_file_system_test PRIVATE

@@ -37,4 +37,5 @@ endif()
 
 add_subdirectory(core)   # the C core: bc::file_system_core
 add_subdirectory(cpp)    # the C++ face: bc::file_system, and the contract and binding suites
+add_subdirectory(fuzz)   # the libFuzzer targets, behind BC_FILE_SYSTEM_BUILD_FUZZERS (the fuzz preset)
 # No install(): consumers build from source through FetchContent and link the alias.

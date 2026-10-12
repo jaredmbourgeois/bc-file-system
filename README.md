@@ -41,6 +41,8 @@ and how its guards enforce them, are in `AGENTS.md`.
 
 Stage 9 of its plan, `salvaged-under-the-new-name`: the public header, an honest stub core that answers
 `unsupported` to every operation, the C++ face, the contract suite (red or disabled until each operation's stage),
-the binding suites, the Swift skeleton, the guards and CI. The operations land in C group by group over the
-next stages (the path module, the engine and its errors, the resolution layer, status and reads, writes,
-directories, moves and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.
+the binding suites, the Swift skeleton, the guards and CI. Stage 10 `path-module` is in: the path module (`core/src/path.c`), the freestanding tier of the core, compiled
+on every build under `-ffreestanding` and for bare wasm32, proven by a C-only test and fuzzed under the `fuzz`
+preset. The remaining operations land in C group by group over the next stages (the engine and its errors, the
+resolution layer, status and reads, writes, directories, moves and copies, locks and links); `0.1.0` is tagged
+when every face is green on every platform.

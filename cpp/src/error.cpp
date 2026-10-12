@@ -105,6 +105,26 @@ auto name_of(Operation operation) noexcept -> std::string_view {
         return "relative_path_from";
     case Operation::absolute_path_from:
         return "absolute_path_from";
+    case Operation::path_join:
+        return "path_join";
+    case Operation::path_parent:
+        return "path_parent";
+    case Operation::path_last_component:
+        return "path_last_component";
+    case Operation::path_next_component:
+        return "path_next_component";
+    case Operation::path_stem:
+        return "path_stem";
+    case Operation::path_extension:
+        return "path_extension";
+    case Operation::path_relate:
+        return "path_relate";
+    case Operation::path_lexically_normalize:
+        return "path_lexically_normalize";
+    case Operation::path_resolve_against:
+        return "path_resolve_against";
+    case Operation::path_library_name:
+        return "path_library_name";
     }
     return "unknown";
 }
@@ -171,7 +191,7 @@ auto error_kind_from(std::int32_t value) noexcept -> std::optional<ErrorKind> {
 }
 
 auto operation_from(std::int32_t value) noexcept -> std::optional<Operation> {
-    if (value >= bc_file_system_operation_engine_create_live && value <= bc_file_system_operation_absolute_path_from) {
+    if (value >= bc_file_system_operation_engine_create_live && value <= bc_file_system_operation_path_library_name) {
         return static_cast<Operation>(value);
     }
     return std::nullopt;
