@@ -17,7 +17,8 @@ on:
 # Not here yet, gated on workstation `ci-forgejo-runner-posture` stage `bc-file-system-job-packages` (the runner
 # has no musl, NDK or Emscripten): the NDK compile legs at API 30, 33 and 35; Emscripten (MEMFS and NODERAWFS
 # under Node); x86_64 musl native and aarch64 musl under qemu-user-static, for the C build and for `cargo test`
-# on the two musl targets `x86_64-unknown-linux-musl` (musl-gcc from musl-tools) and
+# (the crate's binding suite and ABI round trips, run where the target's ABI is) on the two musl targets
+# `x86_64-unknown-linux-musl` (musl-gcc from musl-tools) and
 # `aarch64-unknown-linux-musl` (clang-19 `--target=aarch64-linux-musl` over musl-dev:arm64 headers, named per
 # target through CC_<triple>; no cargo-zigbuild on the Mac either); memory-sanitized; build-clang's sanitized
 # leg (clang-19's compiler-rt, libclang-rt-19-dev: without it the sanitized link fails on libclang_rt.asan*.a);
@@ -78,9 +79,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash scripts/verify.sh consumer
 
-  # The Rust workspace, on the crate's MSRV and one pinned stable, never the moving channel, so a push is red
-  # only for what it changed; the pin moves in one commit with that release's lint fixes. The build script
-  # compiles the C core with the runner's `cc` (GCC 14), the way a Rust consumer on this host would.
+  # The Rust workspace (`bc-file-system` and `bc-file-system-testing`), on the MSRV and one pinned stable, never
+  # the moving channel, so a push is red only for what it changed; the pin moves in one commit with that release's
+  # lint fixes. RUSTUP_TOOLCHAIN takes precedence over the root's rust-toolchain.toml (the MSRV, for local builds),
+  # so each leg runs its own compiler. The leg is fmt, clippy, the tests and rustdoc under -D warnings. The build
+  # script compiles the C core with the runner's `cc` (GCC 14), the way a Rust consumer on this host would.
   rust:
     runs-on: debian-13
     strategy:

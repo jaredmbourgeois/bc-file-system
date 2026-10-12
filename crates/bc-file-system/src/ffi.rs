@@ -184,6 +184,18 @@ pub struct bc_file_system_entry {
     pub name: [u8; 256],
 }
 
+impl bc_file_system_entry {
+    /// The struct before a call: every field zero, which no stored entry leaves (an entry type is never 0).
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            entry_type: 0,
+            name_length: 0,
+            name: [0; 256],
+        }
+    }
+}
+
 /// One scripted fault for an engine created for tests: the `occurrence`-th time `operation` reaches `step`,
 /// the step fails with `system_code` (`fail`) or the operation returns from there without cleanup (`stop`).
 #[repr(C)]
@@ -205,6 +217,25 @@ pub struct bc_file_system_fault {
 pub const LOCATION_KIND_AT: i32 = 1;
 /// The `beneath` location kind.
 pub const LOCATION_KIND_BENEATH: i32 = 2;
+
+// The values of the header's enums that the typed face reads or writes without a `#[repr(i32)]` enum of its own:
+// a read limit and a fault carry data beside their kind, a lock outcome carries the lock, and the library kind
+// `none` is an absent answer rather than a kind.
+
+/// `bc_file_system_read_limit_kind_whole_file`.
+pub const READ_LIMIT_KIND_WHOLE_FILE: i32 = 1;
+/// `bc_file_system_read_limit_kind_at_most`.
+pub const READ_LIMIT_KIND_AT_MOST: i32 = 2;
+/// `bc_file_system_lock_outcome_acquired`.
+pub const LOCK_OUTCOME_ACQUIRED: i32 = 1;
+/// `bc_file_system_lock_outcome_held_elsewhere`.
+pub const LOCK_OUTCOME_HELD_ELSEWHERE: i32 = 2;
+/// `bc_file_system_fault_action_fail`.
+pub const FAULT_ACTION_FAIL: i32 = 1;
+/// `bc_file_system_fault_action_stop`.
+pub const FAULT_ACTION_STOP: i32 = 2;
+/// `bc_file_system_library_kind_none`: the component spells no library file.
+pub const LIBRARY_KIND_NONE: i32 = 1;
 
 /// The header's `static inline` constructor of an `at` location, respelled: an absolute path the system
 /// resolves. `path` is `length` bytes, borrowed for the call that takes the location.

@@ -437,14 +437,49 @@ struct BindingTests {
             (bc_file_system_operation_remove_condemned, .removeCondemned),
             (bc_file_system_operation_relative_path_from, .relativePathFrom),
             (bc_file_system_operation_absolute_path_from, .absolutePathFrom),
+            (bc_file_system_operation_path_join, .pathJoin),
+            (bc_file_system_operation_path_parent, .pathParent),
+            (bc_file_system_operation_path_last_component, .pathLastComponent),
+            (bc_file_system_operation_path_next_component, .pathNextComponent),
+            (bc_file_system_operation_path_stem, .pathStem),
+            (bc_file_system_operation_path_extension, .pathExtension),
+            (bc_file_system_operation_path_relate, .pathRelate),
+            (bc_file_system_operation_path_lexically_normalize, .pathLexicallyNormalize),
+            (bc_file_system_operation_path_resolve_against, .pathResolveAgainst),
+            (bc_file_system_operation_path_library_name, .pathLibraryName),
         ]
         for (core, operation) in pairs {
             #expect(Operation(rawValue: Int32(core.rawValue)) == operation)
         }
+        // The list above and the enum are both the whole header: the last value pins the count.
         #expect(Operation.allCases.count == pairs.count)
-        #expect(Operation.allCases.count == Int(bc_file_system_operation_absolute_path_from.rawValue))
+        #expect(Operation.allCases.count == Int(bc_file_system_operation_path_library_name.rawValue))
         #expect(Operation(rawValue: 0) == nil)
-        #expect(Operation(rawValue: 30) == nil)
+        #expect(Operation(rawValue: 40) == nil)
+    }
+
+    /// The message names each path operation by its Swift case, as it names every other operation.
+    @Test func theMessageNamesEachPathOperation() {
+        let pathOperations: [Operation] = [
+            .relativePathFrom, .absolutePathFrom, .pathJoin, .pathParent, .pathLastComponent, .pathNextComponent,
+            .pathStem, .pathExtension, .pathRelate, .pathLexicallyNormalize, .pathResolveAgainst, .pathLibraryName,
+        ]
+        let names = pathOperations.map { operation in
+            FileSystemError(
+                kind: .invalidArgument, operation: operation, step: nil, systemCode: 0, path: "a/b",
+                nameTruncated: false, failedLocation: nil
+            ).message
+        }
+
+        #expect(
+            names == [
+                "relativePathFrom: a/b: invalidArgument", "absolutePathFrom: a/b: invalidArgument",
+                "pathJoin: a/b: invalidArgument", "pathParent: a/b: invalidArgument",
+                "pathLastComponent: a/b: invalidArgument", "pathNextComponent: a/b: invalidArgument",
+                "pathStem: a/b: invalidArgument", "pathExtension: a/b: invalidArgument",
+                "pathRelate: a/b: invalidArgument", "pathLexicallyNormalize: a/b: invalidArgument",
+                "pathResolveAgainst: a/b: invalidArgument", "pathLibraryName: a/b: invalidArgument",
+            ])
     }
 
     @Test func everyStepHasItsCValue() {
@@ -907,16 +942,33 @@ struct BindingTests {
     }
 }
 
-/// The path values of the Swift face: what RelativePath and AbsolutePath accept and refuse, and how a Location
-/// composes its text. The lexical rules live in the face until stage `path-module` moves them into C.
+/// The path values of the Swift face: what RelativePath and AbsolutePath accept and refuse, and how a refusal
+/// reads. The rules are the path module's, reached through its two validators; these cases hold that each value
+/// asks C and carries the answer across, including the refusals the stage-9 face, which held a minimal copy of the
+/// rules in Swift, used to miss.
 struct PathValueTests {
+    /// 255 bytes is the longest component the module accepts (NAME_MAX on every platform it ships for).
+    static let longestComponent = String(repeating: "x", count: 255)
+    static let componentTooLong = String(repeating: "x", count: 256)
+
     @Test func aRelativePathAcceptsOneOrMoreComponents() throws {
         #expect(try RelativePath(validating: "notes.txt").bytes == Array("notes.txt".utf8))
         #expect(try RelativePath(validating: "notes/2026/april.md").text == "notes/2026/april.md")
+        #expect(try RelativePath(validating: "a/" + Self.longestComponent).text == "a/" + Self.longestComponent)
     }
 
     @Test func aRelativePathRefusesWhatHasNoOneSpelling() {
         for spelling in ["", "/etc/passwd", "a//b", "a/b/", "..", "a/../b", "a/.."] {
+            let refused = errorThrown { () throws(FileSystemError) in try RelativePath(validating: spelling) }
+            #expect(refused?.kind == .invalidArgument, "\(spelling)")
+            #expect(refused?.operation == .relativePathFrom, "\(spelling)")
+            #expect(refused?.path == spelling, "\(spelling)")
+        }
+    }
+
+    /// The module refuses a `.` component and a component over 255 bytes; the stage-9 face accepted both.
+    @Test func aRelativePathRefusesADotComponentAndAComponentTooLong() {
+        for spelling in [".", "./a", "a/./b", "a/.", "a/" + Self.componentTooLong] {
             let refused = errorThrown { () throws(FileSystemError) in try RelativePath(validating: spelling) }
             #expect(refused?.kind == .invalidArgument, "\(spelling)")
             #expect(refused?.operation == .relativePathFrom, "\(spelling)")
@@ -933,6 +985,9 @@ struct PathValueTests {
     @Test func anAbsolutePathAcceptsAPathStartingAtTheRootAndKeepsDotDot() throws {
         #expect(try AbsolutePath(validating: "/").bytes == Array("/".utf8))
         #expect(try AbsolutePath(validating: "/a/../b").text == "/a/../b")
+        #expect(try AbsolutePath(validating: "/..").text == "/..")
+        #expect(try AbsolutePath(validating: "/a/..").text == "/a/..")
+        #expect(try AbsolutePath(validating: "/" + Self.longestComponent).text == "/" + Self.longestComponent)
     }
 
     @Test func anAbsolutePathRefusesRelativeTextAndANulByte() {
@@ -945,19 +1000,34 @@ struct PathValueTests {
         #expect(withNul?.kind == .invalidArgument)
     }
 
+    /// An absolute path has one spelling too: a trailing slash, an empty component, a `.` component and a component
+    /// over 255 bytes are refused, where the stage-9 face accepted any text that began with a slash.
+    @Test func anAbsolutePathRefusesASecondSpellingOfItsPath() {
+        for spelling in ["/a/", "//", "/a//b", "/.", "/a/./b", "/a/.", "/" + Self.componentTooLong] {
+            let refused = errorThrown { () throws(FileSystemError) in try AbsolutePath(validating: spelling) }
+            #expect(refused?.kind == .invalidArgument, "\(spelling)")
+            #expect(refused?.operation == .absolutePathFrom, "\(spelling)")
+            #expect(refused?.path == spelling, "\(spelling)")
+        }
+    }
+
     @Test func aRefusalIsAnErrorLikeAnyOther() {
         let refused = errorThrown { () throws(FileSystemError) in try RelativePath(validating: "a/../b") }
 
         #expect(refused?.step == nil)
         #expect(refused?.systemCode == 0)
         #expect(refused?.nameTruncated == false)
+        #expect(refused?.failedLocation == nil)
         #expect(refused?.message == "relativePathFrom: a/../b: invalidArgument")
     }
 
+    /// One spelling per path, so equality is a byte compare: two values are equal exactly when their bytes are,
+    /// and `..` is kept rather than resolved, so `/a/../b` and `/b` are two values.
     @Test func equalityIsAByteCompare() throws {
         #expect(try RelativePath(validating: "a/b") == RelativePath(validating: "a/b"))
         #expect(try RelativePath(validating: "a/b") != RelativePath(validating: "a/c"))
-        #expect(try AbsolutePath(validating: "/a/b") != AbsolutePath(validating: "/a/b/"))
+        #expect(try AbsolutePath(validating: "/a/b") == AbsolutePath(validating: "/a/b"))
+        #expect(try AbsolutePath(validating: "/a/../b") != AbsolutePath(validating: "/b"))
     }
 
     /// The error `operation` throws; records an issue and answers nil when it throws nothing.

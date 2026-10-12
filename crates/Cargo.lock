@@ -6,7 +6,15 @@ version = 4
 name = "bc-file-system"
 version = "0.1.0"
 dependencies = [
+ "bc-file-system-testing",
  "cc",
+]
+
+[[package]]
+name = "bc-file-system-testing"
+version = "0.1.0"
+dependencies = [
+ "bc-file-system",
 ]
 
 [[package]]

@@ -17,6 +17,11 @@ build = "build.rs"
 [build-dependencies]
 cc = "1"
 
+# The binding suite and the vendored consumer tests run over the companion's observed engine and temporary
+# directory, as a consumer's tests do. A development dependency never reaches a consumer's graph.
+[dev-dependencies]
+bc-file-system-testing = { path = "../bc-file-system-testing" }
+
 # The lint policy lives here so the IDE and CI read one table. `unsafe_code` is `deny`, not `forbid`: this crate
 # is the binding, and its two `unsafe` modules (`ffi`, `live`) each carry an `#[expect(unsafe_code)]` with the
 # invariant written at the block; every consumer keeps `forbid`. `missing_docs` is in lib.rs, because a `[lints]`

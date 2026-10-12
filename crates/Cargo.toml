@@ -1,10 +1,11 @@
 # The Rust workspace: a virtual root so one Cargo.lock pins every crate under crates/ together. The binding
-# crate `bc-file-system` compiles the C core from ../core through `cc`; `bc-file-system-testing` (the temporary
-# directory and the observed-engine factory for a consumer's tests) joins at stage `rust-crates`. Nothing here is
-# published: consumers pin a git SHA (design doc, "Faces and their compositions"; plan Decision mine-7), because
-# the C sources sit outside the crate directory and `cargo package` cannot reach them.
+# crate `bc-file-system` compiles the C core from ../core through `cc` and is the Rust face; its companion
+# `bc-file-system-testing` holds what a consumer's tests need and production never sees (the observed engine and a
+# temporary directory). Nothing here is published: consumers pin a git SHA (design doc, "Faces and their
+# compositions"; plan Decision mine-7), because the C sources sit outside the crate directory and `cargo package`
+# cannot reach them.
 [workspace]
-members = ["bc-file-system"]
+members = ["bc-file-system", "bc-file-system-testing"]
 # The edition-2024 resolver, which resolves with the declared `rust-version` in view.
 resolver = "3"
 

@@ -125,12 +125,17 @@ CONFIGURATION: Final = Configuration(
             "cpp/tests/support/descriptor_balance.cpp",
         ),
         # The build script (the build's composition root: cargo's environment and the directory of C sources),
-        # the one Rust file that names the live factory (`Engine::live`), and the ABI smoke, which creates a live
-        # engine to prove the declarations against the real core.
+        # the one Rust file that names the live factory (`Engine::live`), the ABI smoke, which creates a live
+        # engine to prove the declarations against the real core and prints the error's measured size; the test
+        # companion's temporary directory (the Rust tests' own directory: the system's temporary directory and the
+        # process id, once each, and the raw helpers' file system), and the vendored bc-mutants tests, whose copied
+        # bodies set up and check their cases with std::fs inside the directory they own.
         "rust": (
             "crates/bc-file-system/build.rs",
             "crates/bc-file-system/src/live.rs",
             "crates/bc-file-system/tests/abi_smoke.rs",
+            "crates/bc-file-system/tests/bc_mutants_shapes.rs",
+            "crates/bc-file-system-testing/src/temporary_directory.rs",
         ),
         # The fixtures' temporary directory: the one place `swift test` reads where its root is.
         "swift": ("Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift",),
@@ -144,18 +149,32 @@ CONFIGURATION: Final = Configuration(
     macro_exception_pin=0,
     face_parity_header="core/include/bc_file_system/bc_file_system.h",
     face_parity_prefix="bc_file_system_",
-    # The C++ face, and the Rust face's declarations; the Swift row is added at stage `swift-package`. The leg
-    # looks for each C name where the face calls it, so a method named differently from its C function still
-    # passes; the renamed ones, for the reader: bc_file_system_directory_open -> FileSystem::open_directory,
-    # bc_file_system_status_of -> FileSystem::status, bc_file_system_directory_opened_as -> Directory::opened_as,
-    # bc_file_system_engine_release / directory_release / lock_release -> the three destructors,
-    # bc_file_system_observed_fault_add / faults_clear / step_count -> Engine::add_fault / clear_faults / step_count.
-    # The Rust row holds every function declared (ffi.rs mirrors the whole header by hand) while the typed face
-    # over them (live.rs) carries the engine, the observer and one operation; the typed face grows at stage
-    # `rust-crates`, and this row then reads the typed files alone.
+    # The C++ face, the Swift face and the Rust face. The leg looks for each C name where the face calls it, so a
+    # method named differently from its C function still passes; the C++ face's renamed ones, for the reader:
+    # bc_file_system_directory_open -> FileSystem::open_directory, bc_file_system_status_of -> FileSystem::status,
+    # bc_file_system_directory_opened_as -> Directory::opened_as, bc_file_system_engine_release / directory_release
+    # / lock_release -> the three destructors, bc_file_system_observed_fault_add / faults_clear / step_count ->
+    # Engine::add_fault / clear_faults / step_count.
+    # The Swift row is every file that calls into the C module; its renamed ones besides those: the two validators
+    # -> RelativePath / AbsolutePath(validatingBytes:), bc_file_system_path_next_component ->
+    # PathText.components(of:), and the observer's three calls -> ObservedFileSystem.addFault / clearFaults /
+    # stepCount, in the fixtures (the product a consumer's tests import, never the library's).
+    # The Rust row reads the typed face alone, never ffi.rs (which declares every function by hand, so it would
+    # pass whatever the face calls): live.rs makes every call into the core, and location.rs builds the two
+    # locations with the header's `static inline` constructors. Its renamed ones: bc_file_system_status_of ->
+    # Engine::status, bc_file_system_directory_opened_as -> Directory::opened_as, the three releases -> the three
+    # `Drop`s, bc_file_system_observed_* -> testing_support::add_fault / clear_faults / step_count, which
+    # bc-file-system-testing's ObservedEngine wraps.
     face_parity_faces={
         "C++": ("cpp/src/engine.cpp", "cpp/src/error.cpp", "cpp/src/file_system.cpp", "cpp/src/path.cpp"),
-        "Rust": ("crates/bc-file-system/src/ffi.rs", "crates/bc-file-system/src/live.rs"),
+        "Swift": (
+            "Sources/BCFileSystem/Engine.swift",
+            "Sources/BCFileSystem/FileSystem.swift",
+            "Sources/BCFileSystem/PathText.swift",
+            "Sources/BCFileSystem/Types.swift",
+            "Sources/BCFileSystemTestFixtures/ObservedFileSystem.swift",
+        ),
+        "Rust": ("crates/bc-file-system/src/live.rs", "crates/bc-file-system/src/location.rs"),
     },
     test_only_factory_patterns=(
         r"\bbc_file_system_engine_create_observed_for_tests\b",
@@ -172,6 +191,7 @@ CONFIGURATION: Final = Configuration(
         "crates/bc-file-system/src/ffi.rs",
         "crates/bc-file-system/src/live.rs",
         "crates/bc-file-system/tests/",
+        "crates/bc-file-system-testing/",
         "fuzz/",
         "Sources/BCFileSystemTestFixtures/",
         "Tests/",

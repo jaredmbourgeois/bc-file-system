@@ -1,0 +1,6 @@
+# rustfmt's configuration, beside .clang-format and .swift-format: rustfmt reads the nearest one above each file it
+# formats, so this one governs every crate under crates/. Stable options only: an unstable option is silently
+# ignored on a stable toolchain, and `cargo fmt --check` would then stop agreeing with the editor.
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"

@@ -1,0 +1,8 @@
+# The Rust toolchain a developer's `cargo` uses in this repository: the MSRV, so the question CI's first matrix leg
+# asks is the one a local build answers. rustup reads this file from the directory cargo is invoked in and its
+# parents, and scripts/verify.sh invokes cargo from the repository root (`--manifest-path crates/Cargo.toml`), so
+# the file lives here rather than under crates/. CI sets RUSTUP_TOOLCHAIN per matrix leg (1.89.0 and the pinned
+# stable), which takes precedence over this file, so both legs keep their own compiler.
+[toolchain]
+channel = "1.89.0"
+components = ["clippy", "rustfmt"]

@@ -24,6 +24,71 @@ in the core's private platform header with a clear error. The Rust crate `bc-fil
 or later, `publish = false`: pin it by git SHA) compiles the same core with the consumer's own C compiler, so the
 floor is its floor too, and its build script names the floor and the compiler it found when a host falls below.
 
+## Using the Swift package
+
+Two products: `BCFileSystem` is the library (the engine, the `FileSystem` a piece of code is handed, the
+`Location` it acts on, the path values `AbsolutePath` and `RelativePath` with the path module's functions on
+`PathText`, and the typed `FileSystemError`); `BCFileSystemTestFixtures` is for a consumer's tests only (a
+`TemporaryDirectory` the test owns, and `FileSystem.observed(root:)`, a file system over an engine with the
+observer installed, so a test can script a failing system call or a kill point and read step counts). Neither
+needs C++ interoperability switched on. Until `1.0.0` any release may change the interface, so pin a commit; the
+public URL is decided before `0.1.0`:
+
+```swift
+dependencies: [
+    .package(url: "<the public URL, decided before 0.1.0>", revision: "<sha>"),
+],
+targets: [
+    .target(name: "Tool", dependencies: [.product(name: "BCFileSystem", package: "bc-file-system")]),
+    .testTarget(
+        name: "ToolTests",
+        dependencies: ["Tool", .product(name: "BCFileSystemTestFixtures", package: "bc-file-system")]
+    ),
+]
+```
+
+The composition root names the live engine once and hands the file system down; a test makes its own, over a
+directory it owns:
+
+```swift
+let fileSystem = FileSystem(engine: try Engine.live())                     // in main, and nowhere below it
+let observed = try FileSystem.observed(root: TemporaryDirectory.create())  // in a test
+```
+
+The manifest's tools version is 6.0; the toolchain that builds it must meet the floor above (Swift 6.4, Xcode 27
+on Apple platforms), because SwiftPM compiles the core with the toolchain's own clang.
+
+## Using the Rust crates
+
+Two crates: `bc-file-system` is the library (the `Engine`, whose methods are the operations; the `Location` they
+act on, an `AbsolutePath` or a `RelativePath` beneath an open `Directory`; the path module's functions in
+`bc_file_system::path`; the options every operation states, none with a default; and the typed `Error`);
+`bc-file-system-testing` is for a consumer's tests only (`ObservedEngine`, an engine with the observer installed,
+so a test can script a failing system call or a kill point and read step counts, and `TemporaryDirectory`, a
+directory the test owns). The core's C sources sit outside the crate directory, so the crates are not published
+(`publish = false`): pin a commit, from the same repository as the Swift package; the public URL is decided before
+`0.1.0`. The crates are experimental until a production consumer runs on them.
+
+```toml
+[dependencies]
+bc-file-system = { git = "<the public URL, decided before 0.1.0>", rev = "<sha>" }
+
+[dev-dependencies]
+bc-file-system-testing = { git = "<the public URL, decided before 0.1.0>", rev = "<sha>" }
+```
+
+The composition root names the live engine once and hands `&Engine` down; a test makes an observed one, over a
+directory it owns:
+
+```rust
+let engine = Engine::live()?;                                // in main, and nowhere below it
+let observed = ObservedEngine::observed_for_tests()?;        // in a test
+let directory = TemporaryDirectory::create("my-test")?;      // in a test
+```
+
+The crates need Rust 1.89 or later, and compile the core with the consumer's own C compiler, so the floor above is
+theirs too. The core is POSIX: the crates build for the Unix family only.
+
 ## Building and testing
 
 ```sh
@@ -32,6 +97,7 @@ cmake --preset sanitized && cmake --build --preset sanitized && ctest --preset s
 cmake --preset hardened && cmake --build --preset hardened                                 # the production posture
 swift test
 cargo test --manifest-path crates/Cargo.toml --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path crates/Cargo.toml --no-deps --locked
 bash scripts/verify.sh            # every leg: both builds, the header four ways, the guards, the consumer, swift test, cargo
 ```
 
@@ -81,4 +147,13 @@ told apart by a token) and `remove_condemned` (the tree removal over every conde
 killed write left) are real on every face, so every operation of the header is; the error struct says which end of
 a `rename` or `copy_file` a failure belongs to (`failed_location`, 280 to 284 bytes, every face's pin moved); the
 ABI-argument and operation-sequence fuzzers run beside the path fuzzer under the `fuzz` preset; and nothing of the
-draft facade reached this repository. `0.1.0` is tagged when every face is green on every platform.
+draft facade reached this repository. Stage 18 `swift-package` is in: the Swift path values validate through the path
+module's two validators, so the rules have one home and a Swift value refuses what every other face refuses (`/a/`,
+`//`, `/.`, `a/./b`, a 256-byte component); the module's ten functions are on the Swift face as `PathText`, with the
+C++ path suite's cases ported to Swift; the Swift `Operation` enum covers the header's 39 operations; and the
+house-rules guard's face-parity leg reads the Swift face. Stage 19 `rust-crates` is in: the Rust face is one `&self`
+method on `Engine` per header operation, over `Location`, `Directory`, `Lock`, the options and the path values, with
+the path module's ten functions and the compositions (`read_file_if_present`, `lines`, the bounded grow loop);
+`bc-file-system-testing` holds the observed engine and the temporary directory a consumer's tests use; the error is
+one pointer wide; `cargo doc` joins the `rust` leg; and bc-mutants' four `fs.rs` tests pass, copied into the
+crate's binding suite over compositions of its API. `0.1.0` is tagged when every face is green on every platform.

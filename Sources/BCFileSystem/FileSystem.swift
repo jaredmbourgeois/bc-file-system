@@ -1,76 +1,8 @@
 import CBCFileSystem
 
-// MARK: - Path values
+// MARK: - Locations
 
 private let slash = UInt8(ascii: "/")
-
-/// Path text relative to a directory, as bytes, one spelling per path so equality is a byte compare.
-///
-/// Validated once at construction by the lexical rules the path module will own (stage `path-module` moves
-/// them into C; until then they live here, minimal): not empty, no NUL byte, no leading slash, no empty
-/// component (`a//b`, a trailing slash) and no `..` component. Nothing on disk is consulted.
-public struct RelativePath: Equatable, Sendable {
-    public let bytes: [UInt8]
-
-    public init(validating text: String) throws(FileSystemError) {
-        try self.init(validatingBytes: Array(text.utf8))
-    }
-
-    public init(validatingBytes bytes: [UInt8]) throws(FileSystemError) {
-        let refused = FileSystemError.refusedPath(called: .relativePathFrom, bytes: bytes)
-        if bytes.isEmpty || bytes[0] == slash || bytes.contains(0) {
-            throw refused
-        }
-        for component in bytes.split(separator: slash, omittingEmptySubsequences: false) {
-            if component.isEmpty || component.elementsEqual("..".utf8) {
-                throw refused
-            }
-        }
-        self.bytes = bytes
-    }
-
-    /// The bytes as text, for display.
-    public var text: String {
-        String(decoding: bytes, as: UTF8.self)
-    }
-}
-
-/// Absolute path text, as bytes. `..` is allowed and reported by the path module, never resolved here.
-///
-/// Validated once at construction: starts with a slash, no NUL byte.
-public struct AbsolutePath: Equatable, Sendable {
-    public let bytes: [UInt8]
-
-    public init(validating text: String) throws(FileSystemError) {
-        try self.init(validatingBytes: Array(text.utf8))
-    }
-
-    public init(validatingBytes bytes: [UInt8]) throws(FileSystemError) {
-        if bytes.isEmpty || bytes[0] != slash || bytes.contains(0) {
-            throw FileSystemError.refusedPath(called: .absolutePathFrom, bytes: bytes)
-        }
-        self.bytes = bytes
-    }
-
-    /// The bytes as text, for display.
-    public var text: String {
-        String(decoding: bytes, as: UTF8.self)
-    }
-}
-
-extension FileSystemError {
-    static func refusedPath(called: Operation, bytes: [UInt8]) -> FileSystemError {
-        FileSystemError(
-            kind: .invalidArgument,
-            operation: called,
-            step: nil,
-            systemCode: 0,
-            path: String(decoding: bytes, as: UTF8.self),
-            nameTruncated: false,
-            failedLocation: nil
-        )
-    }
-}
 
 /// Where an operation acts: an absolute path the system resolves, or a relative path beneath a `Directory`
 /// with containment enforced by the kernel. One sum type, so every operation has one signature. Not Sendable:

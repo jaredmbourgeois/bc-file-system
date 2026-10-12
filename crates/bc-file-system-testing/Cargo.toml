@@ -1,0 +1,26 @@
+[package]
+name = "bc-file-system-testing"
+description = "What a consumer's tests of bc-file-system need and production never sees: the observed engine and a temporary directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# A crate rather than a feature of `bc-file-system`: a feature is a switch a consumer could turn on in production,
+# and a test-only door behind it would ship with the switch. A consumer names this crate under
+# [dev-dependencies] only.
+[dependencies]
+bc-file-system = { path = "../bc-file-system" }
+
+# The lint policy of `bc-file-system` with `unsafe_code` at `forbid`: this crate reaches the core only through
+# `bc-file-system`'s safe functions, so a third home for `unsafe` is a compile error here (AGENTS.md, "Rust").
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+let_underscore_must_use = "warn"
+allow_attributes_without_reason = "warn"

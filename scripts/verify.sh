@@ -90,18 +90,32 @@ leg_consumer() {
 leg_swift() {
     command -v swift > /dev/null || fail swift "swift is not on PATH; the Swift package was not tested"
     swift test || fail swift "swift test"
+    # Zero format drift, as the rust leg holds with cargo fmt: the toolchain's swift-format under the
+    # repository's .swift-format. A toolchain without the subcommand is reported, never a silent pass.
+    if swift format --version > /dev/null 2>&1; then
+        swift format lint --strict --configuration .swift-format --recursive Package.swift Sources Tests \
+            || fail swift "swift format lint: the Swift is not formatted"
+    else
+        echo "[info] swift format is not in this toolchain; Swift format drift was not checked"
+    fi
     pass swift
 }
 
-# The Rust workspace under crates/: formatting, clippy over every target with warnings denied, and the tests,
-# each `--locked` so the committed Cargo.lock is the one resolution. The build script compiles the C core with
-# the host's C compiler, so this leg proves the core builds the way a Rust consumer builds it.
+# The Rust workspace under crates/: formatting, clippy over every target with warnings denied, the tests, and
+# the documentation with warnings denied (every public item documented, every intra-doc link resolved), each
+# `--locked` so the committed Cargo.lock is the one resolution. `cargo fmt` takes `--all` because the manifest
+# is a virtual workspace of two crates: without it, cargo fmt finds no package at that manifest and formats
+# nothing. The build script compiles the C core with the host's C compiler, so this leg proves the core builds
+# the way a Rust consumer builds it. The toolchain is rust-toolchain.toml's (the MSRV) unless RUSTUP_TOOLCHAIN
+# names another, as each CI matrix leg does.
 leg_rust() {
-    command -v cargo > /dev/null || fail rust "cargo is not on PATH; the Rust crate was not built or tested"
+    command -v cargo > /dev/null || fail rust "cargo is not on PATH; the Rust crates were not built or tested"
     local manifest=crates/Cargo.toml
-    cargo fmt --manifest-path "$manifest" --check || fail rust "cargo fmt --check: the Rust is not formatted"
+    cargo fmt --manifest-path "$manifest" --all --check || fail rust "cargo fmt --check: the Rust is not formatted"
     cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings || fail rust "cargo clippy"
     cargo test --manifest-path "$manifest" --locked || fail rust "cargo test"
+    RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path "$manifest" --no-deps --locked \
+        || fail rust "cargo doc: a public item is undocumented or a doc link is broken"
     pass rust
 }
 

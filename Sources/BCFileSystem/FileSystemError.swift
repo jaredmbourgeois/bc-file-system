@@ -37,7 +37,9 @@ public enum ErrorKind: Int32, CaseIterable, Sendable {
     case bufferTooSmall = 15
 }
 
-/// Which public function an error came from, in the header's order.
+/// Which public function an error came from, in the header's order. 28 and 29 are the path module's two
+/// validators, named for the constructors that call them (`RelativePath(validatingBytes:)`,
+/// `AbsolutePath(validatingBytes:)`); 30 onward are the rest of the module, the functions of `PathText`.
 public enum Operation: Int32, CaseIterable, Sendable {
     case engineCreateLive = 1
     case engineCreateObservedForTests = 2
@@ -68,6 +70,17 @@ public enum Operation: Int32, CaseIterable, Sendable {
     case removeCondemned = 27
     case relativePathFrom = 28
     case absolutePathFrom = 29
+    case pathJoin = 30
+    case pathParent = 31
+    case pathLastComponent = 32
+    /// The module's component iterator, which `PathText.components(of:)` runs to the end.
+    case pathNextComponent = 33
+    case pathStem = 34
+    case pathExtension = 35
+    case pathRelate = 36
+    case pathLexicallyNormalize = 37
+    case pathResolveAgainst = 38
+    case pathLibraryName = 39
 }
 
 /// The system call an operation was making when it failed, and the observer's vocabulary.

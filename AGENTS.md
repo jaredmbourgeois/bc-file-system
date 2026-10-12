@@ -29,8 +29,8 @@ wrong even when it compiles and passes.
 | `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach; `resolve_test.c` drives the resolution layer through `resolve.h` over a tree it plants under the root `add_test` hands it | `bc_file_system_path_test`, `bc_file_system_engine_test`, `bc_file_system_resolve_test` | not built | — |
 | `cpp/include/bc_file_system/`, `cpp/src/` | The C++ face, a thin wrapper over the header (`.clang-tidy`: the C++ set) | `bc::file_system` | not built | — |
 | `cpp/tests/` | The contract suite (the specification every face is held to, driving C through the C++ face), the C++ binding suite, the observer and path-value suites, and `support/` (the temporary directory, the descriptor-balance fixture, the generated `test_paths.hpp`) | `bc_file_system_test` | not built | — |
-| `Sources/CBCFileSystem/`, `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module, its test fixtures (the temporary directory and the observed engine), and its binding suite and source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
-| `crates/` | The Rust face, a virtual workspace with one `Cargo.lock` and `publish = false` (consumers pin a git SHA): `bc-file-system/` compiles the core through `cc` (`build.rs`), spells the ABI by hand (`src/ffi.rs`, the layout pins beside it), holds the engine, the observer and the error vocabulary (`src/live.rs`, `src/error.rs`), and proves the declarations against the core in `tests/abi_smoke.rs`; the typed operations and `bc-file-system-testing` arrive at stage `rust-crates` | — | — | `bc-file-system` (`bc-file-system-testing` at `rust-crates`) |
+| `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module `CBCFileSystem` (declared in `Package.swift` over `core/`): the engine, `FileSystem` and its operations, and the path values with `PathText`, the path module's ten functions, every value validated and every answer made by one call into C; its test fixtures (the temporary directory and the observed engine); its binding suites (`BindingTests.swift`, and `PathTests.swift`, the port of `cpp/tests/path_test.cpp`), its contract cases and its source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
+| `crates/` | The Rust face, a virtual workspace with one `Cargo.lock` and `publish = false` (consumers pin a git SHA), formatted by the root's `rustfmt.toml` and built locally by the root's `rust-toolchain.toml` (the MSRV). `bc-file-system/` compiles the core through `cc` (`build.rs`) and is the face: `src/ffi.rs` spells the ABI by hand with the layout pins beside it; `src/live.rs` is every call into the core (the `Engine` and its operations, `Directory::opened_as`, the three releases, the path module's calls, and `testing_support`, the observer's documentation-hidden door); the value types are modules of their own (`error.rs`, `options.rs`, `status.rs`, `location.rs` with `Location` and `Directory`, `lock.rs`, `path.rs` with the two path values and the module's ten functions); `buffer.rs` is the buffer protocol (the grow loop, the two calls) and `compositions.rs` the face's compositions; `tests/` holds the binding suite (`binding.rs`), the ported path tables (`path.rs`), the vendored bc-mutants tests (`bc_mutants_shapes.rs`) and the ABI smoke (`abi_smoke.rs`). `bc-file-system-testing/` is what a consumer's tests need and production never sees: `ObservedEngine` with `Fault` and `FaultAction`, over the door, and `TemporaryDirectory` with its raw helpers | — | — | `bc-file-system`, `bc-file-system-testing` |
 | `fuzz/` | The libFuzzer targets, behind `BC_FILE_SYSTEM_BUILD_FUZZERS` (on in the `fuzz` preset): `path_fuzz.c` over the path module; `abi_arguments_fuzz.c` over every public function with fuzzed arguments, and `operation_sequence_fuzz.c` over sequences of operations on one tree with faults scripted into them, each over a root it makes once under the directory the generated `fuzz_paths.h` hands it, sharing `harness.h` (the trap, the reader of fuzzed bytes, the root, the count of descriptors open under it) | `bc_file_system_path_fuzz`, `bc_file_system_abi_arguments_fuzz`, `bc_file_system_operation_sequence_fuzz` | — | — |
 | `examples/consumer/` | A separate CMake project that consumes the core through FetchContent | its own project | — | — |
 | `cmake/helpers.cmake` | The compile-options helper, the toolchain-knob list, the build posture, the four-way header check | included by the root | — | — |
@@ -54,7 +54,8 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
 - **A value where a value will do, a seam where the code must act.** Logic that needs a fact takes the fact
   (`now`, `current_directory`). Logic that must act takes the thing that acts: one function for one operation,
   an interface for several. In C that is an opaque handle created by one live factory; in C++ a `FileSystem`
-  holding an `Engine&`; in Swift a struct holding the engine; in Rust a trait.
+  holding an `Engine&`; in Swift a struct holding the engine; in Rust an `&Engine`, whose operations are its
+  methods.
 - **A door takes the opened resource, never a path it opens itself.** A function that opens its own file from a
   path has gone around whatever file system its caller was handed, so a test's fault gate never sees it.
 - **Naming a live value is itself a reach.** `bc_file_system_engine_create_live()`, `Engine::live()` (the C++
@@ -86,9 +87,14 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
    `fuzz/abi_arguments_fuzz.c`, `fuzz/operation_sequence_fuzz.c`), which make their roots under the directory
    the generated `fuzz_paths.h` hands them and read their own descriptors' paths to prove nothing leaked;
    `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
-   one place `swift test` reads where its root is, and the only Swift file that names `FileManager`); and
-   `crates/bc-file-system/tests/abi_smoke.rs`, the ABI smoke, which creates a live engine because proving the
-   declarations against the real core is the whole of its job.
+   one place `swift test` reads where its root is, and the only Swift file that names `FileManager`);
+   `crates/bc-file-system-testing/src/temporary_directory.rs` (the Rust tests' own directory: the one place a Rust
+   test asks where the system's temporary directory is and what the process id is, once each, to make a name no
+   one else holds, and the raw helpers' `std::fs` inside it); `crates/bc-file-system/tests/bc_mutants_shapes.rs`
+   (bc-mutants' four tests, copied as they are, which set up and check their cases with `std::fs` inside the
+   directory they own); and `crates/bc-file-system/tests/abi_smoke.rs`, the ABI smoke, which creates a live engine
+   because proving the declarations against the real core is the whole of its job, and prints the error's
+   measured size.
 4. **Ambient diagnostics installed once at a root**, such as a logger, held as a written, closed list. This
    repository's list is empty: the library logs nothing and reports through its results.
 
@@ -101,11 +107,13 @@ the finding.** A new legal site is a change to this section first (see [Changing
 observer, run through the same contract suite as the live engine; an in-memory imitation is a second set of
 rename, symlink and permission rules to keep honest, invisible to another language reading the same paths. The
 observer is installed by one factory, `bc_file_system_engine_create_observed_for_tests` (`Engine::observed_for_tests()`
-in C++, `FileSystem.observed(root:)` in Swift, `ObservedEngine::observed_for_tests()` in Rust until
-`bc-file-system-testing` takes it), and the guard's `test-only-factory` leg confines its callers to the header,
-the core, the one wrapper per face (`cpp/src/engine.cpp`; `crates/bc-file-system/src/ffi.rs` and `src/live.rs`),
-`core/tests/`, `cpp/tests/`, `crates/bc-file-system/tests/`, `fuzz/` (the engine fuzzers drive the observed
-engine so a fuzzed fault scripts real refusals), `Sources/BCFileSystemTestFixtures/` and `Tests/`.
+in C++, `FileSystem.observed(root:)` in Swift, `ObservedEngine::observed_for_tests()` in Rust, in
+`bc-file-system-testing`, over `bc-file-system`'s documentation-hidden door `testing_support::observed_for_tests`),
+and the guard's `test-only-factory` leg confines its callers to the header, the core, the one wrapper per face
+(`cpp/src/engine.cpp`; `crates/bc-file-system/src/ffi.rs` and `src/live.rs`), `core/tests/`, `cpp/tests/`,
+`crates/bc-file-system/tests/`, `crates/bc-file-system-testing/` (the Rust face's test companion, which a consumer
+names under `[dev-dependencies]` only), `fuzz/` (the engine fuzzers drive the observed engine so a fuzzed fault
+scripts real refusals), `Sources/BCFileSystemTestFixtures/` and `Tests/`.
 **In a script, the path handed in is the injection**: a function may open the path and write the stream it
 was given, and `main(argv, …)` reads the command line and passes everything down.
 
@@ -278,8 +286,12 @@ comment that explains it. Brevity is never worth obscurity.
 - **Edition 2024, MSRV 1.89** (bc-mutants' floor, the first Rust consumer), declared as `rust-version` in the
   workspace and honoured by `resolver = "3"`; CI runs the MSRV and one pinned stable (`rust:` matrix in
   `.forgejo/workflows/ci.yml`), never the moving channel, and the pin moves in one commit with that release's
-  lint fixes. Stable `rustfmt` at its defaults; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
-  and `cargo test`, each `--locked`, are the `rust` leg.
+  lint fixes. `rust-toolchain.toml` at the root pins a local `cargo` to the MSRV (rustup reads it from the
+  directory cargo is invoked in, which is the root for `scripts/verify.sh`), and each CI leg's `RUSTUP_TOOLCHAIN`
+  takes precedence over it; `rustfmt.toml` beside it (`style_edition = "2024"`, 100 columns, Unix newlines) holds
+  stable options only, since an unstable one is silently ignored on a stable toolchain. `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo doc --no-deps` under `-D warnings`, each
+  `--locked`, are the `rust` leg.
 - **The lint policy lives in `Cargo.toml`** (`[lints]`: `clippy::pedantic`, `unreachable_pub`,
   `missing_debug_implementations`, `let_underscore_must_use`, `allow_attributes_without_reason`), so the IDE
   and CI read one table; `#![deny(missing_docs)]` alone sits in `lib.rs`, because a `[lints]` table reaches the
@@ -287,14 +299,31 @@ comment that explains it. Brevity is never worth obscurity.
 - **`unsafe_code` is `deny` in `bc-file-system` and nowhere else.** The binding crate is the named exception to
   the family's `forbid`: its `unsafe` lives in exactly two modules, `src/ffi.rs` (the hand-written `extern "C"`
   block and the `#[repr(C)]` mirrors, pinned by `size_of`/`align_of`/`offset_of` against the core's own
-  `static_assert`s) and `src/live.rs` (the calls into it and the two `Send`/`Sync` proofs), each under one
+  `static_assert`s) and `src/live.rs` (every call into it, and the header's THREADS paragraph as proofs: `Engine`
+  is `Send` and `Sync`, `Directory` and `Lock` are `Send` only, used from one thread at a time), each under one
   `#![expect(unsafe_code, reason = "…")]` with the header's pointer contract restated at every block. A third
-  `unsafe` home is a lint failure; every consumer, and `bc-file-system-testing`, keeps `forbid`.
+  `unsafe` home is a lint failure; every consumer, and `bc-file-system-testing`, keeps `forbid`: the companion
+  reaches the observer through `bc_file_system::testing_support`, a `#[doc(hidden)]` module of safe functions in
+  `live.rs`, never through `ffi`. A crate, not a cargo feature: a feature is a switch a consumer could turn on in
+  production.
+- **The typed face is one `&self` method per header operation on `Engine`**, each one call into the core plus
+  the conversion of its answer; nothing is virtual, because the double is the observed engine below the core.
+  A `Location<'a>` borrows what it names (`At(&AbsolutePath)`, `Beneath(&Directory, &RelativePath)`); a
+  `Directory` and a `Lock` borrow the engine, which the header requires to outlive them. An engine created for
+  tests takes a turn (a lock) on every call, because a shared `&Engine` may cross threads and the header confines
+  such an engine to one thread at a time. The buffer protocol is absorbed: the grow loop (three attempts, then the
+  error as received) where an answer can change between calls, two calls (the size, then exactly that much)
+  for a path module answer, which cannot. A path value is made from `&Path` or `&[u8]`, never `&str` alone, and
+  validated by the module's two validators; the module's ten functions are free functions in `path`, generic over
+  the sealed `ValidatedPath` where the C++ face overloads. `Error` is one pointer wide (`Box<ErrorDetails>`,
+  pinned by a `const` assert, its fields read through `Deref`): unboxed it made every `Result<(), Error>` 72
+  bytes.
 - **A C enum arrives as `i32` behind a `TryFrom<i32>`** that refuses a value outside the enum with the raw
   integer (`UnknownValue`); the typed error keeps the stand-in visible in `Error::unknown_value`, never a silent
   default. **No `.unwrap()` or `.expect()` outside tests** and the build script's prerequisites (cargo's own
   environment); errors are typed and closed, and `From` impls never lose context. **`#[must_use]`** on every
-  function and type whose result matters; named constructors (`Engine::live`, `ObservedEngine::observed_for_tests`);
+  function and type whose result matters; named constructors (`Engine::live`, `ObservedEngine::observed_for_tests`,
+  `Permissions::exactly`, `TemporaryDirectory::create`), and no options type has a `Default`;
   no `impl Default` that chooses a dependency or a policy value; an effect switch is a two-variant enum
   (`FaultAction::Fail { system_code }` / `Stop`), so a fault without its errno cannot be spelled.
 - **`build.rs` compiles every `core/src/*.c` with `.std("gnu2x")` and `.warnings(true)` and no `.define`**:
@@ -313,6 +342,12 @@ comment that explains it. Brevity is never worth obscurity.
   an `ObservedFileSystem` (the file system, its directory, the faults and the step counts). `Engine` is a `final class`
   that is `@unchecked Sendable` with the proof written at the class and the release in `deinit`. A closure
   witness is written only where a caller substitutes closures.
+- **The path module is called, never restated.** `RelativePath(validatingBytes:)` and
+  `AbsolutePath(validatingBytes:)` call the module's two validators, and its ten functions are static functions on
+  one namespace, `PathText` (`PathText.join(base, relative)`, `PathText.relate(path, to: other)`, …), one for one
+  with the C++ face's free functions; an answer of variable length takes two calls (the size, then exactly that
+  much), never the operations' grow loop, because a path answer cannot change between them. No rule about path
+  text is written in Swift.
 - **Formatting** is `swift-format` with the repository's `.swift-format` (4-space indentation, 120 columns, the
   C++ file's shape), run over the Swift you touch.
 - **The functions are synchronous**; the caller owns the scheduling, and an async view takes its executor as a value.
@@ -337,13 +372,17 @@ comment that explains it. Brevity is never worth obscurity.
 - **The contract suite is the specification.** `cpp/tests/contract_test.cpp` runs every case against the live
   engine and the same engine behind the observer, driving C through the C++ face; new behaviour gets its case
   there. Each face adds a binding suite (`cpp/tests/binding_test.cpp`, `Tests/BCFileSystemTests/BindingTests.swift`,
-  `crates/bc-file-system/tests/abi_smoke.rs` now and the crate's full suite at `rust-crates`): every operation
-  reaches the core once, the error mapping is total, one ABI round trip per value type. `cpp/tests/observer_test.cpp`
+  `crates/bc-file-system/tests/binding.rs` with `abi_smoke.rs` beside it): every operation reaches the core once,
+  the error mapping is total, one ABI round trip per value type. The Rust suite also runs bc-mutants' four
+  `fs.rs` tests, copied as they are into `crates/bc-file-system/tests/bc_mutants_shapes.rs` over compositions of
+  the crate's API, the shape the consumer's swap will take; a bridge the composition makes is named at its
+  function, and an assertion the library's rules cannot hold is a finding for the consumer, never a rewrite. `cpp/tests/observer_test.cpp`
   holds the observer's own cases (a fault takes effect at the scripted step; a live engine refuses the observer
   calls with `invalid_argument`).
 - **The path module and the engine's mechanics are tested in C first**: `core/tests/path_test.c` is a `.c`
   main over tables of cases (every public path function, every refusal, every edge), registered with
-  `add_test`, and the C++ suite `cpp/tests/path_test.cpp` runs the same table through the face;
+  `add_test`, and the C++ suite `cpp/tests/path_test.cpp`, the Swift suite `Tests/BCFileSystemTests/PathTests.swift`
+  and the Rust suite `crates/bc-file-system/tests/path.rs` run the same table through their faces;
   `core/tests/engine_test.c` drives the observer's two hooks (`engine.h`) with no operation in between (a step
   is counted, a fault fires at its occurrence and once, a stop is a verdict, a live engine neither counts nor
   fires) and reports the platform probes, asserting only what the platform guarantees; `core/tests/resolve_test.c`
@@ -365,7 +404,8 @@ comment that explains it. Brevity is never worth obscurity.
   permission) and injected through the observer where it is not (the disk filling up mid-write).
 - **A test checks its outcome without the code under test**, through the test support's raw helpers, and
   **owns one temporary directory** under a root handed to the test binary (the generated `test_paths.hpp`
-  in C++; the fixtures' legal site in Swift), removed when it ends. **Never sleep to synchronize, and never read
+  in C++; the fixtures' legal site in Swift; `bc-file-system-testing`'s `TemporaryDirectory` in Rust), removed
+  when it ends. **Never sleep to synchronize, and never read
   the wall clock.**
 - **A case that cannot pass yet is disabled, never deleted**: a gtest case is written complete and prefixed
   `DISABLED_` with the stage that turns it on in the comment above; a Swift Testing case carries
@@ -374,14 +414,20 @@ comment that explains it. Brevity is never worth obscurity.
   commit, and a case disabled to make a run pass is a finding.
 - **A guard must be able to fail.** The guard scripts have `--selftest` and the Swift scan planted cases for
   every rule; a new rule comes with a plant that proves it fires and a near miss that proves it does not.
+- **Every public function appears in every face.** The guard's face-parity leg (`face_parity_faces` in
+  `scripts/check_house_rules.py`) reads each face's files, C++, Swift and Rust, and finds every
+  `bc_file_system_*` function the header declares named there; a function a face does not reach is a finding,
+  and a face may add compositions of its own. The Rust row reads the typed face (`src/live.rs`,
+  `src/location.rs`), never `src/ffi.rs`, which declares every function whether or not the face calls it.
 - **Appending a step, an operation or an error field touches a closed list**, and the full `scripts/verify.sh`
   runs after every member of it, never only its first legs: the header; `step_last` (or `operation_last`) and
   the layout pins in `core/src/bc_file_system.c`; `cpp/include/bc_file_system/error.hpp` (the enum and its
   pin) and `cpp/src/error.cpp` (the name and the range bound); the C++ binding suite's name table (its size and
   its out-of-range value); `Sources/BCFileSystem/FileSystemError.swift` (the case) and the Swift binding
   suite's pairs, count and out-of-range value; `crates/bc-file-system/src/error.rs` (the variant, the `ALL`
-  array's size, the name) and `crates/bc-file-system/tests/abi_smoke.rs` (the count, the last value, the
-  out-of-range value); for a field, every face's `Error`, its conversion and the layout pins in all three.
+  array's size, the name), `crates/bc-file-system/tests/abi_smoke.rs` (the count, the last value, the
+  out-of-range value) and `crates/bc-file-system/tests/binding.rs` (the name table and its out-of-range value);
+  for a field, every face's `Error` (in Rust `ErrorDetails`), its conversion and the layout pins in all three.
 
 ## Verification
 
@@ -397,7 +443,7 @@ bash scripts/verify.sh path-freestanding  # the path module as a freestanding ob
 bash scripts/verify.sh guards             # each guard's --selftest, then its scan of the tree
 bash scripts/verify.sh consumer           # examples/consumer through FetchContent, from this checkout
 bash scripts/verify.sh swift              # swift test
-bash scripts/verify.sh rust               # cargo fmt --check, clippy -D warnings, cargo test, each --locked, in crates/
+bash scripts/verify.sh rust               # cargo fmt --check, clippy -D warnings, cargo test, cargo doc -D warnings, each --locked, in crates/
 bash scripts/verify.sh clang-tidy         # core/ and cpp/ under their own .clang-tidy; report-only this stage
 bash scripts/verify.sh fuzz-smoke         # each libFuzzer target for ten seconds under the fuzz preset (clang with libFuzzer)
 ```

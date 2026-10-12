@@ -4,12 +4,18 @@ import PackageDescription
 // The same C core the CMake build compiles, declared as a SwiftPM C target, with the Swift face over it:
 //
 //   CBCFileSystem            the C core (core/src/*.c) behind its one public header (core/include/)
-//   BCFileSystem             the Swift face: the engine, the file system, the path values, the errors
+//   BCFileSystem             the Swift face: the engine, the file system, the path values and the path
+//                            module's functions (`PathText`), the errors
 //   BCFileSystemTestFixtures the temporary directory and the observed engine a consumer's tests use
 //
 // BCFileSystem imports only the C module, so neither this package nor one that depends on it needs C++
 // interoperability switched on. The C standard is the one line every build system states the same way
-// (AGENTS.md, "Build shape"): gnu2x here, C_STANDARD 23 with extensions in CMake.
+// (AGENTS.md, "C"): gnu2x here, C_STANDARD 23 with extensions in CMake.
+//
+// The tools version is the oldest manifest format, and so the oldest Swift, that has what this package needs:
+// the Swift 6 language mode and typed throws, both 6.0. It is not the toolchain floor, which is Swift 6.4 (Xcode
+// 27 on Apple platforms; what CI builds with): SwiftPM compiles the C core with the toolchain's own clang, which
+// must meet the consumer-host floor in README.md (C23 with <stdckdint.h>).
 let swiftSettings: [SwiftSetting] = [
     .swiftLanguageMode(.v6)
 ]
