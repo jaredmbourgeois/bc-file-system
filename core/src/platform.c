@@ -257,7 +257,9 @@ int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unus
  * symlink on the way with ELOOP, so one call resolves the whole path contained. The flags travel in the
  * `open_how` struct as a 64-bit field; the engine's flags are non-negative, so the widening is exact. */
 int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor) {
-    struct open_how how = {.flags = (uint64_t)open_flags, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
+    /* The RESOLVE_* macros are `unsigned long`; the field is the kernel's 64-bit type, so GCC asks for the
+     * widening to be spelled. */
+    struct open_how how = {.flags = (uint64_t)open_flags, .resolve = (uint64_t)(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)};
     int code = 0;
     do {
         const long opened = syscall(SYS_openat2, root, relative, &how, sizeof how);
