@@ -8,6 +8,7 @@
  */
 #include "calls.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h> /* only for renameat, which POSIX declares here; no stream is touched */
@@ -358,6 +359,101 @@ bc_file_system_call_outcome bc_file_system_call_unlinkat(bc_file_system_engine *
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+bc_file_system_call_outcome bc_file_system_call_fchmodat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                         const char *name, uint32_t mode, int flags) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fchmodat);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        /* A mode is at most 07777, which every platform's mode_t holds; the cast only changes the type. */
+        if (fchmodat(parent, name, (mode_t)mode, flags) == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+/* ---- Directories --------------------------------------------------------------------------------------------- */
+
+bc_file_system_call_outcome bc_file_system_call_mkdirat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                        const char *name, uint32_t mode) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_mkdirat);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        /* A mode is at most 07777, which every platform's mode_t holds; the cast only changes the type. */
+        if (mkdirat(parent, name, (mode_t)mode) == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+bc_file_system_call_outcome bc_file_system_call_fdopendir(bc_file_system_engine *engine, int32_t operation,
+                                                          int descriptor, DIR **stream) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fdopendir);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        DIR *opened = fdopendir(descriptor);
+        if (opened != nullptr) {
+            *stream = opened;
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *engine, int32_t operation, DIR *stream,
+                                                        struct dirent **entry) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_readdir);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        /* The end of the stream and an error both answer NULL; only errno tells them apart, so it is zeroed
+         * first and read on the line after. */
+        errno = 0;
+        struct dirent *read = readdir(stream);
+        const int code = errno;
+        if (read != nullptr || code == 0) {
+            *entry = read;
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
         outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;

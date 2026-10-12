@@ -61,5 +61,12 @@ staged in an exclusive temporary beside its destination and renamed into place, 
 symlink refused or followed to the file it names, the mode set exactly, `durable` syncing the file and its
 directory), `append` and `sync` are real on every face; "stop without cleanup" is real, so the kill-point cases
 hold the destination whole or replaced at every step of a write; and every gated system call lives in one unit,
-`core/src/calls.c`. The remaining operations land in C group by group over the next stages (directories, moves
-and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.
+`core/src/calls.c`. Stage 15 `directories-in-c` is in: `create_directory` and `create_directories` (made with a
+private mode and given the stated one exactly, the umask never consulted), `list_directory` (sorted; counted
+before stored, so an array too small stores nothing), `remove_file`, `remove_directory`, `remove_tree` (by
+`unlinkat` on held descriptors with a window of sixteen levels and no recursion, the root of the file system
+refused by spelling and by identity, a mount point inside the tree refused as `cross_device`),
+`create_temporary_directory` and `set_permissions` are real on every face; and the walk opens every component
+for search only (`O_SEARCH` on Apple platforms, `O_PATH` on Linux), so a directory the process may enter but
+not read is a parent like any other. The remaining operations land in C group by group over the next stages
+(moves and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.

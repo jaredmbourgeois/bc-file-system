@@ -65,6 +65,11 @@ auto make_symlink_raw(const std::filesystem::path& target, const std::filesystem
 /// Creates a FIFO (a named pipe) with exactly `mode`: an entry that is neither a file nor a directory.
 auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> void;
 
+/// Plants a chain of `depth` directories under `root`, each named `name` inside the one above, with a file
+/// named `name` at the bottom, on held descriptors and never through a path longer than one component: the
+/// chain may be deeper than any path the system takes could spell.
+auto make_deep_chain_raw(const std::filesystem::path& root, std::uint32_t depth, std::string_view name) -> void;
+
 auto set_mode_raw(const std::filesystem::path& path, std::uint32_t mode) -> void;
 
 /// The permission bits of `path` itself (a symlink is not followed).
@@ -100,6 +105,44 @@ public:
 private:
     std::uint64_t previous_limit_;
     bool applied_;
+};
+
+/// While one of these lives the process's umask is `mask`; the previous one comes back when it is destroyed.
+/// The umask is process-wide, so a case that holds one sets it and restores it within itself, and the suite
+/// runs one case at a time.
+class UmaskGuard {
+public:
+    explicit UmaskGuard(std::uint32_t mask);
+    ~UmaskGuard();
+
+    UmaskGuard(const UmaskGuard&) = delete;
+    UmaskGuard(UmaskGuard&&) = delete;
+    auto operator=(const UmaskGuard&) -> UmaskGuard& = delete;
+    auto operator=(UmaskGuard&&) -> UmaskGuard& = delete;
+
+private:
+    std::uint32_t previous_mask_;
+};
+
+/// The soft limit on how many descriptors this process may hold open at once (RLIMIT_NOFILE).
+[[nodiscard]] auto descriptor_soft_limit() -> std::uint64_t;
+
+/// While one of these lives the process may hold at most `soft_limit` descriptors open at once: how a test
+/// proves that an operation holds a bounded number, since one that opened more fails with EMFILE. The limit is
+/// only ever lowered here; the previous one comes back when it is destroyed.
+class DescriptorLimit {
+public:
+    explicit DescriptorLimit(std::uint64_t soft_limit);
+    ~DescriptorLimit();
+
+    DescriptorLimit(const DescriptorLimit&) = delete;
+    DescriptorLimit(DescriptorLimit&&) = delete;
+    auto operator=(const DescriptorLimit&) -> DescriptorLimit& = delete;
+    auto operator=(DescriptorLimit&&) -> DescriptorLimit& = delete;
+
+private:
+    std::uint64_t previous_limit_ = 0;
+    bool applied_ = false;
 };
 
 /// The text as the bytes the library takes.

@@ -7,7 +7,9 @@
  * the relative path is opened against the held parent with `O_DIRECTORY | O_NOFOLLOW`, so no component may be a
  * symlink and nothing above the held directory is reachable (`..` never reaches here: the path module refused
  * it), and each open is bracketed by an identity check, `fstatat` before and `fstat` after, which is the only
- * thing that catches a directory swapped for another directory between the two. Where the platform offers it,
+ * thing that catches a directory swapped for another directory between the two. A component is opened for
+ * search, not for reading (O_SEARCH on Apple platforms, O_PATH on Linux: the platform's flags), so a directory
+ * the process may enter but not list is a parent like any other, as the system treats it. Where the platform offers it,
  * one kernel call does the whole walk (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux,
  * `openat` with `O_NOFOLLOW_ANY` on Apple), reported as its own step so a test can refuse it and force the walk.
  * An `at` location is resolved by the same walk from the root, following symlinks on the way, because the
@@ -34,10 +36,22 @@
  * `beneath` error can be reported as that text, a slash and the relative path. Owned by this layer because the
  * walk beneath a directory starts from its descriptor; created and released by `bc_file_system.c`. */
 struct bc_file_system_directory {
-    int descriptor; /* open O_RDONLY | O_DIRECTORY | O_CLOEXEC; -1 never once the handle has been handed out */
+    int descriptor; /* open for search (the platform's directory_search_open_flags: O_SEARCH on Apple, O_PATH on
+                       Linux), a parent for `*at` calls and never read through; -1 never once the handle has
+                       been handed out */
     size_t opened_as_length;
     uint8_t opened_as[]; /* exactly the bytes the location was opened with, not NUL-terminated */
 };
+
+/* What a directory is opened for. A parent to make `*at` calls through needs only search permission, which is
+ * how the system treats a directory the process may enter but not list, so the walk opens every component that
+ * way (`bc_file_system_platform_directory_search_open_flags`); a directory whose entries are to be read opens
+ * `O_RDONLY`, since `fdopendir` takes nothing less, and a directory the process cannot read cannot be listed,
+ * by the system either. */
+typedef enum bc_file_system_directory_access : int32_t {
+    bc_file_system_directory_access_search = 1,
+    bc_file_system_directory_access_read = 2
+} bc_file_system_directory_access;
 
 /* A location, resolved: the leaf's parent and the leaf's name. Declared with
  * `[[gnu::cleanup(bc_file_system_resolved_close)]]` so the descriptor the walk opened is closed on every path. */
@@ -101,12 +115,12 @@ int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32
                                             const char *name, int32_t final_symlink,
                                             bc_file_system_expected_entry *expected, bc_file_system_error *error);
 
-/* The second half opens the entry as a directory (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`, plus `O_NOFOLLOW` under
- * `refuse`; step `openat`), reads the opened descriptor's identity (step `fstat`) and compares it with
- * `expected` (step `identity_check`): a mismatch is `symlink_refused`, and so is an open refused with ELOOP or
- * ENOTDIR for an entry the stat had seen as a directory or a symlink. Stores the descriptor in `*opened`, which
- * must hold none (-1) on entry and is untouched on failure. */
+/* The second half opens the entry as a directory (the flags of `access`, `O_DIRECTORY` and `O_CLOEXEC` among
+ * them, plus `O_NOFOLLOW` under `refuse`; step `openat`), reads the opened descriptor's identity (step `fstat`)
+ * and compares it with `expected` (step `identity_check`): a mismatch is `symlink_refused`, and so is an open
+ * refused with ELOOP or ENOTDIR for an entry the stat had seen as a directory or a symlink. Stores the
+ * descriptor in `*opened`, which must hold none (-1) on entry and is untouched on failure. */
 int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *engine, int32_t operation, int parent,
-                                                       const char *name, int32_t final_symlink,
+                                                       const char *name, int32_t final_symlink, int32_t access,
                                                        const bc_file_system_expected_entry *expected,
                                                        owned_descriptor *opened, bc_file_system_error *error);

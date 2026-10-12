@@ -274,11 +274,13 @@ pub enum Step {
     Openat2 = 24,
     /// The Apple fast path of a `beneath` location: `openat` with `O_NOFOLLOW_ANY` over the whole relative path.
     OpenatNofollowAny = 25,
+    /// `fchmodat`: the mode set by name under a held directory (`AT_SYMLINK_NOFOLLOW` for the entry itself).
+    Fchmodat = 26,
 }
 
 impl Step {
     /// Every step, in the header's order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Open,
         Self::Openat,
         Self::Fstat,
@@ -304,6 +306,7 @@ impl Step {
         Self::IdentityCheck,
         Self::Openat2,
         Self::OpenatNofollowAny,
+        Self::Fchmodat,
     ];
 
     /// The step's name as the header spells it.
@@ -335,6 +338,7 @@ impl Step {
             Self::IdentityCheck => "identity_check",
             Self::Openat2 => "openat2",
             Self::OpenatNofollowAny => "openat_nofollow_any",
+            Self::Fchmodat => "fchmodat",
         }
     }
 }

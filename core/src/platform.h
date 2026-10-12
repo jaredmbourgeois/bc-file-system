@@ -53,6 +53,17 @@ bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void
  * location rather than weaken the guarantee. A fact of the platform, not a probe. */
 bool bc_file_system_platform_enforces_containment(void);
 
+/* The flags that open a directory to make `*at` calls through it, which needs search permission and not read
+ * permission, so a directory the process may enter but not list (mode 0300, 0100) is a parent like any other,
+ * as the system itself treats it: `O_SEARCH | O_DIRECTORY | O_CLOEXEC` on Apple platforms (where O_SEARCH is
+ * O_EXEC | O_DIRECTORY and a 0300 directory opens), `O_PATH | O_DIRECTORY | O_CLOEXEC` on Linux (an O_PATH
+ * descriptor serves every `*at` call, `fstat` and `openat` beneath it, and needs no permission at all), and
+ * `O_RDONLY | O_DIRECTORY | O_CLOEXEC` on Emscripten, which has neither. A descriptor opened this way cannot be
+ * read (`fdopendir` answers EBADF) or synced (`fsync` of an O_PATH descriptor is EBADF on Linux): an operation
+ * that lists or syncs a directory opens it, or `.` beneath it, read-only for that. A fact of the platform, not
+ * a probe. */
+int bc_file_system_platform_directory_search_open_flags(void);
+
 /* ---- The five operations ------------------------------------------------------------------------------------- */
 
 /* Each operation returns 0 or the errno it failed with, so a call reads `const int code = sync_descriptor(…)`.

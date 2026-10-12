@@ -1,6 +1,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -842,11 +843,11 @@ TEST_F(ObservedContract, DurableWriteWhoseDirectorySyncFailsReportsWritten) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
 }
 
-// A directory with mode 0300 lets a path-based open create files in it, but the engine never opens by path:
-// the walk holds the destination's directory as a descriptor, opened read-only, which the mode forbids. So the
-// write is refused on the way, at the directory's own open, and nothing is created. (The outcome the
-// path-based draft met here, a directory that takes a file but not a sync, is the scripted case above.)
-TEST_P(FileSystemContract, WriteIntoADirectoryTheProcessCannotOpenIsPermissionDeniedBeforeAnythingIsStaged) {
+// A directory with mode 0300 (write and search, no read) takes a file: the walk opens the destination's directory
+// for search only (O_SEARCH on Apple platforms, O_PATH on Linux), as the system itself treats a directory the
+// process may enter but not read, so the file is staged and renamed into place; what the mode forbids is
+// opening the directory read-only afterwards for its sync, which lowers the answer to `written`.
+TEST_P(FileSystemContract, DurableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process opens what its permission bits forbid";
     }
@@ -855,11 +856,11 @@ TEST_P(FileSystemContract, WriteIntoADirectoryTheProcessCannotOpenIsPermissionDe
 
     const auto achieved = files().write_file(in("write-only/file"), bytes, kDurableExactly0644);
 
-    ASSERT_FALSE(achieved.has_value());
-    EXPECT_EQ(achieved.error().kind, ErrorKind::permission_denied);
-    EXPECT_EQ(achieved.error().step, Step::openat);
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::written);
     bc::file_system_test::set_mode_raw(path_of("write-only"), 0700);
-    EXPECT_THAT(bc::file_system_test::names_raw(path_of("write-only")), IsEmpty());
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("write-only/file")), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("write-only")), ElementsAre("file"));
 }
 
 // What "durable" means, read from the system calls the write made: the temporary file is created, written,
@@ -873,7 +874,8 @@ TEST_F(ObservedContract, DurableWriteSyncsTheFileThenRenamesThenSyncsTheDirector
 
     ASSERT_TRUE(achieved.has_value());
     EXPECT_EQ(*achieved, Durability::durable);
-    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 1);
+    // The walk's component opens, the staged file's creation, and the directory opened read-only for its sync.
+    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 2);
     EXPECT_EQ(count(Operation::write_file, Step::write), 1U);
     EXPECT_EQ(count(Operation::write_file, Step::fchmod), 1U);
     EXPECT_EQ(count(Operation::write_file, durable_sync_step()), 2U);
@@ -1245,8 +1247,7 @@ auto names_of(const std::vector<Entry>& entries) -> std::vector<std::string> {
     return names;
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListThisDirectoryReturnsItsEntriesSortedEachWithItsType) {
+TEST_P(FileSystemContract, ListThisDirectoryReturnsItsEntriesSortedEachWithItsType) {
     lay_out_a_small_tree(root_path());
 
     const auto entries = files().list_directory(root(), FinalSymlink::refuse);
@@ -1258,8 +1259,7 @@ TEST_P(FileSystemContract, DISABLED_ListThisDirectoryReturnsItsEntriesSortedEach
 }
 
 // A listing is one level deep; a tree is read by listing each directory in turn.
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfEachDirectoryInATreeReturnsItsOwnEntries) {
+TEST_P(FileSystemContract, ListOfEachDirectoryInATreeReturnsItsOwnEntries) {
     lay_out_a_small_tree(root_path());
 
     const auto top = files().list_directory(root(), FinalSymlink::refuse);
@@ -1274,8 +1274,7 @@ TEST_P(FileSystemContract, DISABLED_ListOfEachDirectoryInATreeReturnsItsOwnEntri
     EXPECT_THAT(names_of(*deeper), ElementsAre("c.txt"));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListListsASymlinkToADirectoryAsASymlinkAndNeverFollowsIt) {
+TEST_P(FileSystemContract, ListListsASymlinkToADirectoryAsASymlinkAndNeverFollowsIt) {
     bc::file_system_test::make_directory_raw(path_of("outside"), 0755);
     bc::file_system_test::write_raw(path_of("outside/private.txt"), "not part of the tree", 0644);
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
@@ -1287,8 +1286,7 @@ TEST_P(FileSystemContract, DISABLED_ListListsASymlinkToADirectoryAsASymlinkAndNe
     EXPECT_THAT(*entries, ElementsAre(Entry{.entry_type = EntryType::symlink, .name = "way-out"}));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListFollowsASymlinkGivenAsTheDirectoryItselfOnlyWhenToldTo) {
+TEST_P(FileSystemContract, ListFollowsASymlinkGivenAsTheDirectoryItselfOnlyWhenToldTo) {
     bc::file_system_test::make_directory_raw(path_of("real"), 0755);
     bc::file_system_test::write_raw(path_of("real/inside.txt"), "content", 0644);
     bc::file_system_test::make_symlink_raw(path_of("real"), path_of("alias"));
@@ -1302,24 +1300,21 @@ TEST_P(FileSystemContract, DISABLED_ListFollowsASymlinkGivenAsTheDirectoryItself
     EXPECT_EQ(refused.error().kind, ErrorKind::symlink_refused);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfAnEmptyDirectoryIsEmpty) {
+TEST_P(FileSystemContract, ListOfAnEmptyDirectoryIsEmpty) {
     const auto entries = files().list_directory(root(), FinalSymlink::refuse);
 
     ASSERT_TRUE(entries.has_value());
     EXPECT_THAT(*entries, IsEmpty());
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfNothingIsNotFound) {
+TEST_P(FileSystemContract, ListOfNothingIsNotFound) {
     const auto entries = files().list_directory(in("absent"), FinalSymlink::refuse);
 
     ASSERT_FALSE(entries.has_value());
     EXPECT_EQ(entries.error().kind, ErrorKind::not_found);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfAFileIsNotDirectory) {
+TEST_P(FileSystemContract, ListOfAFileIsNotDirectory) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto entries = files().list_directory(in("file"), FinalSymlink::refuse);
@@ -1328,8 +1323,7 @@ TEST_P(FileSystemContract, DISABLED_ListOfAFileIsNotDirectory) {
     EXPECT_EQ(entries.error().kind, ErrorKind::not_directory);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfADirectoryWithoutPermissionIsPermissionDenied) {
+TEST_P(FileSystemContract, ListOfADirectoryWithoutPermissionIsPermissionDenied) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process lists what its permission bits forbid";
     }
@@ -1343,8 +1337,7 @@ TEST_P(FileSystemContract, DISABLED_ListOfADirectoryWithoutPermissionIsPermissio
 
 // A listing is complete or it is an error. A directory that cannot be read fails its own listing and names
 // itself; its parent's listing, one level deep, is complete and shows it as an entry.
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListOfADirectoryThatCannotBeReadFailsWhileItsParentListsIt) {
+TEST_P(FileSystemContract, ListOfADirectoryThatCannotBeReadFailsWhileItsParentListsIt) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process lists what its permission bits forbid";
     }
@@ -1363,8 +1356,7 @@ TEST_P(FileSystemContract, DISABLED_ListOfADirectoryThatCannotBeReadFailsWhileIt
 
 // More entries than the face's first array holds, so the listing is asked for a second time with the capacity
 // the core named.
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_ListReturnsMoreEntriesThanTheFirstArrayHolds) {
+TEST_P(FileSystemContract, ListReturnsMoreEntriesThanTheFirstArrayHolds) {
     std::vector<std::string> expected;
     for (int number = 100; number < 400; ++number) {
         const std::string name = "entry-with-a-reasonably-long-name-" + std::to_string(number) + ".txt";
@@ -1376,6 +1368,51 @@ TEST_P(FileSystemContract, DISABLED_ListReturnsMoreEntriesThanTheFirstArrayHolds
 
     ASSERT_TRUE(entries.has_value());
     EXPECT_EQ(names_of(*entries), expected);
+}
+
+// The root of the file system lists like any directory: the walk opens it for search, the listing opens `.`
+// beneath it read-only.
+TEST_P(FileSystemContract, ListOfTheRootOfTheFileSystemIsNotEmpty) {
+    const auto entries = files().list_directory(Location::at(std::filesystem::path{"/"}), FinalSymlink::refuse);
+
+    ASSERT_TRUE(entries.has_value()) << entries.error().message();
+    EXPECT_FALSE(entries->empty());
+}
+
+// An entry whose type the stream does not say (DT_UNKNOWN) is asked with fstatat, never followed. APFS, ext4
+// and tmpfs all say the type, so that branch cannot be provoked on any platform the suite runs on and is read
+// against the rule rather than faked; the types a listing reports are held by the sorted-listing case above
+// whichever way they came.
+
+// What a listing costs: the leaf opened once, read-only, one fdopendir, and every entry read twice, since the
+// entries are counted before any is stored (so an array too small stores nothing) and then stored; `.`, `..`
+// and the end of the stream are read each time too.
+TEST_F(ObservedContract, ListCountsTheEntriesThenStoresThemAndReadsEveryEntryTwice) {
+    lay_out_a_small_tree(root_path());
+
+    const auto entries = files().list_directory(root(), FinalSymlink::refuse);
+
+    ASSERT_TRUE(entries.has_value()) << entries.error().message();
+    EXPECT_EQ(entries->size(), 3U);
+    // The walk's component opens below the root, and the listed directory itself.
+    EXPECT_EQ(count(Operation::list_directory, Step::openat), components_of(root_path()));
+    EXPECT_EQ(count(Operation::list_directory, Step::fdopendir), 1U);
+    // Three entries, `.` and `..`, and the end of the stream: six reads, twice.
+    EXPECT_EQ(count(Operation::list_directory, Step::readdir), 12U);
+}
+
+// A read of the stream that fails discards everything read before it: a listing is complete or an error.
+TEST_F(ObservedContract, AReadOfTheStreamThatFailsIsTheListingsErrorAndNothingIsAnswered) {
+    lay_out_a_small_tree(root_path());
+    script(fail_step(Operation::list_directory, Step::readdir, 2, EIO));
+
+    const auto entries = files().list_directory(root(), FinalSymlink::refuse);
+
+    ASSERT_FALSE(entries.has_value());
+    EXPECT_EQ(entries.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(entries.error().step, Step::readdir);
+    EXPECT_EQ(entries.error().system_code, EIO);
+    EXPECT_EQ(entries.error().path, root_path().string());
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -1891,11 +1928,94 @@ TEST_P(FileSystemContract, WriteBeneathADirectoryStagesBesideTheLeafAndRefusesAS
 }
 
 // -------------------------------------------------------------------------------------------------------------
+// create_directory
+// -------------------------------------------------------------------------------------------------------------
+
+TEST_P(FileSystemContract, CreateDirectoryMakesOneDirectoryWithTheModeExactly) {
+    const auto created = files().create_directory(in("folder"), Permissions::exactly(0750));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("folder")), 0750U);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("folder"));
+}
+
+// The name is taken, by anything: a creation has no final symlink to follow or refuse, and what holds the name
+// is left exactly as it was.
+TEST_P(FileSystemContract, CreateDirectoryOfANameThatIsTakenIsAlreadyExistsWhateverHoldsIt) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_symlink_raw(path_of("folder"), path_of("link"));
+
+    for (const std::string_view name : {"folder", "file", "link"}) {
+        const auto created = files().create_directory(in(name), Permissions::exactly(0700));
+        ASSERT_FALSE(created.has_value()) << name;
+        EXPECT_EQ(created.error().kind, ErrorKind::already_exists) << name;
+        EXPECT_EQ(created.error().step, Step::mkdirat) << name;
+        EXPECT_EQ(created.error().system_code, EEXIST) << name;
+    }
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("folder")), 0755U);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file", "folder", "link"));
+}
+
+TEST_P(FileSystemContract, CreateDirectoryBelowAMissingParentIsNotFoundAndBelowAFileIsNotDirectory) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto below_nothing = files().create_directory(in("missing/child"), Permissions::exactly(0755));
+    const auto below_the_file = files().create_directory(in("file/child"), Permissions::exactly(0755));
+
+    ASSERT_FALSE(below_nothing.has_value());
+    EXPECT_EQ(below_nothing.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(below_the_file.has_value());
+    EXPECT_EQ(below_the_file.error().kind, ErrorKind::not_directory);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file"));
+}
+
+TEST_P(FileSystemContract, CreateDirectoryOfTheRootOfTheFileSystemIsAlreadyExists) {
+    const auto created = files().create_directory(Location::at(std::filesystem::path{"/"}), Permissions::exactly(0755));
+
+    ASSERT_FALSE(created.has_value());
+    EXPECT_EQ(created.error().kind, ErrorKind::already_exists);
+}
+
+// The umask is ambient state the library never consults: a directory is made with a private mode and then
+// given the stated one exactly, so a restrictive umask changes nothing. The umask is process-wide, so the guard
+// sets it and restores it inside this one case, and the suite runs one case at a time.
+TEST_P(FileSystemContract, CreateDirectoryAndCreateDirectoriesGiveTheModeExactlyUnderARestrictiveUmask) {
+    const bc::file_system_test::UmaskGuard umask{0077};
+
+    const auto one = files().create_directory(in("one"), Permissions::exactly(0755));
+    const auto chain = files().create_directories(in("a/b/c"), Permissions::exactly(0775));
+
+    ASSERT_TRUE(one.has_value()) << one.error().message();
+    ASSERT_TRUE(chain.has_value()) << chain.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("one")), 0755U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a")), 0775U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b")), 0775U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b/c")), 0775U);
+}
+
+// A directory whose mode cannot be set is taken back: a failure never leaves a directory with a mode nobody
+// chose. A stop there keeps it, as a kill would.
+TEST_F(ObservedContract, CreateDirectoryWhoseModeCannotBeSetTakesTheDirectoryBackAndAStopKeepsIt) {
+    script(fail_step(Operation::create_directory, Step::fchmodat, 1, EIO));
+    const auto failed = files().create_directory(in("failed"), Permissions::exactly(0755));
+    script(stop_at(Operation::create_directory, Step::fchmodat, 2));
+    const auto stopped = files().create_directory(in("stopped"), Permissions::exactly(0755));
+
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(failed.error().step, Step::fchmodat);
+    ASSERT_FALSE(stopped.has_value());
+    EXPECT_EQ(stopped.error().system_code, 0);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("stopped"));
+}
+
+// -------------------------------------------------------------------------------------------------------------
 // create_directories
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_CreateDirectoriesMakesEveryMissingDirectoryWithTheMode) {
+TEST_P(FileSystemContract, CreateDirectoriesMakesEveryMissingDirectoryWithTheMode) {
     const auto created = files().create_directories(in("a/b/c"), Permissions::exactly(0750));
 
     ASSERT_TRUE(created.has_value());
@@ -1904,8 +2024,7 @@ TEST_P(FileSystemContract, DISABLED_CreateDirectoriesMakesEveryMissingDirectoryW
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b/c")), 0750U);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_CreateDirectoriesLeavesWhatExistsAsItIsUnderEitherPolicy) {
+TEST_P(FileSystemContract, CreateDirectoriesLeavesWhatExistsAsItIsUnderEitherPolicy) {
     bc::file_system_test::make_directory_raw(path_of("existing"), 0700);
 
     const auto under_exactly = files().create_directories(in("existing/new"), Permissions::exactly(0755));
@@ -1919,19 +2038,18 @@ TEST_P(FileSystemContract, DISABLED_CreateDirectoriesLeavesWhatExistsAsItIsUnder
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("existing/new")), 0755U);
 }
 
-// Under `at` the bytes go to the system as spelled, which accepts a trailing separator. Whether an absolute
-// spelling with one is one spelling of its path is the path module's to decide (stage 10); this case holds
-// the system's answer until then.
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_CreateDirectoriesAcceptsATrailingSeparator) {
+// A trailing separator is not one spelling of a path (the path module's rule since stage 10): the location is
+// refused at the door, before any system call, and nothing is made.
+TEST_P(FileSystemContract, CreateDirectoriesRefusesATrailingSeparatorAtTheDoor) {
     const auto created = files().create_directories(in("a/b/"), Permissions::exactly(0755));
 
-    ASSERT_TRUE(created.has_value());
-    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b")), 0755U);
+    ASSERT_FALSE(created.has_value());
+    EXPECT_EQ(created.error().kind, ErrorKind::invalid_argument);
+    EXPECT_FALSE(created.error().step.has_value());
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("a")));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_CreateDirectoriesWhereAFileIsIsNotDirectory) {
+TEST_P(FileSystemContract, CreateDirectoriesWhereAFileIsIsNotDirectory) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto onto_the_file = files().create_directories(in("file"), Permissions::exactly(0755));
@@ -1945,8 +2063,7 @@ TEST_P(FileSystemContract, DISABLED_CreateDirectoriesWhereAFileIsIsNotDirectory)
 }
 
 // Under `at` the system resolves the path, symlinks on the way included; only `beneath` refuses them.
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_CreateDirectoriesAcceptsASymlinkToADirectoryOnTheWay) {
+TEST_P(FileSystemContract, CreateDirectoriesAcceptsASymlinkToADirectoryOnTheWay) {
     bc::file_system_test::make_directory_raw(path_of("real"), 0755);
     bc::file_system_test::make_symlink_raw(path_of("real"), path_of("alias"));
 
@@ -1954,6 +2071,41 @@ TEST_P(FileSystemContract, DISABLED_CreateDirectoriesAcceptsASymlinkToADirectory
 
     ASSERT_TRUE(created.has_value());
     EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("real/child")));
+}
+
+// Beneath a held directory the chain may hold no symlink: a real directory on the way is entered and a symlink
+// to one is refused, as every `beneath` resolution refuses it, with nothing made beyond it.
+TEST_P(FileSystemContract, CreateDirectoriesBeneathEntersARealDirectoryAndRefusesASymlinkOnTheWay) {
+    bc::file_system_test::make_directory_raw(path_of("real"), 0755);
+    bc::file_system_test::make_symlink_raw(path_of("real"), path_of("alias"));
+    const auto held = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(held.has_value()) << held.error().message();
+
+    const auto inside = files().create_directories(Location::beneath(*held, relative("real/child/grandchild")),
+                                                   Permissions::exactly(0755));
+    const auto through_a_link =
+        files().create_directories(Location::beneath(*held, relative("alias/other")), Permissions::exactly(0755));
+
+    ASSERT_TRUE(inside.has_value()) << inside.error().message();
+    EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("real/child/grandchild")));
+    ASSERT_FALSE(through_a_link.has_value());
+    EXPECT_EQ(through_a_link.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(through_a_link.error().path, path_of("alias/other").string());
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("real/other")));
+}
+
+// The root of the file system is there already; so is a chain that exists in full.
+TEST_P(FileSystemContract, CreateDirectoriesOfTheRootAndOfAnExistingChainMakesNothing) {
+    bc::file_system_test::make_directory_raw(path_of("a"), 0700);
+    bc::file_system_test::make_directory_raw(path_of("a/b"), 0700);
+
+    const auto root_of_all =
+        files().create_directories(Location::at(std::filesystem::path{"/"}), Permissions::exactly(0755));
+    const auto existing = files().create_directories(in("a/b"), Permissions::exactly(0755));
+
+    ASSERT_TRUE(root_of_all.has_value()) << root_of_all.error().message();
+    ASSERT_TRUE(existing.has_value()) << existing.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b")), 0700U);
 }
 
 // A mode with bits outside 07777 is a contract violation, refused before any system call: green now.
@@ -1970,8 +2122,7 @@ TEST_P(FileSystemContract, CreateDirectoriesRefusesAModeThatIsNotAMode) {
 // remove_file
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveFileRemovesAFileAndSaysThereWasOne) {
+TEST_P(FileSystemContract, RemoveFileRemovesAFileAndSaysThereWasOne) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto removed = files().remove_file(in("file"));
@@ -1981,16 +2132,14 @@ TEST_P(FileSystemContract, DISABLED_RemoveFileRemovesAFileAndSaysThereWasOne) {
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("file")));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveFileOfNothingSaysThereWasNone) {
+TEST_P(FileSystemContract, RemoveFileOfNothingSaysThereWasNone) {
     const auto removed = files().remove_file(in("absent"));
 
     ASSERT_TRUE(removed.has_value());
     EXPECT_FALSE(*removed);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveFileRemovesASymlinkAndNotWhatItPointsAt) {
+TEST_P(FileSystemContract, RemoveFileRemovesASymlinkAndNotWhatItPointsAt) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
 
@@ -2002,8 +2151,7 @@ TEST_P(FileSystemContract, DISABLED_RemoveFileRemovesASymlinkAndNotWhatItPointsA
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("target.txt")), "behind the link");
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveFileRefusesADirectory) {
+TEST_P(FileSystemContract, RemoveFileRefusesADirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
 
     const auto removed = files().remove_file(in("folder"));
@@ -2014,11 +2162,61 @@ TEST_P(FileSystemContract, DISABLED_RemoveFileRefusesADirectory) {
 }
 
 // -------------------------------------------------------------------------------------------------------------
+// remove_directory
+// -------------------------------------------------------------------------------------------------------------
+
+TEST_P(FileSystemContract, RemoveDirectoryRemovesAnEmptyDirectoryAndSaysThereWasOne) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto removed = files().remove_directory(in("folder"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("folder")));
+}
+
+TEST_P(FileSystemContract, RemoveDirectoryOfNothingSaysThereWasNone) {
+    const auto removed = files().remove_directory(in("absent"));
+    const auto below_nothing = files().remove_directory(in("absent/child"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_FALSE(*removed);
+    ASSERT_TRUE(below_nothing.has_value()) << below_nothing.error().message();
+    EXPECT_FALSE(*below_nothing);
+}
+
+TEST_P(FileSystemContract, RemoveDirectoryOfOneWithEntriesIsDirectoryNotEmptyAndRemovesNothing) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::write_raw(path_of("folder/file"), "content", 0644);
+
+    const auto removed = files().remove_directory(in("folder"));
+
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error().kind, ErrorKind::directory_not_empty);
+    EXPECT_EQ(removed.error().step, Step::unlinkat);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("folder/file")), "content");
+}
+
+TEST_P(FileSystemContract, RemoveDirectoryOfAFileOrASymlinkToADirectoryIsNotDirectory) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::make_symlink_raw(path_of("folder"), path_of("link"));
+
+    const auto a_file = files().remove_directory(in("file"));
+    const auto a_link = files().remove_directory(in("link"));
+
+    ASSERT_FALSE(a_file.has_value());
+    EXPECT_EQ(a_file.error().kind, ErrorKind::not_directory);
+    ASSERT_FALSE(a_link.has_value());
+    EXPECT_EQ(a_link.error().kind, ErrorKind::not_directory);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file", "folder", "link"));
+}
+
+// -------------------------------------------------------------------------------------------------------------
 // remove_tree
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveTreeRemovesEverythingAndSaysThereWasOne) {
+TEST_P(FileSystemContract, RemoveTreeRemovesEverythingAndSaysThereWasOne) {
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
     lay_out_a_small_tree(path_of("tree"));
 
@@ -2029,16 +2227,14 @@ TEST_P(FileSystemContract, DISABLED_RemoveTreeRemovesEverythingAndSaysThereWasOn
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("tree")));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveTreeOfNothingRemovesNothing) {
+TEST_P(FileSystemContract, RemoveTreeOfNothingRemovesNothing) {
     const auto removed = files().remove_tree(in("absent"));
 
     ASSERT_TRUE(removed.has_value());
     EXPECT_FALSE(*removed);
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveTreeOfAFileRemovesTheFile) {
+TEST_P(FileSystemContract, RemoveTreeOfAFileRemovesTheFile) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto removed = files().remove_tree(in("file"));
@@ -2048,8 +2244,7 @@ TEST_P(FileSystemContract, DISABLED_RemoveTreeOfAFileRemovesTheFile) {
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("file")));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_RemoveTreeRemovesSymlinksAndNeverWhatTheyPointAt) {
+TEST_P(FileSystemContract, RemoveTreeRemovesSymlinksAndNeverWhatTheyPointAt) {
     bc::file_system_test::make_directory_raw(path_of("outside"), 0755);
     bc::file_system_test::write_raw(path_of("outside/kept.txt"), "must survive", 0644);
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
@@ -2066,6 +2261,145 @@ TEST_P(FileSystemContract, DISABLED_RemoveTreeRemovesSymlinksAndNeverWhatTheyPoi
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("tree")));
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("alias")));
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("outside/kept.txt")), "must survive");
+}
+
+// A tree wider than its window at every level: every file and every directory goes, in one call.
+TEST_P(FileSystemContract, RemoveTreeOfAWideTreeRemovesEveryEntry) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    for (int branch = 0; branch < 24; ++branch) {
+        const std::string name = "branch-" + std::to_string(branch);
+        bc::file_system_test::make_directory_raw(path_of("tree/" + name), 0755);
+        for (int leaf = 0; leaf < 24; ++leaf) {
+            bc::file_system_test::write_raw(path_of("tree/" + name + "/leaf-" + std::to_string(leaf)), "", 0644);
+        }
+        bc::file_system_test::make_directory_raw(path_of("tree/" + name + "/empty"), 0700);
+        bc::file_system_test::make_symlink_raw(path_of("tree"), path_of("tree/" + name + "/back"));
+    }
+
+    const auto removed = files().remove_tree(in("tree"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
+}
+
+// The removal walks on held descriptors with no recursion and a window of sixteen levels: a chain deeper than
+// the window is cleared in passes that descend from the top again. The proof that nothing more is held is a
+// descriptor limit lowered to what the suite holds now, the window and a handful: an operation that opened
+// more would fail with EMFILE. The chain is planted on held descriptors, as the resolve test plants its own.
+// The limit in force is read first, and where it is below what the planting itself needs the case skips, saying
+// so, rather than failing for the runner's limit.
+TEST_P(FileSystemContract, RemoveTreeClearsAChainDeeperThanItsWindowUnderALoweredDescriptorLimit) {
+    constexpr std::uint32_t depth = 300;
+    constexpr std::uint64_t window = 16;
+    // The walk's parent, the top's stream, a child being entered, the root opened for the identity check, and
+    // slack for the test framework's own needs.
+    constexpr std::uint64_t allowance = 8;
+    const std::uint64_t held_now = bc::file_system_test::open_descriptors().size();
+    const std::uint64_t needed = held_now + window + allowance;
+    if (bc::file_system_test::descriptor_soft_limit() <= needed) {
+        GTEST_SKIP() << "the soft descriptor limit, " << bc::file_system_test::descriptor_soft_limit()
+                     << ", is not above the " << needed << " this case needs";
+    }
+    bc::file_system_test::make_directory_raw(path_of("chain"), 0755);
+    bc::file_system_test::make_deep_chain_raw(path_of("chain"), depth, "d");
+    ASSERT_TRUE(bc::file_system_test::exists_raw(path_of("chain/d/d/d/d")));
+
+    {
+        const bc::file_system_test::DescriptorLimit limit{needed};
+        const auto removed = files().remove_tree(in("chain"));
+        ASSERT_TRUE(removed.has_value()) << removed.error().message();
+        EXPECT_TRUE(*removed);
+    }
+
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("chain")));
+}
+
+TEST_P(FileSystemContract, RemoveTreeBeneathADirectoryRemovesTheTreeAndRefusesASymlinkOnTheWay) {
+    lay_out_directories(root_path());
+    bc::file_system_test::write_raw(path_of("sub/deeper/file"), "content", 0644);
+    const auto held = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(held.has_value()) << held.error().message();
+
+    const auto through_a_link = files().remove_tree(Location::beneath(*held, relative("alias/deeper")));
+    const auto inside = files().remove_tree(Location::beneath(*held, relative("sub/deeper")));
+
+    ASSERT_FALSE(through_a_link.has_value());
+    EXPECT_EQ(through_a_link.error().kind, ErrorKind::symlink_refused);
+    ASSERT_TRUE(inside.has_value()) << inside.error().message();
+    EXPECT_TRUE(*inside);
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub")), ElementsAre("way-out"));
+    EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("outside")));
+}
+
+// The error of a removal names the entry it failed on, relative to the location, which the face composes into
+// the path; what was removed before it stays removed.
+TEST_F(ObservedContract, RemoveTreeNamesTheEntryItCouldNotRemoveAndKeepsWhatItRemoved) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("tree/a"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("tree/a/b"), 0755);
+    bc::file_system_test::write_raw(path_of("tree/a/b/kept"), "content", 0644);
+    bc::file_system_test::write_raw(path_of("tree/a/b/gone"), "content", 0644);
+    // The two files are unlinked in the order the stream answers them: the second is the one refused.
+    script(fail_step(Operation::remove_tree, Step::unlinkat, 2, EACCES));
+
+    const auto removed = files().remove_tree(in("tree"));
+
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(removed.error().step, Step::unlinkat);
+    EXPECT_FALSE(removed.error().name_truncated);
+    const std::vector<std::string> remaining = bc::file_system_test::names_raw(path_of("tree/a/b"));
+    ASSERT_EQ(remaining.size(), 1U);
+    EXPECT_EQ(removed.error().path, path_of("tree/a/b/" + remaining.front()).string());
+}
+
+// A mount point inside the tree is where the removal stops, with `cross_device` and what it removed before it
+// kept. A mount is nothing a test can plant without privileges, and a scripted fault can fail a step or stop it
+// but never change what fstatat answers, so the case waits for either a scripted stat answer in the observer or
+// a mount the suite may make (a loop mount on Linux, under a privileged leg).
+TEST_F(ObservedContract, DISABLED_RemoveTreeStopsAtAMountPointInsideTheTreeWithCrossDevice) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("tree/mount"), 0755);
+    // (the mount of another device at tree/mount would go here)
+
+    const auto removed = files().remove_tree(in("tree"));
+
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error().kind, ErrorKind::cross_device);
+    EXPECT_EQ(removed.error().path, path_of("tree/mount").string());
+    EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("tree")));
+}
+
+// The kill points of remove_tree: a stop at any of its unlinkat calls leaves the descriptors closed and a tree
+// that a second call finishes, whatever was removed before the stop.
+TEST_F(ObservedContract, RemoveTreeStoppedAtAnyUnlinkatLeavesATreeASecondCallFinishes) {
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    lay_out_a_small_tree(path_of("tree"));
+    const auto whole = files().remove_tree(in("tree"));
+    ASSERT_TRUE(whole.has_value()) << whole.error().message();
+    // a.txt, link, sub/b.txt, sub/deeper/c.txt, deeper, sub, and the tree itself.
+    const std::uint64_t unlinks = count(Operation::remove_tree, Step::unlinkat);
+    ASSERT_EQ(unlinks, 7U);
+
+    for (std::uint64_t point = 1; point <= unlinks; ++point) {
+        bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+        lay_out_a_small_tree(path_of("tree"));
+        const std::uint64_t before = count(Operation::remove_tree, Step::unlinkat);
+        script(stop_at(Operation::remove_tree, Step::unlinkat, static_cast<std::uint32_t>(before + point)));
+
+        const auto stopped = files().remove_tree(in("tree"));
+        ASSERT_FALSE(stopped.has_value()) << "unlinkat " << point;
+        EXPECT_EQ(stopped.error().kind, ErrorKind::io_failed) << "unlinkat " << point;
+        EXPECT_EQ(stopped.error().step, Step::unlinkat) << "unlinkat " << point;
+        EXPECT_EQ(stopped.error().system_code, 0) << "unlinkat " << point;
+        EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("tree"))) << "unlinkat " << point;
+
+        const auto finished = files().remove_tree(in("tree"));
+        ASSERT_TRUE(finished.has_value()) << "unlinkat " << point << ": " << finished.error().message();
+        EXPECT_TRUE(*finished) << "unlinkat " << point;
+        EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("tree"))) << "unlinkat " << point;
+    }
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -2093,19 +2427,16 @@ protected:
     }
 };
 
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_TheRootIsTheRoot) {
+TEST_F(RootRefusal, TheRootIsTheRoot) {
     expect_refused_by_spelling("/");
 }
 
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_RepeatedSeparatorsAreStillTheRoot) {
+TEST_F(RootRefusal, RepeatedSeparatorsAreStillTheRoot) {
     expect_refused_by_spelling("//");
     expect_refused_by_spelling("///");
 }
 
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_TheRootsOwnDotAndDotDotAreTheRoot) {
+TEST_F(RootRefusal, TheRootsOwnDotAndDotDotAreTheRoot) {
     expect_refused_by_spelling("/.");
     expect_refused_by_spelling("/./");
     expect_refused_by_spelling("/..");
@@ -2113,8 +2444,7 @@ TEST_F(RootRefusal, DISABLED_TheRootsOwnDotAndDotDotAreTheRoot) {
     expect_refused_by_spelling("/./../.");
 }
 
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_ANameCancelledByDotDotLeavesTheRoot) {
+TEST_F(RootRefusal, ANameCancelledByDotDotLeavesTheRoot) {
     expect_refused_by_spelling("/tmp/..");
     expect_refused_by_spelling("/tmp/../");
     expect_refused_by_spelling("/tmp/./..");
@@ -2125,10 +2455,10 @@ TEST_F(RootRefusal, DISABLED_ANameCancelledByDotDotLeavesTheRoot) {
 }
 
 // The same spellings below the test's own directory name nothing, and nothing is not the root: the call
-// proceeds and answers "there was nothing".
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_AnythingBelowTheRootIsNotTheRoot) {
-    for (const std::string_view spelling : {"tmp", "tmp/", "tmp/cache/files", "tmp/cache/..", "a/../b", "..."}) {
+// proceeds and answers "there was nothing". (A trailing separator is refused at the door since stage 10 and is
+// not among them.)
+TEST_P(FileSystemContract, AnythingBelowTheRootIsNotTheRoot) {
+    for (const std::string_view spelling : {"tmp", "tmp/cache/files", "tmp/cache/..", "a/../b", "..."}) {
         const auto removed = files().remove_tree(in(spelling));
         ASSERT_TRUE(removed.has_value()) << spelling << ": " << removed.error().message();
         EXPECT_FALSE(*removed) << spelling;
@@ -2152,8 +2482,7 @@ TEST_P(FileSystemContract, ARelativePathIsRefusedAtTheDoorAndNeverCalledTheRoot)
 
 // The identity check: a directory that is the root however the path reached it. A symlink to the root with
 // `/.` behind it spells no root, and the system resolves it to one.
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_ARootReachedThroughASymlinkIsRefusedByIdentity) {
+TEST_F(RootRefusal, ARootReachedThroughASymlinkIsRefusedByIdentity) {
     bc::file_system_test::make_symlink_raw("/", path_of("alias"));
 
     const auto removed = files().remove_tree(in("alias/."));
@@ -2164,8 +2493,7 @@ TEST_F(RootRefusal, DISABLED_ARootReachedThroughASymlinkIsRefusedByIdentity) {
     EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("alias")));
 }
 
-// stage 15 directories-in-c
-TEST_P(FileSystemContract, DISABLED_AnOrdinaryDirectoryAFileAndNothingAreNotTheRoot) {
+TEST_P(FileSystemContract, AnOrdinaryDirectoryAFileAndNothingAreNotTheRoot) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
@@ -2184,8 +2512,7 @@ TEST_P(FileSystemContract, DISABLED_AnOrdinaryDirectoryAFileAndNothingAreNotTheR
 // What the spelling cannot show: `alias/..` reduces, by text, to the test's own directory, while the system
 // resolves the alias to the root and its parent to the root again. The spelling says "the test directory";
 // the system says "the root"; the identity check refuses.
-// stage 15 directories-in-c
-TEST_F(RootRefusal, DISABLED_ARootReachedByDotDotThroughASymlinkIsRefusedByIdentity) {
+TEST_F(RootRefusal, ARootReachedByDotDotThroughASymlinkIsRefusedByIdentity) {
     bc::file_system_test::make_symlink_raw("/", path_of("alias"));
 
     const auto removed = files().remove_tree(in("alias/.."));
@@ -2194,6 +2521,141 @@ TEST_F(RootRefusal, DISABLED_ARootReachedByDotDotThroughASymlinkIsRefusedByIdent
     EXPECT_EQ(removed.error().kind, ErrorKind::invalid_argument);
     EXPECT_EQ(count(Operation::remove_tree, Step::unlinkat), 0U);
     EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("alias")));
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// set_permissions
+// -------------------------------------------------------------------------------------------------------------
+
+TEST_P(FileSystemContract, SetPermissionsSetsTheBitsOfAFileAndADirectoryExactly) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto file = files().set_permissions(in("file"), 0600, FinalSymlink::refuse);
+    const auto folder = files().set_permissions(in("folder"), 0700, FinalSymlink::follow);
+
+    ASSERT_TRUE(file.has_value()) << file.error().message();
+    ASSERT_TRUE(folder.has_value()) << folder.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0600U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("folder")), 0700U);
+}
+
+// Under `refuse` a symlink is refused and nothing changes; under `follow` what it points at gets the mode.
+TEST_P(FileSystemContract, SetPermissionsRefusesASymlinkUnderRefuseAndActsOnItsTargetUnderFollow) {
+    bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
+    bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
+
+    const auto refused = files().set_permissions(in("link"), 0600, FinalSymlink::refuse);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("target.txt")), 0644U);
+    const auto followed = files().set_permissions(in("link"), 0600, FinalSymlink::follow);
+
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().kind, ErrorKind::symlink_refused);
+    EXPECT_FALSE(refused.error().step.has_value());
+    ASSERT_TRUE(followed.has_value()) << followed.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("target.txt")), 0600U);
+}
+
+TEST_P(FileSystemContract, SetPermissionsOfNothingIsNotFoundUnderEitherChoice) {
+    bc::file_system_test::make_symlink_raw(path_of("nowhere"), path_of("dangling"));
+
+    const auto refused = files().set_permissions(in("absent"), 0600, FinalSymlink::refuse);
+    const auto followed = files().set_permissions(in("absent"), 0600, FinalSymlink::follow);
+    const auto through_a_dangling_link = files().set_permissions(in("dangling"), 0600, FinalSymlink::follow);
+
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(followed.has_value());
+    EXPECT_EQ(followed.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(through_a_dangling_link.has_value());
+    EXPECT_EQ(through_a_dangling_link.error().kind, ErrorKind::not_found);
+}
+
+// What a mode change costs on this platform: under `follow` one fchmodat; under `refuse` one look at the entry
+// and one fchmodat with AT_SYMLINK_NOFOLLOW, which Apple platforms and a glibc with the fchmodat2 call or the
+// /proc fallback honour on anything that is not a symlink, so the open-and-fchmod way is never needed here.
+TEST_F(ObservedContract, SetPermissionsIsOneFchmodatAndUnderRefuseOneLookFirst) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto followed = files().set_permissions(in("file"), 0600, FinalSymlink::follow);
+    const auto refused = files().set_permissions(in("file"), 0640, FinalSymlink::refuse);
+
+    ASSERT_TRUE(followed.has_value()) << followed.error().message();
+    ASSERT_TRUE(refused.has_value()) << refused.error().message();
+    EXPECT_EQ(count(Operation::set_permissions, Step::fchmodat), 2U);
+    EXPECT_EQ(count(Operation::set_permissions, Step::fstatat), components_of(root_path()) * 2 + 1);
+    EXPECT_EQ(count(Operation::set_permissions, Step::fchmod), 0U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0640U);
+}
+
+// Where a libc refuses AT_SYMLINK_NOFOLLOW on an entry that is not a symlink (ENOTSUP), the entry is opened
+// without following and fchmod sets the mode on the descriptor; a symlink there answers ELOOP, refused.
+TEST_F(ObservedContract, SetPermissionsFallsBackToOpenAndFchmodWhereTheFlagIsNotSupported) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    script(fail_step(Operation::set_permissions, Step::fchmodat, 1, ENOTSUP));
+
+    const auto changed = files().set_permissions(in("file"), 0600, FinalSymlink::refuse);
+
+    ASSERT_TRUE(changed.has_value()) << changed.error().message();
+    EXPECT_EQ(count(Operation::set_permissions, Step::fchmod), 1U);
+    EXPECT_EQ(count(Operation::set_permissions, Step::openat), components_of(root_path()) + 1);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0600U);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// create_temporary_directory
+// -------------------------------------------------------------------------------------------------------------
+
+TEST_P(FileSystemContract, CreateTemporaryDirectoryTwiceYieldsTwoDirectoriesWithTheirModes) {
+    const auto first = files().create_temporary_directory(root(), Permissions::exactly(0700));
+    const auto second = files().create_temporary_directory(root(), Permissions::exactly(0750));
+
+    ASSERT_TRUE(first.has_value()) << first.error().message();
+    ASSERT_TRUE(second.has_value()) << second.error().message();
+    EXPECT_NE(*first, *second);
+    EXPECT_EQ(first->find('/'), std::string::npos);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of(*first)), 0700U);
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of(*second)), 0750U);
+    std::vector<std::string> expected{*first, *second};
+    std::ranges::sort(expected);
+    EXPECT_EQ(bc::file_system_test::names_raw(root_path()), expected);
+}
+
+TEST_P(FileSystemContract, CreateTemporaryDirectoryInNothingIsNotFoundAndInAFileIsNotDirectory) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto in_nothing = files().create_temporary_directory(in("absent"), Permissions::exactly(0700));
+    const auto in_a_file = files().create_temporary_directory(in("file"), Permissions::exactly(0700));
+
+    ASSERT_FALSE(in_nothing.has_value());
+    EXPECT_EQ(in_nothing.error().kind, ErrorKind::not_found);
+    ASSERT_FALSE(in_a_file.has_value());
+    EXPECT_EQ(in_a_file.error().kind, ErrorKind::not_directory);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file"));
+}
+
+TEST_P(FileSystemContract, CreateTemporaryDirectoryBeneathAHeldDirectoryMakesItInside) {
+    bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
+    const auto held = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(held.has_value()) << held.error().message();
+
+    const auto name =
+        files().create_temporary_directory(Location::beneath(*held, relative("sub")), Permissions::exactly(0700));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(path_of("sub")), ElementsAre(*name));
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("sub/" + *name)), 0700U);
+}
+
+// A name that is taken is tried again with the next token: one more mkdirat, and the directory is made.
+TEST_F(ObservedContract, ATemporaryNameThatIsTakenIsTriedAgainWithTheNextToken) {
+    script(fail_step(Operation::create_temporary_directory, Step::mkdirat, 1, EEXIST));
+
+    const auto name = files().create_temporary_directory(root(), Permissions::exactly(0700));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_EQ(count(Operation::create_temporary_directory, Step::mkdirat), 2U);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(*name));
 }
 
 // -------------------------------------------------------------------------------------------------------------

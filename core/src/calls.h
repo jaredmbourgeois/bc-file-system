@@ -14,6 +14,7 @@
  */
 #pragma once
 
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include <stddef.h>
@@ -95,3 +96,24 @@ bc_file_system_call_outcome bc_file_system_call_rename_no_replace(bc_file_system
                                                                   const char *to_name);
 bc_file_system_call_outcome bc_file_system_call_unlinkat(bc_file_system_engine *engine, int32_t operation, int parent,
                                                          const char *name, int flags);
+/* `fchmodat` of `name` under `parent`; `flags` is AT_SYMLINK_NOFOLLOW for the entry itself, never what a symlink
+ * points at, or 0 to follow. Where a platform cannot honour the flag on a non-symlink it answers ENOTSUP or
+ * EOPNOTSUPP, and the operation opens the entry and uses `bc_file_system_call_fchmod` instead. */
+bc_file_system_call_outcome bc_file_system_call_fchmodat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                         const char *name, uint32_t mode, int flags);
+
+/* ---- Directories --------------------------------------------------------------------------------------------- */
+
+/* `mkdirat` with `mode` as the umask leaves it, which is why every operation that creates a directory sets the
+ * mode exactly afterwards. EEXIST means the name is taken, by anything. */
+bc_file_system_call_outcome bc_file_system_call_mkdirat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                        const char *name, uint32_t mode);
+/* `fdopendir` over a descriptor opened for reading: on success the stream owns the descriptor from then on, so
+ * the caller releases it from its owner; on failure, real or scripted, the descriptor is still the caller's. */
+bc_file_system_call_outcome bc_file_system_call_fdopendir(bc_file_system_engine *engine, int32_t operation,
+                                                          int descriptor, DIR **stream);
+/* One `readdir`: errno is zeroed first, because a null answer means the end of the stream or an error and only
+ * errno says which. At the end `*entry` is NULL and the call succeeded. The entry is the stream's and is valid
+ * only until the next call on it, so the caller copies `d_name` before asking again. */
+bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *engine, int32_t operation, DIR *stream,
+                                                        struct dirent **entry);

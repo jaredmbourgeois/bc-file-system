@@ -94,6 +94,12 @@ bool bc_file_system_platform_enforces_containment(void) {
     return true;
 }
 
+/* O_SEARCH is O_EXEC | O_DIRECTORY on Apple platforms: a directory the process may search but not read opens
+ * (measured: a 0300 directory opens, takes a created file, and answers EBADF to fdopendir). */
+int bc_file_system_platform_directory_search_open_flags(void) {
+    return O_SEARCH | O_DIRECTORY | O_CLOEXEC;
+}
+
 /* O_NOFOLLOW_ANY makes the kernel refuse a symlink at any depth of `relative` with ELOOP (measured: in the middle
  * and at the end alike), so one openat relative to the held root resolves the whole path contained. */
 int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor) {
@@ -154,6 +160,11 @@ bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void
  * directory goes stale on rename, a symlink on the way escapes, and no openat2 exists. Nothing is contained. */
 bool bc_file_system_platform_enforces_containment(void) {
     return false;
+}
+
+/* Neither O_SEARCH nor O_PATH has a meaning in the runtime's file system; a directory opens read-only. */
+int bc_file_system_platform_directory_search_open_flags(void) {
+    return O_RDONLY | O_DIRECTORY | O_CLOEXEC;
 }
 
 /* No kernel call opens a path contained beneath a descriptor here; the engine never asks, since containment is
@@ -243,6 +254,13 @@ bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void
 /* A directory descriptor is a kernel object here. */
 bool bc_file_system_platform_enforces_containment(void) {
     return true;
+}
+
+/* O_PATH (Linux 2.6.39, glibc, musl and bionic alike) opens a directory with no permission check at all and
+ * yields a descriptor that every `*at` call, `fstat` (Linux 3.6) and openat2 take as a directory; what it
+ * cannot do is read (fdopendir: EBADF) or sync (fsync: EBADF), which the engine never asks of a parent. */
+int bc_file_system_platform_directory_search_open_flags(void) {
+    return O_PATH | O_DIRECTORY | O_CLOEXEC;
 }
 
 #if defined(__ANDROID__) || !__has_include(<linux/openat2.h>)

@@ -103,6 +103,8 @@ public enum Step: Int32, CaseIterable, Sendable {
     case openat2 = 24
     /// The Apple fast path of a `beneath` location: openat with O_NOFOLLOW_ANY over the whole relative path.
     case openatNofollowAny = 25
+    /// fchmodat: the mode set by name under a held directory (AT_SYMLINK_NOFOLLOW for the entry itself).
+    case fchmodat = 26
 }
 
 /// Why an operation failed. A plain value: the core reports enums and integers; the face composes `path` from

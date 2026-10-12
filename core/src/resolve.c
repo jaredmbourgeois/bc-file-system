@@ -1,7 +1,9 @@
 /* resolve.c — the bodies behind resolve.h: the walk, the fast paths, the identity check, the errno mapping.
  *
  * One shape for every open of a directory entry: `fstatat` records what is there, `openat` opens it as a
- * directory, `fstat` reads what was opened, and the two identities are compared. The walk is that shape in a
+ * directory (for search only on the walk: O_SEARCH on Apple platforms, O_PATH on Linux, the platform's flags,
+ * so a directory the process may enter but not list is a parent like any other), `fstat` reads what was
+ * opened, and the two identities are compared. The walk is that shape in a
  * loop, holding one parent descriptor at a time and closing the previous one as it goes; the fast path is that
  * shape once, with the platform's one-call open in the middle. Every system call goes through calls.h (the two
  * opens that are the walk's own, the root by path and the platform's one-call open, keep the same shape
@@ -32,9 +34,19 @@
 /* ---- Constants ---------------------------------------------------------------------------------------------- */
 
 enum : int32_t {
-    /* How a directory is opened to walk through it: never for writing, never inherited by a child process. */
-    directory_open_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC
+    /* How a directory is opened to read its entries: never for writing, never inherited by a child process. */
+    directory_read_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC
 };
+
+/* How a directory is opened for `access`: to walk through it, the platform's search-only flags (O_SEARCH,
+ * O_PATH), so that a directory the process may enter but not list is a parent like any other; to list it,
+ * read-only, since fdopendir takes nothing less. */
+static int open_flags_for(int32_t access) {
+    if (access == bc_file_system_directory_access_read) {
+        return directory_read_flags;
+    }
+    return bc_file_system_platform_directory_search_open_flags();
+}
 
 /* ---- The errno mapping -------------------------------------------------------------------------------------- */
 
@@ -98,7 +110,7 @@ static bc_file_system_call_outcome open_root(bc_file_system_engine *engine, int3
             outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
-        const int opened = open("/", directory_open_flags);
+        const int opened = open("/", bc_file_system_platform_directory_search_open_flags());
         if (opened >= 0) {
             *descriptor = opened;
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
@@ -124,7 +136,8 @@ static bc_file_system_call_outcome open_beneath_in_one_call(bc_file_system_engin
             outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
-        const int code = bc_file_system_platform_open_beneath(held, relative, directory_open_flags, descriptor);
+        const int code = bc_file_system_platform_open_beneath(
+            held, relative, bc_file_system_platform_directory_search_open_flags(), descriptor);
         if (code == 0) {
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
@@ -174,6 +187,13 @@ static bool is_final_symlink_choice(int32_t final_symlink) {
     return final_symlink == bc_file_system_final_symlink_follow;
 }
 
+static bool is_directory_access_choice(int32_t access) {
+    if (access == bc_file_system_directory_access_search) {
+        return true;
+    }
+    return access == bc_file_system_directory_access_read;
+}
+
 int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32_t operation, int parent,
                                             const char *name, int32_t final_symlink,
                                             bc_file_system_expected_entry *expected, bc_file_system_error *error) {
@@ -200,20 +220,20 @@ int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32
 }
 
 int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *engine, int32_t operation, int parent,
-                                                       const char *name, int32_t final_symlink,
+                                                       const char *name, int32_t final_symlink, int32_t access,
                                                        const bc_file_system_expected_entry *expected,
                                                        owned_descriptor *opened, bc_file_system_error *error) {
     if (error == nullptr) {
         return bc_file_system_error_kind_invalid_argument;
     }
     if (engine == nullptr || parent < 0 || name == nullptr || !is_final_symlink_choice(final_symlink) ||
-        expected == nullptr || opened == nullptr || opened->value != -1) {
+        !is_directory_access_choice(access) || expected == nullptr || opened == nullptr || opened->value != -1) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     /* O_NOFOLLOW is what makes a refusing open refuse: with O_DIRECTORY beside it a symlink answers ENOTDIR on
      * macOS and Linux alike (ELOOP without O_DIRECTORY), which the mapping above reads as the refusal. */
-    const int flags =
-        final_symlink == bc_file_system_final_symlink_refuse ? directory_open_flags | O_NOFOLLOW : directory_open_flags;
+    const int flags = final_symlink == bc_file_system_final_symlink_refuse ? open_flags_for(access) | O_NOFOLLOW
+                                                                           : open_flags_for(access);
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor candidate = {.value = -1};
     const bc_file_system_call_outcome outcome =
         bc_file_system_call_openat(engine, operation, parent, name, flags, &candidate.value);
@@ -252,7 +272,8 @@ static int32_t walk(bc_file_system_engine *engine, int32_t operation, const uint
         }
         [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor child = {.value = -1};
         kind = bc_file_system_resolve_open_expected_directory(engine, operation, resolved->parent, (const char *)name,
-                                                              final_symlink, &expected, &child, error);
+                                                              final_symlink, bc_file_system_directory_access_search,
+                                                              &expected, &child, error);
         if (kind != 0) {
             return kind;
         }

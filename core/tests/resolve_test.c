@@ -879,7 +879,8 @@ static void expect_race(report *tally, const fixture *tree, swap_kind kind, int3
     }
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
     const int32_t kind_answered = bc_file_system_resolve_open_expected_directory(
-        engine, operation, a.value, "b", bc_file_system_final_symlink_refuse, &expected, &opened, &error);
+        engine, operation, a.value, "b", bc_file_system_final_symlink_refuse, bc_file_system_directory_access_search,
+        &expected, &opened, &error);
     expect(tally, kind_answered == expected_kind, what, "");
     if (expected_kind == 0) {
         struct stat b;

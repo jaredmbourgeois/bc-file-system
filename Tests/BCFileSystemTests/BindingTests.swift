@@ -119,60 +119,73 @@ struct BindingTests {
         #expect(achieved == .durable)
     }
 
+    /// The directory operations are real: each one reaches the core and its answer comes back through the face.
     @Test func createDirectoryReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.createDirectory, path: observed.root.absolutePath(of: "folder")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.createDirectory(try observed.location("folder"), permissions: .exactly(mode: 0o755))
-        }
+
+        try observed.fileSystem.createDirectory(try observed.location("folder"), permissions: .exactly(mode: 0o755))
+
+        #expect(try observed.root.rawMode(of: "folder") == 0o755)
     }
 
     @Test func createDirectoriesReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.createDirectories, path: observed.root.absolutePath(of: "a/b/c")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.createDirectories(
-                try observed.location("a/b/c"), permissions: .exactly(mode: 0o755))
-        }
+
+        try observed.fileSystem.createDirectories(try observed.location("a/b/c"), permissions: .exactly(mode: 0o755))
+
+        #expect(try observed.root.rawMode(of: "a/b/c") == 0o755)
     }
 
     @Test func listDirectoryReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.listDirectory, path: observed.root.absolutePath(of: "folder")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.listDirectory(try observed.location("folder"), finalSymlink: .refuse)
-        }
+        try observed.root.rawMakeDirectory("folder", mode: 0o755)
+        try observed.root.rawWrite("content", to: "folder/file", mode: 0o644)
+
+        let entries = try observed.fileSystem.listDirectory(try observed.location("folder"), finalSymlink: .refuse)
+
+        #expect(entries == [Entry(entryType: .regularFile, name: Array("file".utf8))])
     }
 
     @Test func removeFileReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.removeFile, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.removeFile(try observed.location("file"))
-        }
+        try observed.root.rawWrite("content", to: "file", mode: 0o644)
+
+        let removed = try observed.fileSystem.removeFile(try observed.location("file"))
+
+        #expect(removed == true)
+        #expect(observed.root.rawExists("file") == false)
     }
 
     @Test func removeDirectoryReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.removeDirectory, path: observed.root.absolutePath(of: "folder")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.removeDirectory(try observed.location("folder"))
-        }
+        try observed.root.rawMakeDirectory("folder", mode: 0o755)
+
+        let removed = try observed.fileSystem.removeDirectory(try observed.location("folder"))
+
+        #expect(removed == true)
+        #expect(observed.root.rawExists("folder") == false)
     }
 
     @Test func removeTreeReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.removeTree, path: observed.root.absolutePath(of: "tree")) { () throws(FileSystemError) in
-            try observed.fileSystem.removeTree(try observed.location("tree"))
-        }
+        try observed.root.rawMakeDirectory("tree", mode: 0o755)
+        try observed.root.rawWrite("content", to: "tree/file", mode: 0o644)
+
+        let removed = try observed.fileSystem.removeTree(try observed.location("tree"))
+
+        #expect(removed == true)
+        #expect(observed.root.rawExists("tree") == false)
     }
 
     @Test func createTemporaryDirectoryReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.createTemporaryDirectory, path: observed.root.absolutePath(of: "parent")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.createTemporaryDirectory(
-                in: try observed.location("parent"), permissions: .exactly(mode: 0o700))
-        }
+        try observed.root.rawMakeDirectory("parent", mode: 0o755)
+
+        let name = try observed.fileSystem.createTemporaryDirectory(
+            in: try observed.location("parent"), permissions: .exactly(mode: 0o700))
+
+        #expect(name.isEmpty == false)
+        #expect(try observed.root.rawMode(of: "parent/" + String(decoding: name, as: UTF8.self)) == 0o700)
     }
 
     /// A rename's error names the destination (the face's convention for the two-location operations).
@@ -195,9 +208,11 @@ struct BindingTests {
 
     @Test func setPermissionsReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.setPermissions, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.setPermissions(try observed.location("file"), mode: 0o600, finalSymlink: .refuse)
-        }
+        try observed.root.rawWrite("content", to: "file", mode: 0o644)
+
+        try observed.fileSystem.setPermissions(try observed.location("file"), mode: 0o600, finalSymlink: .refuse)
+
+        #expect(try observed.root.rawMode(of: "file") == 0o600)
     }
 
     @Test func createSymlinkReachesC() throws {
@@ -414,14 +429,15 @@ struct BindingTests {
             (bc_file_system_step_identity_check, .identityCheck),
             (bc_file_system_step_openat2, .openat2),
             (bc_file_system_step_openat_nofollow_any, .openatNofollowAny),
+            (bc_file_system_step_fchmodat, .fchmodat),
         ]
         for (core, step) in pairs {
             #expect(Step(rawValue: Int32(core.rawValue)) == step)
         }
         #expect(Step.allCases.count == pairs.count)
-        #expect(Step.allCases.count == Int(bc_file_system_step_openat_nofollow_any.rawValue))
+        #expect(Step.allCases.count == Int(bc_file_system_step_fchmodat.rawValue))
         #expect(Step(rawValue: 0) == nil)
-        #expect(Step(rawValue: 26) == nil)
+        #expect(Step(rawValue: 27) == nil)
     }
 
     @Test func everySmallEnumIsPinnedToTheHeader() {

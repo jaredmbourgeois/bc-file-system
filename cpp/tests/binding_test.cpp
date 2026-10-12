@@ -275,36 +275,71 @@ TEST_F(BindingTest, SyncReachesC) {
     EXPECT_EQ(*achieved, Durability::durable);
 }
 
+// The directory operations are real: each one reaches the core and its answer comes back through the face.
 TEST_F(BindingTest, CreateDirectoryReachesC) {
-    expect_unsupported(files().create_directory(in("folder"), Permissions::exactly(0755)), Operation::create_directory,
-                       path_text_of("folder"));
+    const auto created = files().create_directory(in("folder"), Permissions::exactly(0755));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("folder")), 0755U);
 }
 
 TEST_F(BindingTest, CreateDirectoriesReachesC) {
-    expect_unsupported(files().create_directories(in("a/b/c"), Permissions::exactly(0755)),
-                       Operation::create_directories, path_text_of("a/b/c"));
+    const auto created = files().create_directories(in("a/b/c"), Permissions::exactly(0755));
+
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("a/b/c")), 0755U);
 }
 
 TEST_F(BindingTest, ListDirectoryReachesC) {
-    expect_unsupported(files().list_directory(in("folder"), FinalSymlink::refuse), Operation::list_directory,
-                       path_text_of("folder"));
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::write_raw(path_of("folder/file"), "content", 0644);
+
+    const auto entries = files().list_directory(in("folder"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(entries.has_value()) << entries.error().message();
+    EXPECT_THAT(*entries, ElementsAre(Entry{.entry_type = EntryType::regular_file, .name = "file"}));
 }
 
 TEST_F(BindingTest, RemoveFileReachesC) {
-    expect_unsupported(files().remove_file(in("file")), Operation::remove_file, path_text_of("file"));
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto removed = files().remove_file(in("file"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("file")));
 }
 
 TEST_F(BindingTest, RemoveDirectoryReachesC) {
-    expect_unsupported(files().remove_directory(in("folder")), Operation::remove_directory, path_text_of("folder"));
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const auto removed = files().remove_directory(in("folder"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("folder")));
 }
 
 TEST_F(BindingTest, RemoveTreeReachesC) {
-    expect_unsupported(files().remove_tree(in("tree")), Operation::remove_tree, path_text_of("tree"));
+    bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("tree/sub"), 0755);
+    bc::file_system_test::write_raw(path_of("tree/sub/file"), "content", 0644);
+
+    const auto removed = files().remove_tree(in("tree"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("tree")));
 }
 
 TEST_F(BindingTest, CreateTemporaryDirectoryReachesC) {
-    expect_unsupported(files().create_temporary_directory(in("parent"), Permissions::exactly(0700)),
-                       Operation::create_temporary_directory, path_text_of("parent"));
+    bc::file_system_test::make_directory_raw(path_of("parent"), 0755);
+
+    const auto name = files().create_temporary_directory(in("parent"), Permissions::exactly(0700));
+
+    ASSERT_TRUE(name.has_value()) << name.error().message();
+    EXPECT_FALSE(name->empty());
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("parent") / *name), 0700U);
 }
 
 // A rename's error names the destination (the face's convention for the two-location operations).
@@ -319,8 +354,12 @@ TEST_F(BindingTest, CopyFileReachesCAndNamesTheDestination) {
 }
 
 TEST_F(BindingTest, SetPermissionsReachesC) {
-    expect_unsupported(files().set_permissions(in("file"), 0600, FinalSymlink::refuse), Operation::set_permissions,
-                       path_text_of("file"));
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto changed = files().set_permissions(in("file"), 0600, FinalSymlink::refuse);
+
+    ASSERT_TRUE(changed.has_value()) << changed.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0600U);
 }
 
 TEST_F(BindingTest, CreateSymlinkReachesC) {
@@ -392,8 +431,7 @@ TEST_F(BindingTest, ReadFileGrowsItsBufferToAFileLargerThanTheFirstCapacity) {
     EXPECT_EQ(text_of(*bytes), large);
 }
 
-// stage 15 directories-in-c
-TEST_F(BindingTest, DISABLED_ListDirectoryGrowsItsArrayPastTheFirstCapacity) {
+TEST_F(BindingTest, ListDirectoryGrowsItsArrayPastTheFirstCapacity) {
     // The face offers room for 64 entries first.
     std::vector<std::string> expected;
     for (int number = 100; number < 200; ++number) {
@@ -531,7 +569,7 @@ TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
 }
 
 TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
-    const std::array<std::string_view, 25> names = {"open",
+    const std::array<std::string_view, 26> names = {"open",
                                                     "openat",
                                                     "fstat",
                                                     "fstatat",
@@ -555,7 +593,8 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
                                                     "close",
                                                     "identity_check",
                                                     "openat2",
-                                                    "openat_nofollow_any"};
+                                                    "openat_nofollow_any",
+                                                    "fchmodat"};
 
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto value = static_cast<std::int32_t>(index + 1);
@@ -565,7 +604,7 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
         EXPECT_EQ(name_of(*step), names[index]);
     }
     EXPECT_FALSE(bc::file_system::step_from(0).has_value());
-    EXPECT_FALSE(bc::file_system::step_from(26).has_value());
+    EXPECT_FALSE(bc::file_system::step_from(27).has_value());
 }
 
 // The small enums, each enumerator against the header's constant.
@@ -1195,8 +1234,7 @@ TEST_F(CoreBindingTest, DISABLED_ReadSymlinkFollowsTheSameProtocol) {
     EXPECT_EQ(std::string(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(length)), "target.txt");
 }
 
-// stage 15 directories-in-c
-TEST_F(CoreBindingTest, DISABLED_ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray) {
+TEST_F(CoreBindingTest, ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray) {
     bc::file_system_test::write_raw(path_of("a.txt"), "alpha", 0640);
     bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
     bc::file_system_test::make_symlink_raw("a.txt", path_of("link"));
@@ -1211,11 +1249,17 @@ TEST_F(CoreBindingTest, DISABLED_ListDirectoryReportsTheCapacityItNeedsThenFills
     EXPECT_EQ(with_no_array, bc_file_system_error_kind_buffer_too_small);
     EXPECT_EQ(count, 3U);
 
-    // One entry too few is still too small.
-    std::vector<bc_file_system_entry> entries(count);
+    // One entry too few is still too small, and nothing is stored into the array: the entries are counted
+    // before any is stored.
+    constexpr std::int32_t untouched = 99;
+    std::vector<bc_file_system_entry> entries(count, bc_file_system_entry{.entry_type = untouched});
     const std::int32_t one_short = bc_file_system_list_directory(
         engine(), &location, bc_file_system_final_symlink_refuse, entries.data(), entries.size() - 1, &count, &c_error);
     EXPECT_EQ(one_short, bc_file_system_error_kind_buffer_too_small);
+    EXPECT_EQ(count, 3U);
+    for (const bc_file_system_entry& entry : entries) {
+        EXPECT_EQ(entry.entry_type, untouched);
+    }
 
     const std::int32_t status = bc_file_system_list_directory(engine(), &location, bc_file_system_final_symlink_refuse,
                                                               entries.data(), entries.size(), &count, &c_error);
@@ -1232,8 +1276,7 @@ TEST_F(CoreBindingTest, DISABLED_ListDirectoryReportsTheCapacityItNeedsThenFills
     EXPECT_EQ(entries[2].entry_type, bc_file_system_entry_type_directory);
 }
 
-// stage 15 directories-in-c
-TEST_F(CoreBindingTest, DISABLED_ListDirectoryListsOneLevel) {
+TEST_F(CoreBindingTest, ListDirectoryListsOneLevel) {
     bc::file_system_test::make_directory_raw(path_of("sub"), 0755);
     bc::file_system_test::write_raw(path_of("sub/b.txt"), "bee", 0600);
     const std::string path = root_text();

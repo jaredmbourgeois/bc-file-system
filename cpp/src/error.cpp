@@ -181,6 +181,8 @@ auto name_of(Step step) noexcept -> std::string_view {
         return "openat2";
     case Step::openat_nofollow_any:
         return "openat_nofollow_any";
+    case Step::fchmodat:
+        return "fchmodat";
     }
     return "unknown";
 }
@@ -202,7 +204,7 @@ auto operation_from(std::int32_t value) noexcept -> std::optional<Operation> {
 }
 
 auto step_from(std::int32_t value) noexcept -> std::optional<Step> {
-    if (value >= bc_file_system_step_open && value <= bc_file_system_step_openat_nofollow_any) {
+    if (value >= bc_file_system_step_open && value <= bc_file_system_step_fchmodat) {
         return static_cast<Step>(value);
     }
     return std::nullopt;

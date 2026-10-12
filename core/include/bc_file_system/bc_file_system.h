@@ -187,7 +187,10 @@ typedef enum bc_file_system_step {
     bc_file_system_step_openat2 = 24,
     /* The Apple fast path of a `beneath` location: openat with O_NOFOLLOW_ANY over the whole relative path in
      * one call. The same scripted errnos make the engine walk instead. */
-    bc_file_system_step_openat_nofollow_any = 25
+    bc_file_system_step_openat_nofollow_any = 25,
+    /* fchmodat: the mode set by name under a held directory (with AT_SYMLINK_NOFOLLOW where the entry itself,
+     * never what a symlink points at, is meant), as opposed to `fchmod` on an open descriptor. */
+    bc_file_system_step_fchmodat = 26
 } bc_file_system_step;
 
 /* What to do when the last component of a path is a symlink. */

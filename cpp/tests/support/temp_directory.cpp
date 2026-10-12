@@ -125,6 +125,39 @@ auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> voi
     set_mode_raw(path, mode);
 }
 
+auto make_deep_chain_raw(const std::filesystem::path& root, std::uint32_t depth, std::string_view name) -> void {
+    const std::string component(name);
+    // One descriptor rolls down the chain: each level is made and opened beneath the one above, and the one
+    // above is closed, so planting holds two descriptors at most whatever the depth.
+    int current = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current < 0) {
+        ADD_FAILURE() << "open " << root << ": " << std::strerror(errno);
+        return;
+    }
+    for (std::uint32_t level = 0; level < depth; ++level) {
+        if (::mkdirat(current, component.c_str(), S_IRWXU) != 0) {
+            ADD_FAILURE() << "mkdirat level " << level << " of " << root << ": " << std::strerror(errno);
+            ::close(current);
+            return;
+        }
+        const int child = ::openat(current, component.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (child < 0) {
+            ADD_FAILURE() << "openat level " << level << " of " << root << ": " << std::strerror(errno);
+            ::close(current);
+            return;
+        }
+        ::close(current);
+        current = child;
+    }
+    const int bottom = ::openat(current, component.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (bottom < 0) {
+        ADD_FAILURE() << "create the file at the bottom of " << root << ": " << std::strerror(errno);
+    } else {
+        ::close(bottom);
+    }
+    ::close(current);
+}
+
 auto set_mode_raw(const std::filesystem::path& path, std::uint32_t mode) -> void {
     if (::chmod(path.c_str(), static_cast<mode_t>(mode)) != 0) {
         ADD_FAILURE() << "chmod " << path << ": " << std::strerror(errno);
@@ -208,6 +241,53 @@ FileSizeLimit::~FileSizeLimit() {
     if (::getrlimit(RLIMIT_FSIZE, &limit) == 0) {
         limit.rlim_cur = static_cast<rlim_t>(previous_limit_);
         ::setrlimit(RLIMIT_FSIZE, &limit);
+    }
+}
+
+UmaskGuard::UmaskGuard(std::uint32_t mask)
+    : previous_mask_(static_cast<std::uint32_t>(::umask(static_cast<mode_t>(mask)))) {}
+
+UmaskGuard::~UmaskGuard() {
+    ::umask(static_cast<mode_t>(previous_mask_));
+}
+
+auto descriptor_soft_limit() -> std::uint64_t {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        ADD_FAILURE() << "getrlimit: " << std::strerror(errno);
+        return 0;
+    }
+    return static_cast<std::uint64_t>(limit.rlim_cur);
+}
+
+DescriptorLimit::DescriptorLimit(std::uint64_t soft_limit) {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        ADD_FAILURE() << "getrlimit: " << std::strerror(errno);
+        return;
+    }
+    previous_limit_ = static_cast<std::uint64_t>(limit.rlim_cur);
+    if (soft_limit >= previous_limit_) {
+        ADD_FAILURE() << "a descriptor limit of " << soft_limit << " would not lower the one in force, "
+                      << previous_limit_;
+        return;
+    }
+    limit.rlim_cur = static_cast<rlim_t>(soft_limit);
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        ADD_FAILURE() << "setrlimit: " << std::strerror(errno);
+        return;
+    }
+    applied_ = true;
+}
+
+DescriptorLimit::~DescriptorLimit() {
+    if (!applied_) {
+        return;
+    }
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+        limit.rlim_cur = static_cast<rlim_t>(previous_limit_);
+        ::setrlimit(RLIMIT_NOFILE, &limit);
     }
 }
 

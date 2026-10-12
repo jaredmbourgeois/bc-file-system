@@ -6,19 +6,23 @@
  *
  * Where the library stands: the handles, the platform probes, the observer and the resolution layer are real,
  * and so are the operations that read (`bc_file_system_directory_open`, `bc_file_system_status_of`,
- * `bc_file_system_read_file`) and the ones that write (`bc_file_system_write_file`, staged and renamed into
- * place; `bc_file_system_append`; `bc_file_system_sync`); every other operation is an honest stub. Each one
- * validates its arguments exactly as the header promises (a contract violation is `invalid_argument` and
- * touches nothing) and announces itself to the observer; a stub then answers `unsupported` with the operation
- * named and the step zero, so every contract case is red for a stated reason until the stage that builds it. A
- * real operation resolves its location once through resolve.h to (parent descriptor, leaf name) and makes only
- * `*at` calls on that pair from then on, each through calls.h (behind the observer's `before_step`, asked again
- * on EINTR, the errno copied on the line after the call); every descriptor it holds is an owned_descriptor
- * under the cleanup idiom of owned.h, and a file it created and still owns is a staged_file under the same
- * idiom, unlinked on a failing path and kept on a stop.
+ * `bc_file_system_read_file`), the ones that write (`bc_file_system_write_file`, staged and renamed into
+ * place; `bc_file_system_append`; `bc_file_system_sync`) and the ones on directories (`create_directory`,
+ * `create_directories`, `list_directory`, `remove_file`, `remove_directory`, `remove_tree` on held descriptors
+ * with a bounded window, `create_temporary_directory`, `set_permissions`); every other operation is an honest
+ * stub. Each one validates its arguments exactly as the header promises (a contract violation is
+ * `invalid_argument` and touches nothing) and announces itself to the observer; a stub then answers
+ * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
+ * until the stage that builds it. A real operation resolves its location once through resolve.h to (parent
+ * descriptor, leaf name) and makes only `*at` calls on that pair from then on, each through calls.h (behind
+ * the observer's `before_step`, asked again on EINTR, the errno copied on the line after the call); every
+ * descriptor it holds is an owned_descriptor under the cleanup idiom of owned.h, a directory it reads is an
+ * owned_directory_stream, and a file or directory it created and still owns is a staged_file or a
+ * created_directory under the same idiom, unlinked on a failing path and kept on a stop.
  */
 #include <bc_file_system/bc_file_system.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -96,7 +100,10 @@ enum : uint32_t {
     most_symlinks_followed = 32,
     /* The mode a staged file is created with: nobody else may read it before it is given its mode and renamed
      * into place. */
-    staged_file_mode = 0600
+    staged_file_mode = 0600,
+    /* The mode a directory is created with before it is given its own: nobody else may enter it in between,
+     * and widening to the stated mode is the one direction a mode is ever changed in on creation. */
+    directory_create_mode = 0700
 };
 
 /* The infix of a staged file's name (`.<leaf>.bc-tmp-<process id>-<token>`); a later stage decides whether the
@@ -126,14 +133,17 @@ enum : int32_t {
     append_create_flags = O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
     append_open_flags = O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
     /* How a file or directory is opened to be synced: a directory opens read-only, a symlink is refused. */
-    sync_open_flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+    sync_open_flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+    /* How a directory the walk holds for search is opened again to be synced: read-only, as `.` beneath it,
+     * because a search-only descriptor (O_PATH on Linux) cannot be synced. */
+    directory_read_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC
 };
 
 /* The last enumerator of each closed enum, so a range check reads `is_in_enum(value, operation_last)`. Every
  * enum in the header runs from 1 to its last value without a gap. */
 enum : int32_t {
     operation_last = bc_file_system_operation_path_library_name,
-    step_last = bc_file_system_step_openat_nofollow_any,
+    step_last = bc_file_system_step_fchmodat,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
     read_limit_kind_last = bc_file_system_read_limit_kind_at_most,
@@ -473,7 +483,8 @@ int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_fi
             return kind;
         }
         kind = bc_file_system_resolve_open_expected_directory(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, final_symlink, &expected, &opened, error);
+            engine, operation, resolved.parent, (const char *)resolved.leaf, final_symlink,
+            bc_file_system_directory_access_search, &expected, &opened, error);
         if (kind != 0) {
             return kind;
         }
@@ -949,6 +960,27 @@ static int32_t sync_after_change(bc_file_system_engine *engine, int32_t operatio
     return 0;
 }
 
+/* The sync of the directory a change is now visible in (a staged file renamed into place; an append's new
+ * name). The parent the walk holds is open for search only, which a sync cannot use (fsync of an O_PATH
+ * descriptor is EBADF on Linux), so the directory is opened again, read-only, as `.` beneath it; a directory
+ * the process may enter but not read cannot be synced by it, and that lowers the answer to `written` like a
+ * sync that fails, because the change happened. Only a stop ends the operation. */
+static int32_t sync_directory_after_change(bc_file_system_engine *engine, int32_t operation, int parent,
+                                           int32_t *achieved, bc_file_system_error *error) {
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor directory = {.value = -1};
+    const bc_file_system_call_outcome opened =
+        bc_file_system_call_openat(engine, operation, parent, ".", directory_read_flags, &directory.value);
+    if (opened.stopped) {
+        return report_outcome(error, operation, bc_file_system_step_openat, &opened,
+                              bc_file_system_error_kind_io_failed);
+    }
+    if (!opened.succeeded) {
+        *achieved = bc_file_system_durability_written; /* discard-ok: lowers the answer, never raises an error */
+        return 0;
+    }
+    return sync_after_change(engine, operation, directory.value, achieved, error);
+}
+
 /* ---- write_file ---------------------------------------------------------------------------------------------- */
 
 /* What the write found at its destination before staging anything: nothing, or a regular file with its mode. */
@@ -1202,7 +1234,7 @@ int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_s
     }
     /* The directory's sync makes the new name itself durable; the parent the walk holds is the directory. */
     if (achieved == bc_file_system_durability_durable) {
-        kind = sync_after_change(engine, operation, resolved.parent, &achieved, error);
+        kind = sync_directory_after_change(engine, operation, resolved.parent, &achieved, error);
         if (kind != 0) {
             return kind;
         }
@@ -1318,7 +1350,7 @@ int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_syste
             achieved = bc_file_system_durability_written; /* discard-ok: lowers the answer, never an error */
         }
         if (is_new && achieved == bc_file_system_durability_durable) {
-            kind = sync_after_change(engine, operation, resolved.parent, &achieved, error);
+            kind = sync_directory_after_change(engine, operation, resolved.parent, &achieved, error);
             if (kind != 0) {
                 return kind;
             }
@@ -1374,12 +1406,149 @@ int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_
                           bc_file_system_call_kind_of_errno(synced.code));
 }
 
-/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+/* ---- Directories --------------------------------------------------------------------------------------------- */
 
-/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
- * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
- * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
- * names. */
+/* The prefix of a temporary directory's name (`tmp-<process id>-<token>`): the engine's counter makes it
+ * unique, as it does a staged file's name, and it carries no `.bc-` infix because the directory is the
+ * caller's to keep or remove, never a sweep's. */
+static const char temporary_directory_prefix[] = "tmp-";
+
+/* The most a temporary directory's name holds: the prefix, the process id, the dash and the token. */
+enum : size_t {
+    temporary_name_capacity =
+        (sizeof temporary_directory_prefix - 1) + decimal_digit_capacity + 1 + decimal_digit_capacity
+};
+static_assert(temporary_name_capacity <= NAME_MAX, "a temporary directory's name must be one component");
+
+/* Whether a platform answered that a flag it was given has no meaning here (ENOTSUP, EOPNOTSUPP: one number
+ * on Linux, two on macOS, so an if-chain). */
+static bool means_flag_unsupported(int code) {
+    if (code == ENOTSUP) {
+        return true;
+    }
+    return code == EOPNOTSUPP;
+}
+
+/* A directory this operation created in `parent` under `name` and still owns, until it has its mode: declared
+ * under `[[gnu::cleanup(discard_created_directory)]]`, so a failing path removes it again (a directory with a
+ * mode nobody chose is never left behind) and a stop keeps it, as a kill would. */
+typedef struct created_directory {
+    int parent;                 /* borrowed: the directory it was created in */
+    uint8_t name[NAME_MAX + 1]; /* NUL-terminated */
+    bool created;
+    bool kept;
+} created_directory;
+
+static created_directory created_directory_in(int parent, const uint8_t *name) {
+    created_directory created = {.parent = parent, .name = {}, .created = false, .kept = false};
+    memcpy(created.name, name, strlen((const char *)name));
+    return created;
+}
+
+/* The cleanup: the removal is best effort after the real error, and nothing it could report changes it. */
+static void discard_created_directory(created_directory *created) {
+    if (!created->created || created->kept) {
+        return;
+    }
+    (void)unlinkat(created->parent, (const char *)created->name, AT_REMOVEDIR); /* discard-ok: after the error */
+    created->created = false;
+}
+
+/* The one place an operation holding a created directory reads a verdict: a stop keeps the directory, as a
+ * kill would, and is reported as every stop is. */
+static int32_t report_created_outcome(created_directory *created, bc_file_system_error *error, int32_t operation,
+                                      int32_t step, const bc_file_system_call_outcome *outcome, int32_t kind) {
+    if (outcome->stopped) {
+        created->kept = true;
+    }
+    return report_outcome(error, operation, step, outcome, kind);
+}
+
+/* Sets the mode of `name` under `parent` exactly, on the entry itself and never on what a symlink points at.
+ * The first way is `fchmodat` with AT_SYMLINK_NOFOLLOW, which Apple platforms honour on every entry and
+ * which glibc since 2.32 and musl honour on everything but a symlink (through the fchmodat2 call where the
+ * kernel has it, else through an O_PATH descriptor and /proc); a libc that cannot honour the flag answers
+ * ENOTSUP or EOPNOTSUPP, and then the entry is opened without following (a symlink answers ELOOP, which the
+ * table reads as `symlink_refused`) and `fchmod` sets the mode on the descriptor. Answers the outcome of the
+ * call that decided, with `*failed_step` naming it when it failed. */
+static bc_file_system_call_outcome set_mode_never_following(bc_file_system_engine *engine, int32_t operation,
+                                                            int parent, const char *name, uint32_t mode,
+                                                            int32_t *failed_step) {
+    const bc_file_system_call_outcome by_name =
+        bc_file_system_call_fchmodat(engine, operation, parent, name, mode, AT_SYMLINK_NOFOLLOW);
+    if (by_name.succeeded) {
+        return by_name;
+    }
+    if (by_name.stopped || !means_flag_unsupported(by_name.code)) {
+        *failed_step = bc_file_system_step_fchmodat;
+        return by_name;
+    }
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor entry = {.value = -1};
+    const bc_file_system_call_outcome opened =
+        bc_file_system_call_openat(engine, operation, parent, name, file_read_flags | O_NOFOLLOW, &entry.value);
+    if (!opened.succeeded) {
+        *failed_step = bc_file_system_step_openat;
+        return opened;
+    }
+    const bc_file_system_call_outcome changed = bc_file_system_call_fchmod(engine, operation, entry.value, mode);
+    if (!changed.succeeded) {
+        *failed_step = bc_file_system_step_fchmod;
+    }
+    return changed;
+}
+
+/* The one call that makes a directory, in the shape every creating operation uses: made with a private mode
+ * first (nobody else may enter it before it has its own), then given the stated mode exactly, whatever the
+ * umask left. `created` must name the parent and the name and hold nothing yet. */
+static int32_t make_directory_with_mode(bc_file_system_engine *engine, int32_t operation, created_directory *created,
+                                        uint32_t mode, bc_file_system_error *error) {
+    const char *name = (const char *)created->name;
+    const bc_file_system_call_outcome made =
+        bc_file_system_call_mkdirat(engine, operation, created->parent, name, directory_create_mode);
+    if (!made.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_mkdirat, &made,
+                              bc_file_system_call_kind_of_errno(made.code));
+    }
+    created->created = true;
+    int32_t failed_step = 0;
+    const bc_file_system_call_outcome mode_set =
+        set_mode_never_following(engine, operation, created->parent, name, mode, &failed_step);
+    if (!mode_set.succeeded) {
+        return report_created_outcome(created, error, operation, failed_step, &mode_set,
+                                      bc_file_system_call_kind_of_errno(mode_set.code));
+    }
+    created->kept = true;
+    return 0;
+}
+
+/* Opens the directory a resolved location names, for `access`, bracketed by the identity check like every
+ * component before it: the leaf under the caller's choice about a final symlink, or, for the root, `.` beneath
+ * the descriptor the walk opened (which is open for search, and a listing needs more). */
+static int32_t open_resolved_directory(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_resolved *resolved, int32_t final_symlink, int32_t access,
+                                       bc_file_system_expected_entry *expected, owned_descriptor *opened,
+                                       bc_file_system_error *error) {
+    const char *name = resolved->leaf_length == 0 ? "." : (const char *)resolved->leaf;
+    const int32_t kind =
+        bc_file_system_resolve_expect_entry(engine, operation, resolved->parent, name, final_symlink, expected, error);
+    if (kind != 0) {
+        return kind;
+    }
+    return bc_file_system_resolve_open_expected_directory(engine, operation, resolved->parent, name, final_symlink,
+                                                          access, expected, opened, error);
+}
+
+/* The choice a location makes about a symlink on its way: an `at` path is the system's to resolve, a
+ * `beneath` path may hold no symlink at all. What an operation without a `final_symlink` of its own applies to
+ * the directory it was handed. */
+static int32_t symlink_choice_of(const bc_file_system_location *location) {
+    if (location->kind == bc_file_system_location_kind_at) {
+        return bc_file_system_final_symlink_follow;
+    }
+    return bc_file_system_final_symlink_refuse;
+}
+
+/* ---- create_directory ---------------------------------------------------------------------------------------- */
 
 int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
                                         const bc_file_system_permissions *permissions, bc_file_system_error *error) {
@@ -1391,7 +1560,65 @@ int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root is always there. A final symlink has no meaning for a creation: the name must be free, and a
+     * symlink holding it is something already there, which mkdirat answers EEXIST for. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_already_exists, operation);
+    }
+    [[gnu::cleanup(discard_created_directory)]] created_directory created =
+        created_directory_in(resolved.parent, resolved.leaf);
+    const int32_t made = make_directory_with_mode(engine, operation, &created, permissions->mode, error);
+    if (made != 0) {
+        return made;
+    }
+    return succeed(error);
+}
+
+/* ---- create_directories -------------------------------------------------------------------------------------- */
+
+/* Whether a failed creation was mkdirat answering EEXIST: the name is held by something now. */
+static bool name_was_taken(int32_t kind, const bc_file_system_error *error) {
+    if (kind != bc_file_system_error_kind_already_exists) {
+        return false;
+    }
+    if (error->step != bc_file_system_step_mkdirat) {
+        return false;
+    }
+    return error->system_code == EEXIST;
+}
+
+/* One component of the chain: opened as a directory when it is there (bracketed like a walk's component, the
+ * system resolving a symlink under `at` and `beneath` refusing one), made with the mode and then opened when
+ * it is not. `*child` receives the opened directory. */
+static int32_t open_or_create_component(bc_file_system_engine *engine, int32_t operation, int parent,
+                                        const uint8_t *name, int32_t final_symlink, uint32_t mode,
+                                        owned_descriptor *child, bc_file_system_error *error) {
+    bc_file_system_expected_entry expected;
+    int32_t kind = bc_file_system_resolve_expect_entry(engine, operation, parent, (const char *)name, final_symlink,
+                                                       &expected, error);
+    if (kind == bc_file_system_error_kind_not_found) {
+        [[gnu::cleanup(discard_created_directory)]] created_directory created = created_directory_in(parent, name);
+        kind = make_directory_with_mode(engine, operation, &created, mode, error);
+        /* A name taken since the stat (this chain being made twice at once) is one that is there now, and what
+         * is there is judged below like anything else; every other failure is the operation's. */
+        if (kind != 0 && !name_was_taken(kind, error)) {
+            return kind;
+        }
+        kind = bc_file_system_resolve_expect_entry(engine, operation, parent, (const char *)name, final_symlink,
+                                                   &expected, error);
+    }
+    if (kind != 0) {
+        return kind;
+    }
+    return bc_file_system_resolve_open_expected_directory(engine, operation, parent, (const char *)name, final_symlink,
+                                                          bc_file_system_directory_access_search, &expected, child,
+                                                          error);
 }
 
 int32_t bc_file_system_create_directories(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -1404,7 +1631,202 @@ int32_t bc_file_system_create_directories(bc_file_system_engine *engine, const b
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    /* The chain is walked from where the location starts, the root or the held directory, component by
+     * component, each one opened when it is there and made when it is not; so a parent that is missing is
+     * made on the way, which is what this operation is for, and an existing one is left as it is. */
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved start = bc_file_system_resolved_empty();
+    int current = -1;
+    if (location->kind == bc_file_system_location_kind_at) {
+        const bc_file_system_location root = bc_file_system_location_at((const uint8_t *)"/", 1);
+        const int32_t kind = bc_file_system_resolve(engine, operation, &root, &start, error);
+        if (kind != 0) {
+            return kind;
+        }
+        current = start.parent;
+    } else {
+        if (!bc_file_system_platform_enforces_containment()) {
+            return refuse(error, bc_file_system_error_kind_unsupported, operation);
+        }
+        current = location->directory->descriptor;
+    }
+    const int32_t final_symlink = symlink_choice_of(location);
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor held = {.value = -1};
+    size_t cursor = 0;
+    size_t offset = 0;
+    size_t component_length = 0;
+    while (bc_file_system_path_text_next_component(location->path, location->length, &cursor, &offset,
+                                                   &component_length)) {
+        uint8_t name[NAME_MAX + 1] = {};
+        memcpy(name, location->path + offset, component_length);
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor child = {.value = -1};
+        const int32_t kind =
+            open_or_create_component(engine, operation, current, name, final_symlink, permissions->mode, &child, error);
+        if (kind != 0) {
+            return kind;
+        }
+        adopt_descriptor(&held, &child);
+        current = held.value;
+    }
+    return succeed(error);
+}
+
+/* ---- list_directory ------------------------------------------------------------------------------------------ */
+
+/* The next entry of the stream that is not `.` or `..`, or none at the end. The name is copied out before the
+ * next call, as the stream owns it. */
+static int32_t next_entry_name(bc_file_system_engine *engine, int32_t operation, DIR *stream, uint8_t *name,
+                               size_t *name_length, unsigned char *entry_type, bool *found,
+                               bc_file_system_error *error) {
+    for (;;) {
+        struct dirent *entry = nullptr;
+        const bc_file_system_call_outcome read = bc_file_system_call_readdir(engine, operation, stream, &entry);
+        if (!read.succeeded) {
+            return report_outcome(error, operation, bc_file_system_step_readdir, &read,
+                                  bc_file_system_call_kind_of_errno(read.code));
+        }
+        if (entry == nullptr) {
+            *found = false;
+            return 0;
+        }
+        const size_t length = strlen(entry->d_name);
+        if (length == 1 && entry->d_name[0] == '.') {
+            continue;
+        }
+        if (length == 2 && entry->d_name[0] == '.' && entry->d_name[1] == '.') {
+            continue;
+        }
+        /* NAME_MAX bounds every name the system answers; a longer one would be the system breaking its word. */
+        if (length > NAME_MAX) {
+            return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+        }
+        memcpy(name, entry->d_name, length);
+        name[length] = 0;
+        *name_length = length;
+        *entry_type = entry->d_type;
+        *found = true;
+        return 0;
+    }
+}
+
+/* What a directory stream says an entry is, from the advisory d_type; `DT_UNKNOWN` means the file system did
+ * not say and the entry is asked with fstatat, never followed. */
+static int32_t entry_type_of_listed(bc_file_system_engine *engine, int32_t operation, int directory, const char *name,
+                                    unsigned char d_type, int32_t *entry_type, bool *present,
+                                    bc_file_system_error *error) {
+    *present = true;
+    if (d_type == DT_REG) {
+        *entry_type = bc_file_system_entry_type_regular_file;
+        return 0;
+    }
+    if (d_type == DT_DIR) {
+        *entry_type = bc_file_system_entry_type_directory;
+        return 0;
+    }
+    if (d_type == DT_LNK) {
+        *entry_type = bc_file_system_entry_type_symlink;
+        return 0;
+    }
+    if (d_type != DT_UNKNOWN) {
+        *entry_type = bc_file_system_entry_type_other;
+        return 0;
+    }
+    struct stat info;
+    const bc_file_system_call_outcome outcome =
+        bc_file_system_call_fstatat(engine, operation, directory, name, AT_SYMLINK_NOFOLLOW, &info);
+    if (!outcome.succeeded) {
+        /* An entry removed between the read and the stat is not part of the listing. */
+        if (!outcome.stopped && outcome.code == ENOENT) {
+            *present = false;
+            return 0;
+        }
+        const int32_t kind = report_outcome(error, operation, bc_file_system_step_fstatat, &outcome,
+                                            bc_file_system_call_kind_of_errno(outcome.code));
+        const size_t length = strlen(name);
+        memcpy(error->name, name, length);
+        error->name_length = (uint32_t)length;
+        return kind;
+    }
+    *entry_type = entry_type_of(info.st_mode);
+    return 0;
+}
+
+/* The order of a listing: by name bytes, a shorter name before a longer one it is a prefix of; qsort's
+ * comparator. */
+static int compare_entry_names(const void *left, const void *right) {
+    const bc_file_system_entry *first = left;
+    const bc_file_system_entry *second = right;
+    const size_t shorter = first->name_length < second->name_length ? first->name_length : second->name_length;
+    const int order = memcmp(first->name, second->name, shorter);
+    if (order != 0) {
+        return order;
+    }
+    if (first->name_length < second->name_length) {
+        return -1;
+    }
+    if (first->name_length > second->name_length) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Counts the entries of the stream, from its start to its end. */
+static int32_t count_entries(bc_file_system_engine *engine, int32_t operation, DIR *stream, size_t *total,
+                             bc_file_system_error *error) {
+    *total = 0;
+    for (;;) {
+        uint8_t name[NAME_MAX + 1];
+        size_t name_length = 0;
+        unsigned char d_type = DT_UNKNOWN;
+        bool found = false;
+        const int32_t kind = next_entry_name(engine, operation, stream, name, &name_length, &d_type, &found, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (!found) {
+            return 0;
+        }
+        *total += 1;
+    }
+}
+
+/* Stores the entries of the stream into the caller's array, at most `capacity` of them, and counts every one:
+ * `*seen` above `capacity` means the directory grew since it was counted. */
+static int32_t store_entries(bc_file_system_engine *engine, int32_t operation, DIR *stream,
+                             bc_file_system_entry *entries, size_t capacity, size_t *seen,
+                             bc_file_system_error *error) {
+    *seen = 0;
+    for (;;) {
+        uint8_t name[NAME_MAX + 1];
+        size_t name_length = 0;
+        unsigned char d_type = DT_UNKNOWN;
+        bool found = false;
+        int32_t kind = next_entry_name(engine, operation, stream, name, &name_length, &d_type, &found, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (!found) {
+            return 0;
+        }
+        if (*seen >= capacity) {
+            *seen += 1;
+            continue;
+        }
+        int32_t entry_type = 0;
+        bool present = false;
+        kind = entry_type_of_listed(engine, operation, dirfd(stream), (const char *)name, d_type, &entry_type, &present,
+                                    error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (!present) {
+            continue;
+        }
+        bc_file_system_entry *stored = &entries[*seen];
+        *stored = (bc_file_system_entry){.entry_type = entry_type, .name_length = (uint32_t)name_length, .name = {}};
+        memcpy(stored->name, name, name_length);
+        *seen += 1;
+    }
 }
 
 int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -1419,8 +1841,63 @@ int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_fi
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The directory is opened read-only, which a listing needs and the walk's search-only open does not give,
+     * bracketed like every component before it; the stream then owns the descriptor. */
+    bc_file_system_expected_entry expected;
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    kind = open_resolved_directory(engine, operation, &resolved, final_symlink, bc_file_system_directory_access_read,
+                                   &expected, &opened, error);
+    if (kind != 0) {
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_directory_stream)]] owned_directory_stream stream = {.value = nullptr};
+    const bc_file_system_call_outcome streamed =
+        bc_file_system_call_fdopendir(engine, operation, opened.value, &stream.value);
+    if (!streamed.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fdopendir, &streamed,
+                              bc_file_system_call_kind_of_errno(streamed.code));
+    }
+    (void)release_descriptor(&opened);
+    /* The entries are counted first, so a listing the caller's array cannot hold stores nothing and answers
+     * the count it needs; then the stream is read again from its start and the entries stored. A directory
+     * that grew in between is answered `buffer_too_small` again, with its new count, so the face's bounded
+     * grow loop is the only retry. A listing is complete or it is an error: nothing stored on the way is an
+     * answer. */
+    size_t total = 0;
+    kind = count_entries(engine, operation, stream.value, &total, error);
+    if (kind != 0) {
+        return kind;
+    }
+    if (total > capacity) {
+        *count = total;
+        return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+    }
+    rewinddir(stream.value);
+    size_t seen = 0;
+    kind = store_entries(engine, operation, stream.value, entries, capacity, &seen, error);
+    if (kind != 0) {
+        return kind;
+    }
+    if (seen > capacity) {
+        *count = seen;
+        return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+    }
+    /* Sorted by name bytes so the listing is the same on every run and every platform: qsort, which the hosted
+     * tier may use, over the caller's own array. */
+    if (seen > 1) {
+        qsort(entries, seen, sizeof entries[0], compare_entry_names);
+    }
+    *count = seen;
+    return succeed(error);
 }
+
+/* ---- remove_file and remove_directory ----------------------------------------------------------------------- */
 
 int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_system_location *location,
                                    int32_t *existed, bc_file_system_error *error) {
@@ -1432,7 +1909,59 @@ int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (resolution != 0) {
+        if (means_absence(resolution)) {
+            *existed = 0;
+            return succeed(error);
+        }
+        return resolution;
+    }
+    /* The root is a directory. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_not_regular_file, operation);
+    }
+    /* unlinkat without AT_REMOVEDIR removes a file or a symlink (the link itself, never what it points at) and
+     * refuses a directory: EISDIR on Linux, EPERM on Apple platforms, where EPERM also means what it means
+     * everywhere, so a look at the entry tells the two apart. */
+    const bc_file_system_call_outcome removed =
+        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)resolved.leaf, 0);
+    if (removed.succeeded) {
+        *existed = 1;
+        return succeed(error);
+    }
+    if (!removed.stopped && removed.code == ENOENT) {
+        *existed = 0;
+        return succeed(error);
+    }
+    int32_t kind = bc_file_system_call_kind_of_errno(removed.code);
+    if (!removed.stopped && removed.code == EPERM) {
+        struct stat info;
+        const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
+            engine, operation, resolved.parent, (const char *)resolved.leaf, AT_SYMLINK_NOFOLLOW, &info);
+        if (!looked.succeeded) {
+            return report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
+                                  bc_file_system_call_kind_of_errno(looked.code));
+        }
+        if (S_ISDIR(info.st_mode)) {
+            kind = bc_file_system_error_kind_not_regular_file;
+        }
+    }
+    return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed, kind);
+}
+
+/* The kind a refused directory removal decides: a directory with entries is `directory_not_empty` (ENOTEMPTY,
+ * or EEXIST where the system spells it that way), anything else is the table's. */
+static int32_t kind_of_directory_removal_failure(int code) {
+    if (code == ENOTEMPTY) {
+        return bc_file_system_error_kind_directory_not_empty;
+    }
+    if (code == EEXIST) {
+        return bc_file_system_error_kind_directory_not_empty;
+    }
+    return bc_file_system_call_kind_of_errno(code);
 }
 
 int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -1445,7 +1974,370 @@ int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (resolution != 0) {
+        if (means_absence(resolution)) {
+            *existed = 0;
+            return succeed(error);
+        }
+        return resolution;
+    }
+    /* The root of the file system is refused, as it is for a tree. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    const bc_file_system_call_outcome removed =
+        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)resolved.leaf, AT_REMOVEDIR);
+    if (removed.succeeded) {
+        *existed = 1;
+        return succeed(error);
+    }
+    if (!removed.stopped && removed.code == ENOENT) {
+        *existed = 0;
+        return succeed(error);
+    }
+    return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
+                          kind_of_directory_removal_failure(removed.code));
+}
+
+/* ---- remove_tree --------------------------------------------------------------------------------------------- */
+
+enum : uint32_t {
+    /* How many levels below the top of the tree the removal holds open at once. A process under launchd starts
+     * with 256 descriptors, so one per level would fail a few hundred levels down; with a window of the
+     * deepest sixteen the removal re-descends from the top for anything deeper, in passes, which cleared a
+     * 400-level chain in half a second (the S6 spike) and never needs more than the window and a handful. */
+    removal_window_capacity = 16
+};
+
+/* One level of the tree the removal holds: the directory's stream, whose descriptor serves the calls inside
+ * it, its name under the level above, and whether its stream was already read again after a removal that the
+ * system refused as not empty. */
+typedef struct held_level {
+    owned_directory_stream stream;
+    uint8_t name[NAME_MAX + 1]; /* NUL-terminated */
+    bool rescanned;
+} held_level;
+
+/* The deepest `count` of the `depth` levels the walk stands below the top: when the two differ, levels nearer
+ * the top fell out of the window and the walk cannot climb through them, so the pass ends and the next one
+ * descends from the top again. Declared under `[[gnu::cleanup(close_removal_window)]]`; a zeroed window holds
+ * nothing (a NULL stream is none). */
+typedef struct removal_window {
+    held_level levels[removal_window_capacity];
+    uint32_t count;
+    uint32_t depth;
+} removal_window;
+
+static void close_removal_window(removal_window *window) {
+    for (uint32_t index = 0; index < window->count; ++index) {
+        close_owned_directory_stream(&window->levels[index].stream);
+    }
+    window->count = 0;
+    window->depth = 0;
+}
+
+/* Holds `stream` as the new deepest level; when the window is full the level nearest the top is let go. */
+static void push_level(removal_window *window, owned_directory_stream *stream, const uint8_t *name) {
+    if (window->count == removal_window_capacity) {
+        close_owned_directory_stream(&window->levels[0].stream);
+        memmove(&window->levels[0], &window->levels[1], sizeof window->levels[0] * (removal_window_capacity - 1));
+        window->count -= 1;
+    }
+    held_level *level = &window->levels[window->count];
+    *level = (held_level){.stream = {.value = release_directory_stream(stream)}, .name = {}, .rescanned = false};
+    memcpy(level->name, name, strlen((const char *)name));
+    window->count += 1;
+    window->depth += 1;
+}
+
+/* Lets go of the deepest level, whose directory has been removed. */
+static void pop_level(removal_window *window) {
+    close_owned_directory_stream(&window->levels[window->count - 1].stream);
+    window->count -= 1;
+    window->depth -= 1;
+}
+
+/* Names the entry a step of the removal failed on, relative to the location: the held levels' names, a slash
+ * between each, and the entry's own (empty for the level's directory itself). When the window no longer holds
+ * every level down from the top, or the spelling does not fit, the name is cut where it stops being a prefix
+ * and `name_truncated` says so. */
+static void name_entry_in_error(bc_file_system_error *error, const removal_window *window, const uint8_t *entry) {
+    const bool whole_chain_held = window->depth == window->count;
+    size_t position = 0;
+    bool fits = whole_chain_held;
+    for (uint32_t index = 0; fits && index < window->count; ++index) {
+        const size_t length = strlen((const char *)window->levels[index].name);
+        if (position + length + 1 > sizeof error->name) {
+            fits = false;
+            break;
+        }
+        if (position > 0) {
+            error->name[position] = '/';
+            position += 1;
+        }
+        memcpy(error->name + position, window->levels[index].name, length);
+        position += length;
+    }
+    const size_t entry_length = strlen((const char *)entry);
+    if (fits && entry_length > 0) {
+        if (position + entry_length + 1 > sizeof error->name) {
+            fits = false;
+        } else {
+            if (position > 0) {
+                error->name[position] = '/';
+                position += 1;
+            }
+            memcpy(error->name + position, entry, entry_length);
+            position += entry_length;
+        }
+    }
+    error->name_length = (uint32_t)position;
+    error->name_truncated = 0;
+    if (!fits) {
+        error->name_truncated = 1;
+    }
+}
+
+/* The directory the walk stands in: the deepest held level's, or the top's. */
+static DIR *current_stream(const removal_window *window, DIR *top) {
+    if (window->count == 0) {
+        return top;
+    }
+    return window->levels[window->count - 1].stream.value;
+}
+
+/* Removes the deepest held level's directory through its parent. The parent is held when the level above is
+ * in the window or the level is directly below the top; otherwise it fell out of the window and the pass
+ * must end, which `*parent_lost` says. A directory the system refuses as not empty is read again once, from
+ * its start, since an entry may have arrived since its stream ended; a second refusal is the error. */
+static int32_t remove_deepest_level(bc_file_system_engine *engine, int32_t operation, removal_window *window, DIR *top,
+                                    bool *parent_lost, bc_file_system_error *error) {
+    *parent_lost = false;
+    /* Called only below the top, where at least the deepest level is held: the pass loop guarantees it, and
+     * the analyzer reads this line to see that. */
+    assert(window->count > 0);
+    held_level *level = &window->levels[window->count - 1];
+    int parent = -1;
+    if (window->count >= 2) {
+        parent = dirfd(window->levels[window->count - 2].stream.value);
+    } else if (window->depth == 1) {
+        parent = dirfd(top);
+    } else {
+        *parent_lost = true;
+        return 0;
+    }
+    const bc_file_system_call_outcome removed =
+        bc_file_system_call_unlinkat(engine, operation, parent, (const char *)level->name, AT_REMOVEDIR);
+    if (removed.succeeded) {
+        pop_level(window);
+        return 0;
+    }
+    const int32_t kind = kind_of_directory_removal_failure(removed.code);
+    if (!removed.stopped && kind == bc_file_system_error_kind_directory_not_empty && !level->rescanned) {
+        level->rescanned = true;
+        rewinddir(level->stream.value);
+        return 0;
+    }
+    const int32_t reported = report_outcome(error, operation, bc_file_system_step_unlinkat, &removed, kind);
+    name_entry_in_error(error, window, (const uint8_t *)"");
+    return reported;
+}
+
+/* Descends into the directory entry `name` of the directory the walk stands in: opened without following and
+ * bracketed by the identity check, held against the tree's device (a mount point inside the tree is where the
+ * removal stops, with `cross_device`), then read through a stream of its own. */
+static int32_t descend_into(bc_file_system_engine *engine, int32_t operation, removal_window *window, DIR *top,
+                            const uint8_t *name, const bc_file_system_expected_entry *expected, uint64_t tree_device,
+                            bc_file_system_error *error) {
+    if (expected->device != tree_device) {
+        const int32_t kind = refuse(error, bc_file_system_error_kind_cross_device, operation);
+        name_entry_in_error(error, window, name);
+        return kind;
+    }
+    const int directory = dirfd(current_stream(window, top));
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor child = {.value = -1};
+    int32_t kind = bc_file_system_resolve_open_expected_directory(
+        engine, operation, directory, (const char *)name, bc_file_system_final_symlink_refuse,
+        bc_file_system_directory_access_read, expected, &child, error);
+    if (kind != 0) {
+        name_entry_in_error(error, window, name);
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_directory_stream)]] owned_directory_stream stream = {.value = nullptr};
+    const bc_file_system_call_outcome streamed =
+        bc_file_system_call_fdopendir(engine, operation, child.value, &stream.value);
+    if (!streamed.succeeded) {
+        kind = report_outcome(error, operation, bc_file_system_step_fdopendir, &streamed,
+                              bc_file_system_call_kind_of_errno(streamed.code));
+        name_entry_in_error(error, window, name);
+        return kind;
+    }
+    (void)release_descriptor(&child);
+    push_level(window, &stream, name);
+    return 0;
+}
+
+/* Where a pass of the removal stands after one step. */
+typedef enum pass_verdict : int32_t {
+    pass_continues = 1,
+    /* The parent of the deepest level fell out of the window: the next pass descends from the top again. */
+    pass_ends = 2,
+    tree_removed = 3
+} pass_verdict;
+
+/* The top is empty: it goes through the location's parent. A refusal as not empty (an entry arrived since its
+ * stream ended) is answered by one more read of it from the start, once. */
+static int32_t remove_top(bc_file_system_engine *engine, int32_t operation, int parent, const uint8_t *leaf,
+                          bool *top_rescanned, int32_t *verdict, bc_file_system_error *error) {
+    const bc_file_system_call_outcome removed =
+        bc_file_system_call_unlinkat(engine, operation, parent, (const char *)leaf, AT_REMOVEDIR);
+    if (removed.succeeded) {
+        *verdict = tree_removed;
+        return 0;
+    }
+    const int32_t kind = kind_of_directory_removal_failure(removed.code);
+    if (!removed.stopped && kind == bc_file_system_error_kind_directory_not_empty && !*top_rescanned) {
+        *top_rescanned = true;
+        *verdict = pass_ends;
+        return 0;
+    }
+    return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed, kind);
+}
+
+/* An entry of the directory the walk stands in: what it is comes from a stat on the held directory, never from
+ * the advisory d_type, since the answer decides whether it is entered or unlinked. A directory is entered; an
+ * entry that is nothing else (a file, a symlink, a device) is unlinked where it is, never followed; one that
+ * vanished since the stream answered it is nothing to do. */
+static int32_t remove_entry(bc_file_system_engine *engine, int32_t operation, removal_window *window, DIR *top,
+                            const uint8_t *name, uint64_t tree_device, bc_file_system_error *error) {
+    const int directory = dirfd(current_stream(window, top));
+    bc_file_system_expected_entry expected;
+    int32_t kind = bc_file_system_resolve_expect_entry(engine, operation, directory, (const char *)name,
+                                                       bc_file_system_final_symlink_refuse, &expected, error);
+    if (kind == bc_file_system_error_kind_not_found && error->system_code == ENOENT) {
+        return 0;
+    }
+    if (kind != 0) {
+        name_entry_in_error(error, window, name);
+        return kind;
+    }
+    if (expected.is_directory) {
+        return descend_into(engine, operation, window, top, name, &expected, tree_device, error);
+    }
+    const bc_file_system_call_outcome removed =
+        bc_file_system_call_unlinkat(engine, operation, directory, (const char *)name, 0);
+    if (removed.succeeded) {
+        return 0;
+    }
+    if (!removed.stopped && removed.code == ENOENT) {
+        return 0;
+    }
+    kind = report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
+                          bc_file_system_call_kind_of_errno(removed.code));
+    name_entry_in_error(error, window, name);
+    return kind;
+}
+
+/* One step of a pass: the next entry of the directory the walk stands in is dealt with, or, when there is none,
+ * the directory itself is removed through its parent and the walk climbs. */
+static int32_t advance_removal(bc_file_system_engine *engine, int32_t operation, removal_window *window, DIR *top,
+                               int parent, const uint8_t *leaf, uint64_t tree_device, bool *top_rescanned,
+                               int32_t *verdict, bc_file_system_error *error) {
+    *verdict = pass_continues;
+    uint8_t name[NAME_MAX + 1];
+    size_t name_length = 0;
+    unsigned char d_type = DT_UNKNOWN;
+    bool found = false;
+    const int32_t kind =
+        next_entry_name(engine, operation, current_stream(window, top), name, &name_length, &d_type, &found, error);
+    if (kind != 0) {
+        name_entry_in_error(error, window, (const uint8_t *)"");
+        return kind;
+    }
+    if (found) {
+        return remove_entry(engine, operation, window, top, name, tree_device, error);
+    }
+    if (window->depth == 0) {
+        return remove_top(engine, operation, parent, leaf, top_rescanned, verdict, error);
+    }
+    bool parent_lost = false;
+    const int32_t removed = remove_deepest_level(engine, operation, window, top, &parent_lost, error);
+    if (parent_lost) {
+        *verdict = pass_ends;
+    }
+    return removed;
+}
+
+/* Empties the directory `top` (whose descriptor serves the stream) and removes it from `parent` under `leaf`,
+ * by unlinkat on held descriptors, with no recursion and never more than the window open. Each pass descends
+ * from the top: an entry that is not a directory is unlinked where it is found (a symlink is removed, never
+ * followed); a directory is entered; a directory read to its end is removed through its parent and the walk
+ * climbs, until the parent is a level the window let go, which ends the pass. The top, read to its end, is
+ * removed through the location's parent, and that is the end. */
+static int32_t remove_directory_tree(bc_file_system_engine *engine, int32_t operation, int parent, const uint8_t *leaf,
+                                     DIR *top, uint64_t tree_device, bc_file_system_error *error) {
+    [[gnu::cleanup(close_removal_window)]] removal_window window = {};
+    bool top_rescanned = false;
+    for (;;) {
+        close_removal_window(&window);
+        rewinddir(top);
+        int32_t verdict = pass_continues;
+        while (verdict == pass_continues) {
+            const int32_t kind = advance_removal(engine, operation, &window, top, parent, leaf, tree_device,
+                                                 &top_rescanned, &verdict, error);
+            if (kind != 0) {
+                return kind;
+            }
+        }
+        if (verdict == tree_removed) {
+            return 0;
+        }
+    }
+}
+
+/* Whether an `at` path spells the root of the file system once `.` and `..` are folded: `/`, `/..`, `/tmp/..`
+ * and `/a/../../..` all do, and a normalised absolute path is the root exactly when it is one byte long. The
+ * path module is asked for the length alone, so no buffer is needed. */
+static bool spells_the_root(const bc_file_system_location *location) {
+    if (location->kind != bc_file_system_location_kind_at) {
+        return false;
+    }
+    size_t normalized_length = 0;
+    bc_file_system_error own_error;
+    const int32_t answer = bc_file_system_path_lexically_normalize(location->path, location->length, nullptr, 0,
+                                                                   &normalized_length, &own_error);
+    if (answer != bc_file_system_error_kind_buffer_too_small) {
+        return false;
+    }
+    return normalized_length == 1;
+}
+
+/* Whether the directory `expected` describes is the root of the file system, by identity: the root is opened
+ * (the one open by path in the core) and described, and the two identities compared. */
+static int32_t is_the_root_by_identity(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_expected_entry *expected, bool *is_root,
+                                       bc_file_system_error *error) {
+    const bc_file_system_location root_location = bc_file_system_location_at((const uint8_t *)"/", 1);
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved root = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, &root_location, &root, error);
+    if (kind != 0) {
+        return kind;
+    }
+    struct stat info;
+    const bc_file_system_call_outcome described = bc_file_system_call_fstat(engine, operation, root.parent, &info);
+    if (!described.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &described,
+                              bc_file_system_call_kind_of_errno(described.code));
+    }
+    if (expected->device != (uint64_t)info.st_dev) {
+        *is_root = false;
+        return 0;
+    }
+    *is_root = expected->inode == (uint64_t)info.st_ino;
+    return 0;
 }
 
 int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -1457,8 +2349,96 @@ int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_
     if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    /* The root of the file system is refused by spelling before any system call, and by identity below before
+     * any removal: the one argument this operation will not take. */
+    if (spells_the_root(location)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (resolution != 0) {
+        if (means_absence(resolution)) {
+            *existed = 0;
+            return succeed(error);
+        }
+        return resolution;
+    }
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    /* What the leaf is, never followed: nothing is absence; anything but a directory is unlinked as it is, a
+     * symlink included; a directory is opened read-only, bracketed, and emptied. */
+    bc_file_system_expected_entry expected;
+    int32_t kind = bc_file_system_resolve_expect_entry(engine, operation, resolved.parent, (const char *)resolved.leaf,
+                                                       bc_file_system_final_symlink_refuse, &expected, error);
+    if (kind == bc_file_system_error_kind_not_found && error->system_code == ENOENT) {
+        *existed = 0;
+        return succeed(error);
+    }
+    if (kind != 0) {
+        return kind;
+    }
+    if (!expected.is_directory) {
+        const bc_file_system_call_outcome removed =
+            bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)resolved.leaf, 0);
+        if (!removed.succeeded) {
+            if (!removed.stopped && removed.code == ENOENT) {
+                *existed = 0;
+                return succeed(error);
+            }
+            return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
+                                  bc_file_system_call_kind_of_errno(removed.code));
+        }
+        *existed = 1;
+        return succeed(error);
+    }
+    bool is_root = false;
+    kind = is_the_root_by_identity(engine, operation, &expected, &is_root, error);
+    if (kind != 0) {
+        return kind;
+    }
+    if (is_root) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    kind = bc_file_system_resolve_open_expected_directory(
+        engine, operation, resolved.parent, (const char *)resolved.leaf, bc_file_system_final_symlink_refuse,
+        bc_file_system_directory_access_read, &expected, &opened, error);
+    if (kind != 0) {
+        return kind;
+    }
+    [[gnu::cleanup(close_owned_directory_stream)]] owned_directory_stream top = {.value = nullptr};
+    const bc_file_system_call_outcome streamed =
+        bc_file_system_call_fdopendir(engine, operation, opened.value, &top.value);
+    if (!streamed.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fdopendir, &streamed,
+                              bc_file_system_call_kind_of_errno(streamed.code));
+    }
+    (void)release_descriptor(&opened);
+    kind = remove_directory_tree(engine, operation, resolved.parent, resolved.leaf, top.value, expected.device, error);
+    if (kind != 0) {
+        return kind;
+    }
+    *existed = 1;
+    return succeed(error);
+}
+
+/* ---- create_temporary_directory ------------------------------------------------------------------------------ */
+
+/* The name of a temporary directory, NUL-terminated into `name`: the prefix, the process id, a dash and the
+ * token, which is what makes it unique. Answers its length. */
+static size_t spell_temporary_name(uint8_t *name, uint64_t process_id, uint64_t token) {
+    size_t position = 0;
+    memcpy(name, temporary_directory_prefix, sizeof temporary_directory_prefix - 1);
+    position += sizeof temporary_directory_prefix - 1;
+    position += spell_decimal(name + position, process_id);
+    name[position] = '-';
+    position += 1;
+    position += spell_decimal(name + position, token);
+    name[position] = 0;
+    return position;
 }
 
 int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine, const bc_file_system_location *parent,
@@ -1473,8 +2453,129 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, parent, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The directory the name goes into is opened for search, bracketed; a final symlink is the system's to
+     * resolve under `at` and refused under `beneath`, as for any component. The root is the descriptor the walk
+     * opened. */
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    int directory = resolved.parent;
+    if (resolved.leaf_length > 0) {
+        bc_file_system_expected_entry expected;
+        kind = open_resolved_directory(engine, operation, &resolved, symlink_choice_of(parent),
+                                       bc_file_system_directory_access_search, &expected, &opened, error);
+        if (kind != 0) {
+            return kind;
+        }
+        directory = opened.value;
+    }
+    /* A name that is taken (a leftover of a process that died with the same id) is tried again with the next
+     * token, a bounded number of times; a name the caller's buffer cannot hold is answered before anything is
+     * made, so the size query creates nothing. */
+    uint8_t name[NAME_MAX + 1] = {};
+    size_t name_length = 0;
+    bool made = false;
+    for (uint32_t attempt = 0; attempt < staging_attempts && !made; ++attempt) {
+        const uint64_t token =
+            atomic_fetch_add_explicit(&engine->staging_counter, (uint64_t)1, memory_order_relaxed) + 1;
+        name_length = spell_temporary_name(name, engine->process_id, token);
+        if (name_length > capacity) {
+            *length = name_length;
+            return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+        }
+        const bc_file_system_call_outcome outcome =
+            bc_file_system_call_mkdirat(engine, operation, directory, (const char *)name, directory_create_mode);
+        if (outcome.succeeded) {
+            made = true;
+        } else if (outcome.stopped || outcome.code != EEXIST) {
+            return report_outcome(error, operation, bc_file_system_step_mkdirat, &outcome,
+                                  bc_file_system_call_kind_of_errno(outcome.code));
+        }
+    }
+    if (!made) {
+        /* Every name tried was taken: the system's refusal, not the parent's existence. */
+        const bc_file_system_call_outcome taken = {.succeeded = false, .code = EEXIST, .stopped = false};
+        return report_outcome(error, operation, bc_file_system_step_mkdirat, &taken,
+                              bc_file_system_error_kind_io_failed);
+    }
+    [[gnu::cleanup(discard_created_directory)]] created_directory created = created_directory_in(directory, name);
+    created.created = true;
+    int32_t failed_step = 0;
+    const bc_file_system_call_outcome mode_set =
+        set_mode_never_following(engine, operation, directory, (const char *)name, permissions->mode, &failed_step);
+    if (!mode_set.succeeded) {
+        return report_created_outcome(&created, error, operation, failed_step, &mode_set,
+                                      bc_file_system_call_kind_of_errno(mode_set.code));
+    }
+    created.kept = true;
+    memcpy(buffer, name, name_length);
+    *length = name_length;
+    return succeed(error);
 }
+
+/* ---- set_permissions ----------------------------------------------------------------------------------------- */
+
+int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                       uint32_t mode, int32_t final_symlink, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_set_permissions;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || mode > permission_bits ||
+        !is_in_enum(final_symlink, final_symlink_last)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root has no leaf: it is `.` beneath the descriptor the walk opened. */
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+    if (final_symlink == bc_file_system_final_symlink_follow) {
+        const bc_file_system_call_outcome changed =
+            bc_file_system_call_fchmodat(engine, operation, resolved.parent, name, mode, 0);
+        if (!changed.succeeded) {
+            return report_outcome(error, operation, bc_file_system_step_fchmodat, &changed,
+                                  bc_file_system_call_kind_of_errno(changed.code));
+        }
+        return succeed(error);
+    }
+    /* Under `refuse` a symlink is refused rather than given a mode of its own (which Apple platforms would
+     * allow and Linux refuses): the entry is looked at first, without following. The look does not decide
+     * where the change lands, since the change itself never follows a symlink either; it only decides the
+     * answer for one. */
+    struct stat info;
+    const bc_file_system_call_outcome looked =
+        bc_file_system_call_fstatat(engine, operation, resolved.parent, name, AT_SYMLINK_NOFOLLOW, &info);
+    if (!looked.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
+                              bc_file_system_call_kind_of_errno(looked.code));
+    }
+    if (S_ISLNK(info.st_mode)) {
+        return refuse(error, bc_file_system_error_kind_symlink_refused, operation);
+    }
+    int32_t failed_step = 0;
+    const bc_file_system_call_outcome changed =
+        set_mode_never_following(engine, operation, resolved.parent, name, mode, &failed_step);
+    if (!changed.succeeded) {
+        return report_outcome(error, operation, failed_step, &changed, bc_file_system_call_kind_of_errno(changed.code));
+    }
+    return succeed(error);
+}
+
+/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+
+/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
+ * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
+ * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
+ * names. */
 
 int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_system_location *source,
                               const bc_file_system_location *destination, int32_t existing_destination,
@@ -1506,20 +2607,6 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
     }
     bc_file_system_engine_before_operation(engine, operation);
     return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 16 moves-and-copies-in-c */
-}
-
-int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                       uint32_t mode, int32_t final_symlink, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_set_permissions;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || mode > permission_bits ||
-        !is_in_enum(final_symlink, final_symlink_last)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 15 directories-in-c */
 }
 
 int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,

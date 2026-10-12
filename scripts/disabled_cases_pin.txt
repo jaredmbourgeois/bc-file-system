@@ -1,2 +1,2 @@
-gtest 57
-swift 8
+gtest 24
+swift 0

@@ -154,7 +154,7 @@ struct ContractTests {
         #expect(error?.kind == .notFound)
     }
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func listOfNothingIsNotFound() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("absent")
@@ -209,7 +209,7 @@ struct ContractTests {
         #expect(try observed.root.rawRead("target.txt") == "behind the link")
     }
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func listOfAFileIsNotDirectory() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("content", to: "file", mode: 0o644)
@@ -261,10 +261,10 @@ struct ContractTests {
 
     /// A directory with mode 0o300 lets a path-based open create files in it, but the engine never opens by
     /// path: the walk holds the destination's directory as a descriptor, opened read-only, which the mode
-    /// forbids. So the write is refused on the way and nothing is created. (A directory sync that fails after
-    /// the rename answering `written` is scripted and proven in the C++ suite.)
+    /// forbids a read-only open of; the walk opens it for search only, as the system treats such a directory,
+    /// so the file lands, and what cannot be opened read-only afterwards for its sync lowers the answer.
     @Test
-    func writeIntoADirectoryTheProcessCannotOpenIsPermissionDenied() throws {
+    func durableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten() throws {
         let observed = try observedFileSystem()
         guard try observed.root.permissionsAreEnforced() else {
             return  // this process opens what its permission bits forbid; no such failure can happen
@@ -272,13 +272,12 @@ struct ContractTests {
         try observed.root.rawMakeDirectory("write-only", mode: 0o300)
         let location = try observed.location("write-only/file")
 
-        let error = errorThrown { () throws(FileSystemError) in
-            try observed.fileSystem.writeFile(location, bytes: Array("content".utf8), options: Self.durableExactly0644)
-        }
+        let achieved = try observed.fileSystem.writeFile(
+            location, bytes: Array("content".utf8), options: Self.durableExactly0644)
 
-        #expect(error?.kind == .permissionDenied)
+        #expect(achieved == .written)
         try observed.root.rawSetMode(0o700, of: "write-only")
-        #expect(try observed.root.rawExists("write-only/file") == false)
+        #expect(try observed.root.rawRead("write-only/file") == "content")
     }
 
     @Test
@@ -352,7 +351,7 @@ struct ContractTests {
 
     // MARK: - Listing
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func listReturnsTheEntriesSortedEachWithItsType() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("alpha", to: "a.txt", mode: 0o644)
@@ -378,7 +377,7 @@ struct ContractTests {
 
     /// More entries than the first array holds, so the listing is asked for a second time with the capacity the
     /// core named.
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func aListingLargerThanItsFirstBuffersIsComplete() throws {
         let observed = try observedFileSystem()
         var expected: [String] = []
@@ -393,7 +392,7 @@ struct ContractTests {
         #expect(entries.map(\.nameText) == expected)
     }
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func listOfAnEmptyDirectoryIsEmpty() throws {
         let observed = try observedFileSystem()
 
@@ -402,7 +401,7 @@ struct ContractTests {
 
     // MARK: - Creating directories
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func createDirectoriesMakesEveryMissingDirectoryWithTheMode() throws {
         let observed = try observedFileSystem()
 
@@ -413,7 +412,7 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "a/b/c") == 0o750)
     }
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func createDirectoriesLeavesWhatExistsAsItIs() throws {
         let observed = try observedFileSystem()
         try observed.root.rawMakeDirectory("existing", mode: 0o700)
@@ -427,7 +426,7 @@ struct ContractTests {
         #expect(try observed.root.rawMode(of: "existing/new") == 0o755)
     }
 
-    @Test(.disabled("stage 15 directories-in-c"))
+    @Test
     func createDirectoriesWhereAFileIsIsNotDirectory() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("content", to: "file", mode: 0o644)
@@ -438,6 +437,41 @@ struct ContractTests {
         }
 
         #expect(error?.kind == .notDirectory)
+    }
+
+    // MARK: - Removing, and a temporary directory
+
+    @Test
+    func removeTreeRemovesEverythingAndASecondCallFindsNothing() throws {
+        let observed = try observedFileSystem()
+        try observed.root.rawMakeDirectory("tree", mode: 0o755)
+        try observed.root.rawMakeDirectory("tree/sub", mode: 0o755)
+        try observed.root.rawWrite("content", to: "tree/sub/file", mode: 0o644)
+        try observed.root.rawMakeSymlink(at: "tree/way-out", pointingAt: observed.root.path)
+        let location = try observed.location("tree")
+
+        let first = try observed.fileSystem.removeTree(location)
+        let second = try observed.fileSystem.removeTree(location)
+
+        #expect(first == true)
+        #expect(second == false)
+        #expect(observed.root.rawExists("tree") == false)
+    }
+
+    @Test
+    func createTemporaryDirectoryTwiceYieldsTwoNamesWithTheMode() throws {
+        let observed = try observedFileSystem()
+        let parent = try rootLocation(of: observed)
+
+        let first = try observed.fileSystem.createTemporaryDirectory(in: parent, permissions: .exactly(mode: 0o700))
+        let second = try observed.fileSystem.createTemporaryDirectory(in: parent, permissions: .exactly(mode: 0o750))
+
+        #expect(first != second)
+        let firstName = String(decoding: first, as: UTF8.self)
+        let secondName = String(decoding: second, as: UTF8.self)
+        #expect(try observed.root.rawMode(of: firstName) == 0o700)
+        #expect(try observed.root.rawMode(of: secondName) == 0o750)
+        #expect(try observed.root.rawNames() == [firstName, secondName].sorted())
     }
 
     // MARK: - The core's buffer protocol
