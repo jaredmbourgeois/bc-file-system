@@ -1,0 +1,46 @@
+# bc-file-system
+
+A C23 file-system core with one header and C++, Swift and Rust faces.
+
+Two house rules, inject-never-reach and no-default-arguments, need a file system that code is *handed* rather
+than one it reaches for. This library is that file system, written once as a C core so that C++, Swift and
+Rust consumers share one engine, one error vocabulary and one contract suite. It earns its place through what
+the standard libraries do not do: kernel-enforced containment (`beneath` a held directory, with every component
+opened `O_NOFOLLOW | O_DIRECTORY` against the held parent), refusal to replace, kill-safety of every multi-step
+write, and one fault gate every face can use: an observer in the engine that fails a scripted system call or
+stops an operation without cleanup, as if the process had been killed there.
+
+The names: the C prefix is `bc_file_system_` and the header `<bc_file_system/bc_file_system.h>`; the C++
+namespace is `bc::file_system` with headers `<bc_file_system/….hpp>`; CMake builds `bc_file_system_core` (C)
+and `bc_file_system` (C++), linked as `bc::file_system_core` and `bc::file_system`; the Swift products are
+`BCFileSystem` and `BCFileSystemTestFixtures` over the C module `CBCFileSystem`; the Rust crates are
+`bc-file-system` and `bc-file-system-testing`. Licence: Apache-2.0 (`LICENSE.txt`).
+
+## Consumer-host floor
+
+The published consumer-host floor is GCC 14, clang 19, Apple clang 21 (Xcode 27), NDK r28 or later and
+Emscripten 2025 or later: C23 in its GNU dialect with `<stdckdint.h>`. A host below it fails at the floor check
+in the core's private platform header with a clear error.
+
+## Building and testing
+
+```sh
+cmake --preset debug && cmake --build --preset debug && ctest --preset debug
+cmake --preset sanitized && cmake --build --preset sanitized && ctest --preset sanitized   # ASan + UBSan
+cmake --preset hardened && cmake --build --preset hardened                                 # the production posture
+swift test
+bash scripts/verify.sh            # every leg: both builds, the header four ways, the guards, the consumer, swift test
+```
+
+Build output goes under `build/<preset>/`. GoogleTest is fetched by CMake, pinned to a commit, and only when this
+repository is the top-level project; a consumer that pulls the library in through `FetchContent` (see
+`examples/consumer/`) gets the two libraries and nothing else. The standards the repository holds itself to,
+and how its guards enforce them, are in `AGENTS.md`.
+
+## Where it stands
+
+Stage 9 of its plan, `salvaged-under-the-new-name`: the public header, an honest stub core that answers
+`unsupported` to every operation, the C++ face, the contract suite (red or disabled until each operation's stage),
+the binding suites, the Swift skeleton, the guards and CI. The operations land in C group by group over the
+next stages (the path module, the engine and its errors, the resolution layer, status and reads, writes,
+directories, moves and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.

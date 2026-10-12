@@ -1,0 +1,61 @@
+name: CI
+
+# Branches only: a tag names a commit that a branch push has already built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  # A manual run from the Actions tab, for a commit pushed before Actions was enabled on the repository.
+  workflow_dispatch:
+
+# Every job is one leg of scripts/verify.sh (its name is the leg's name), so "green locally" and "green in CI"
+# cannot drift; the workflow chooses the compiler and nothing else. The runner is Debian 13 with GCC 14,
+# clang 19, Swift 6.4, CMake, Ninja and Python 3 on PATH; the jobs install nothing. The one thing fetched is
+# GoogleTest, by CMake, pinned to a commit.
+#
+# Not here yet, gated on workstation `ci-forgejo-runner-posture` stage `bc-file-system-job-packages` (the runner
+# has no musl, NDK or Emscripten): the NDK compile legs at API 30, 33 and 35; Emscripten (MEMFS and NODERAWFS
+# under Node); x86_64 musl native and aarch64 musl under qemu-user-static; wasm32 freestanding for the path
+# module; memory-sanitized. Each lands as its own job when its packages do.
+jobs:
+  build-gcc:
+    runs-on: debian-13
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh build-debug build-sanitized
+
+  build-clang:
+    runs-on: debian-13
+    env:
+      CC: clang-19
+      CXX: clang++-19
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh build-debug build-sanitized
+
+  header-four-ways:
+    runs-on: debian-13
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh header-four-ways
+
+  guards:
+    runs-on: debian-13
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh guards
+
+  swift:
+    runs-on: debian-13
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh swift
+
+  consumer:
+    runs-on: debian-13
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/verify.sh consumer

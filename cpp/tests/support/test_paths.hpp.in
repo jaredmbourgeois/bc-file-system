@@ -1,0 +1,17 @@
+#pragma once
+
+// Rendered by cpp/CMakeLists.txt into the build tree (build/<preset>/cpp/generated/test_paths.hpp) and reached
+// through the test support's include path as `#include "test_paths.hpp"`. The value is captured when CMake
+// configures; a plain rebuild does not refresh it. The one build-time value the tests read, handed in as a
+// declaration a reader can open rather than a compile definition.
+
+#include <string_view>
+
+namespace bc::file_system_test {
+
+/// The directory every test creates its own temporary directory under. It exists once CMake has configured.
+[[nodiscard]] constexpr auto temporary_root() noexcept -> std::string_view {
+    return "@BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT@";
+}
+
+}  // namespace bc::file_system_test

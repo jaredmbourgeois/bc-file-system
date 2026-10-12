@@ -1,0 +1,94 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "debug",
+            "inherits": "base",
+            "displayName": "Debug, with the tests",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "none"
+            }
+        },
+        {
+            "name": "hardened",
+            "inherits": "base",
+            "displayName": "RelWithDebInfo + hardening (the production posture)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "hardened"
+            }
+        },
+        {
+            "name": "sanitized",
+            "inherits": "base",
+            "displayName": "Debug + ASan/UBSan (the CI posture)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "sanitized"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        },
+        {
+            "name": "hardened",
+            "configurePreset": "hardened"
+        },
+        {
+            "name": "sanitized",
+            "configurePreset": "sanitized"
+        },
+        {
+            "name": "header-four-ways",
+            "displayName": "The public header compiled four ways, and nothing else",
+            "configurePreset": "debug",
+            "targets": [
+                "bc_file_system_core_header_c11",
+                "bc_file_system_core_header_gnu11",
+                "bc_file_system_core_header_cxx20",
+                "bc_file_system_core_header_cxx23"
+            ]
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "debug",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "hardened",
+            "configurePreset": "hardened",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "sanitized",
+            "configurePreset": "sanitized",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}

@@ -1,0 +1,100 @@
+# clang-tidy config — the C core. The C++ face carries its own .clang-tidy; clang-tidy reads the
+# nearest one, so a header is analysed with the flags of the unit that included it and the check
+# set of the directory it sits in. modernize-*, cppcoreguidelines-* and hicpp-* are C++ sets: off.
+# WarningsAsErrors is empty: the build's -Werror governs failure; clang-tidy reports.
+# readability-magic-numbers is off because the layout pins beside every ABI struct and the fixed
+# ABI widths (a 256-byte name) are literals by design; readability-identifier-length is off because
+# the house names in full by rule, and `to` beside `from` is the clearest name a rename destination has.
+# language: c
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*-c,
+  clang-analyzer-core.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-unix.*,
+  clang-analyzer-security.*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  misc-no-recursion,
+  readability-*,
+  -readability-ambiguous-smartptr-reset-call,
+  -readability-avoid-return-with-void-value,
+  -readability-container-contains,
+  -readability-container-data-pointer,
+  -readability-container-size-empty,
+  -readability-convert-member-functions-to-static,
+  -readability-delete-null-pointer,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-make-member-function-const,
+  -readability-operators-representation,
+  -readability-qualified-auto,
+  -readability-redundant-access-specifiers,
+  -readability-redundant-member-init,
+  -readability-redundant-smartptr-get,
+  -readability-redundant-string-cstr,
+  -readability-redundant-string-init,
+  -readability-redundant-typename,
+  -readability-reference-to-constructed-temporary,
+  -readability-static-accessed-through-instance,
+  -readability-static-definition-in-anonymous-namespace,
+  -readability-string-compare,
+  -readability-uniqueptr-delete-release,
+  -readability-use-anyofallof,
+  -readability-use-std-min-max
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|.*/)core/(include|src)/.*\.h$'
+FormatStyle: none
+
+# Lint-only knob: Apple's SDK fortify macros rename strcpy/sprintf/memcpy to __builtin___*_chk and
+# blind every name-based check. The build keeps its presets; this line affects only clang-tidy.
+ExtraArgs: ['-D_FORTIFY_SOURCE=0']
+
+CheckOptions:
+  bugprone-sizeof-expression.WarnOnSizeOfPointer: true
+  # One row per banned function (AGENTS.md, "C"): ^name$,replacement,reason
+  bugprone-unsafe-functions.CustomFunctions: >-
+    ^strcpy$,memccpy or memcpy with a checked length,is unbounded;
+    ^strcat$,memccpy or memcpy with a checked length,is unbounded;
+    ^sprintf$,snprintf with its result checked,is unbounded;
+    ^strncpy$,memccpy or memcpy with a checked length,does not terminate;
+    ^strtok$,a bounded scan over the bytes,keeps hidden state;
+    ^atoi$,strtoll with errno and the end pointer checked,reports no error;
+    ^strerror$,the errno carried in the error struct,the face renders text and strerror is not thread-safe;
+    ^tmpnam$,openat with O_CREAT|O_EXCL and an injected token,races and reaches the temporary directory;
+    ^mktemp$,openat with O_CREAT|O_EXCL and an injected token,races and reaches the temporary directory;
+    ^tempnam$,openat with O_CREAT|O_EXCL and an injected token,races and reaches the temporary directory;
+    ^rand$,an injected source,reaches ambient state;
+    ^localtime$,an injected instant,reaches the time zone;
+    ^setlocale$,nothing: no locale in a library,mutates process state;
+    ^chdir$,a held directory descriptor,mutates process state;
+    ^umask$,an exact mode by fchmod,mutates process state;
+    ^getcwd$,the root resolves paths against an injected working directory,reaches the process;
+    ^realpath$,the root resolves paths against an injected working directory,consults the disk;
+    ^basename$,the path module,consults nothing and is not thread-safe;
+    ^dirname$,the path module,consults nothing and is not thread-safe;
+    ^readdir_r$,readdir with errno zeroed before each call,is deprecated;
+    ^nftw$,an explicit walk on held descriptors,recurses by path;
+    ^fts_open$,an explicit walk on held descriptors,recurses by path;
+    ^access$,faccessat on the held directory or open and inspect,resolves by path;
+    ^stat$,open with O_NOFOLLOW then fstat on the descriptor,a stat-then-open races;
+    ^lstat$,fstatat on the held directory,resolves by path;
+    ^signal$,nothing: the host owns signals,installs process state;
+    ^sigaction$,nothing: the host owns signals,installs process state;
+    ^exit$,a returned status,the host owns exit;
+    ^abort$,invalid_argument returned,the host owns exit;
+    ^_Exit$,a returned status,the host owns exit;
+    ^system$,nothing,spawns a process;
+    ^getenv$,a value read at the composition root,reaches the environment;
+    ^alloca$,a fixed buffer sized by an enum or the caller's buffer,is a stack overflow by argument;
+    ^setjmp$,a returned status,hides control flow;
+    ^isalpha$,an ASCII helper over uint8_t,is locale-dependent and UB on a negative char;
+    ^isdigit$,an ASCII helper over uint8_t,is locale-dependent and UB on a negative char;
+    ^isspace$,an ASCII helper over uint8_t,is locale-dependent and UB on a negative char;
+    ^toupper$,an ASCII helper over uint8_t,is locale-dependent and UB on a negative char;
+    ^tolower$,an ASCII helper over uint8_t,is locale-dependent and UB on a negative char
+  # cert-err33-c's default list is the C standard library only; add the POSIX calls whose
+  # result the house never discards (the discard list in AGENTS.md is marked discard-ok: at the site).
+  cert-err33-c.CheckedFunctions: '^::write$;^::pwrite$;^::fsync$;^::fdatasync$;^::close$;^::renameat$;^::unlinkat$;^::mkdirat$;^::fchmod$;^::fstat$;^::fstatat$;^::openat$;^::read$;^::pread$;^::flock$'

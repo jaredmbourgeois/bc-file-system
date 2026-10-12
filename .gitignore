@@ -1,0 +1,17 @@
+# CMake build trees: build/, and any sibling named build-something
+/build*/
+
+# SwiftPM. Package.resolved is not tracked: a library package leaves the pin to its consumer.
+/.build/
+/.swiftpm/
+/Package.resolved
+
+# Python
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/

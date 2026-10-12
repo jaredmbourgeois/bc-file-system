@@ -1,0 +1,14 @@
+# The C and C++ in this repository is formatted by clang-format with this file (AGENTS.md, "Code standards").
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
+# C++ writes `const Path& path`, C writes `const char *path`. Each file keeps the spelling it already has;
+# a new file with no pointer in it yet gets the C++ one.
+DerivePointerAlignment: true
+PointerAlignment: Left
+# The include blocks are ordered by hand; clang-format sorts within a block and keeps the blocks apart.
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
