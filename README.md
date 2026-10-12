@@ -162,4 +162,7 @@ crate's binding suite over compositions of its API. Stage 26 `portable-only-run`
 tests, `bc_file_system_engine_create_portable_only_for_tests` (on every face beside the observed one), makes the
 observed engine with every fast path refused, and the C++ contract suite runs every case on it as well, so the
 walk, the read-and-write copy loop, fsync and the `unsupported` answer of every `refuse` and condemn without a
-no-replace rename are proven on every platform. `0.1.0` is tagged when every face is green on every platform.
+no-replace rename are proven on every platform. Stage 27 `at-one-open` is in: an `at` location's parent is
+opened by path in one call (in pieces past `PATH_MAX`), the system resolving it, so `status` through `at` is one
+open and one stat at any depth where it had been three calls a component; containment and its identity check
+stay `beneath`'s. `0.1.0` is tagged when every face is green on every platform.

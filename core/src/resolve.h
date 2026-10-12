@@ -12,13 +12,15 @@
  * the process may enter but not list is a parent like any other, as the system treats it. Where the platform offers it,
  * one kernel call does the whole walk (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux,
  * `openat` with `O_NOFOLLOW_ANY` on Apple), reported as its own step so a test can refuse it and force the walk.
- * An `at` location is resolved by the same walk from the root, following symlinks on the way, because the
- * header promises that the system resolves an absolute path; its walk is bracketed the same way so there is
- * one shape, one mapping and one test. The functions have external linkage under the library's prefix so the
- * C-only test in `core/tests` can drive them; they are declared only here. Every system call the walk makes
- * goes through calls.h, which holds the one loop per call and the one errno table of the core, except the two
- * opens that are the walk's own (the root by path, the platform's one-call open beneath a held directory),
- * which keep the same shape in resolve.c. Private to `core/src`: C23, never a common subset.
+ * An `at` location is the system's to resolve, because the header promises that the system resolves an
+ * absolute path, symlinks on the way included: its parent text is opened by path, for search, in one call (in
+ * pieces of whole components where the text is longer than one call takes), with no identity check, since a
+ * component swapped under it would be one the system's own resolution follows too. The functions have external
+ * linkage under the library's prefix so the C-only test in `core/tests` can drive them; they are declared only
+ * here. Every system call the layer makes goes through calls.h, which holds the one loop per call and the one
+ * errno table of the core, except the two opens that are resolve.c's own (an `at` parent text by path, the
+ * platform's one-call open beneath a held directory), which keep the same shape there. Private to `core/src`:
+ * C23, never a common subset.
  */
 #pragma once
 
@@ -59,7 +61,7 @@ typedef struct bc_file_system_resolved {
     /* The leaf's parent directory. Borrowed: it is `opened` below, or the held directory's own descriptor when
      * the leaf sits directly inside it and nothing had to be opened. */
     int parent;
-    /* What the walk opened for `parent`; -1 when `parent` is the held directory's. For the root (`at("/")`)
+    /* What the layer opened for `parent`; -1 when `parent` is the held directory's. For the root (`at("/")`)
      * this is the root itself and the leaf is empty: the parent is the location. */
     owned_descriptor opened;
     /* The last component, NUL-terminated for the `*at` call that acts on it. Empty only for the root. */
@@ -88,10 +90,12 @@ void bc_file_system_resolved_close(bc_file_system_resolved *resolved);
  * observer: every system call here goes through `before_step` under that operation's name, and the error names
  * it. On success `*resolved` holds the parent and the leaf; on failure it is untouched and `*error` is filled
  * with an empty name, since what failed to resolve is the location itself, whose text the face holds. The
- * refusals: a component that is or became a symlink, or an entry swapped between the stat and the open, is
- * `symlink_refused`; a missing component `not_found`; a component that is not a directory `not_directory`; a
- * platform that cannot enforce containment (Emscripten, where a directory descriptor is a path string)
- * answers `unsupported` for every `beneath` location before any system call.
+ * refusals under `beneath`: a component that is or became a symlink, or an entry swapped between the stat and
+ * the open, is `symlink_refused`; a missing component `not_found`; a component that is not a directory
+ * `not_directory`; a platform that cannot enforce containment (Emscripten, where a directory descriptor is a
+ * path string) answers `unsupported` for every `beneath` location before any system call. Under `at`, the
+ * system's answer to the open of the parent text, read by the one table (resolve.c states it at `resolve_at`):
+ * `not_found`, `not_directory`, `symlink_refused` for a loop, `permission_denied`, `resource_exhausted`.
  *
  * `engine`    must not be NULL.
  * `location`  must not be NULL; a valid location (the path module's rules; `beneath` with an open directory).

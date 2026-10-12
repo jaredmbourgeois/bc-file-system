@@ -87,7 +87,7 @@ typedef enum bc_file_system_error_kind {
     /* A directory that must be empty to be removed or replaced is not. */
     bc_file_system_error_kind_directory_not_empty = 6,
     /* A symlink sat where the call was told not to follow one: at the end of the path, or anywhere along a path
-     * resolved beneath a directory. */
+     * resolved beneath a directory; or, along an `at` path, a loop of symlinks the system would not follow. */
     bc_file_system_error_kind_symlink_refused = 7,
     /* The file is larger than a read limit, than `size_t` on this target, or (EFBIG) than the process's file-size
      * limit, which is reached only on a host that ignores SIGXFSZ — this library never installs that handling. */
@@ -245,7 +245,13 @@ typedef enum bc_file_system_permissions_policy {
 
 /* How a location addresses its target. */
 typedef enum bc_file_system_location_kind {
-    /* An absolute path the system resolves. Relative text is refused with `invalid_argument`. */
+    /* An absolute path the system resolves, every symlink on the way followed: the parent is opened by path,
+     * for search, in one call (piece after piece where the text is PATH_MAX bytes or longer), and the system's
+     * answer is the error: ENOENT `not_found`, ENOTDIR `not_directory` (a file on the way), ELOOP
+     * `symlink_refused` (a loop), EACCES `permission_denied`, EMFILE or ENFILE `resource_exhausted`, and
+     * ENAMETOOLONG `invalid_argument` for a component longer than the volume allows. Nothing is checked around
+     * the open, so an entry swapped while the path resolves is followed as the system follows it; containment
+     * is `beneath`'s. Relative text is refused with `invalid_argument`. */
     bc_file_system_location_kind_at = 1,
     /* A relative path resolved beneath an open directory with containment enforced by the kernel: no component
      * may be a symlink, and nothing above the directory is reachable. */

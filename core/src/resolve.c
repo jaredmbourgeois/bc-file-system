@@ -1,15 +1,18 @@
-/* resolve.c — the bodies behind resolve.h: the walk, the fast paths, the identity check, the errno mapping.
+/* resolve.c — the bodies behind resolve.h: the one open of an `at` parent, the walk, the fast paths, the identity
+ * check, the errno mapping.
  *
- * One shape for every open of a directory entry: `fstatat` records what is there, `openat` opens it as a
- * directory (for search only on the walk: O_SEARCH on Apple platforms, O_PATH on Linux, the platform's flags,
- * so a directory the process may enter but not list is a parent like any other), `fstat` reads what was
- * opened, and the two identities are compared. The walk is that shape in a
- * loop, holding one parent descriptor at a time and closing the previous one as it goes; the fast path is that
- * shape once, with the platform's one-call open in the middle. Every system call goes through calls.h (the two
- * opens that are the walk's own, the root by path and the platform's one-call open, keep the same shape
- * here), so it is behind the observer's `before_step`, asked again on EINTR, with the errno copied on the
- * line after the call, and its failure is read with the one errno table of the core. Nothing here opens a
- * leaf, reads a byte or writes one; nothing allocates.
+ * Two resolutions, one per kind of location. An `at` location is the system's to resolve, symlinks on the way
+ * included, so its parent text is opened by path in one call (for search only: O_SEARCH on Apple platforms,
+ * O_PATH on Linux, the platform's flags, so a directory the process may enter but not list is a parent like any
+ * other), and nothing is checked around the open. A `beneath` location is the library's to contain, so each of
+ * its opens has one shape: `fstatat` records what is there, `openat` opens it as a directory, `fstat` reads what
+ * was opened, and the two identities are compared. The walk is that shape in a loop, holding one parent
+ * descriptor at a time and closing the previous one as it goes; the fast path is that shape once, with the
+ * platform's one-call open in the middle. Every system call goes through calls.h (the two opens that are this
+ * file's own, a text by path and the platform's one-call open, keep the same shape here), so it is behind the
+ * observer's `before_step`, asked again on EINTR, with the errno copied on the line after the call, and its
+ * failure is read with the one errno table of the core. Nothing here opens a leaf, reads a byte or writes one;
+ * nothing allocates.
  */
 #include "resolve.h"
 
@@ -18,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <assert.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -96,10 +100,12 @@ static int32_t refuse(bc_file_system_error *error, int32_t kind, int32_t operati
     return kind;
 }
 
-/* ---- The two opens of the walk's own, in the shape of calls.c's -------------------------------------------- */
+/* ---- The two opens of this file's own, in the shape of calls.c's ----------------------------------------- */
 
-/* The one open by path in the core: the root, where every absolute path starts. */
-static bc_file_system_call_outcome open_root(bc_file_system_engine *engine, int32_t operation, int *descriptor) {
+/* The one open by path in the core: an `at` location's parent text, absolute and NUL-terminated, opened for
+ * search with every symlink on the way followed, as the system resolves any path. */
+static bc_file_system_call_outcome open_by_path(bc_file_system_engine *engine, int32_t operation, const char *text,
+                                                int *descriptor) {
     bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
         const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_open);
@@ -110,7 +116,7 @@ static bc_file_system_call_outcome open_root(bc_file_system_engine *engine, int3
             outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
-        const int opened = open("/", bc_file_system_platform_directory_search_open_flags());
+        const int opened = open(text, open_flags_for(bc_file_system_directory_access_search));
         if (opened >= 0) {
             *descriptor = opened;
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
@@ -357,6 +363,39 @@ static int32_t open_beneath_fast(bc_file_system_engine *engine, int32_t operatio
     return 0;
 }
 
+/* ---- The pieces of an `at` parent text ---------------------------------------------------------------------- */
+
+enum : size_t {
+    /* The longest text one by-path open takes: the system refuses PATH_MAX bytes with their NUL, so a piece is at
+     * most PATH_MAX - 1 bytes (1023 on Apple platforms, 4095 on Linux; a component is at most NAME_MAX, 255, so
+     * every piece holds at least one). */
+    at_piece_capacity = PATH_MAX - 1,
+    /* The limit that admits one component and no more, since a piece always takes its first. */
+    one_component_only = 0
+};
+
+/* Where the piece of `text` (a valid absolute path of `length` bytes) that begins at `start` ends: as many whole
+ * components as keep the piece within `limit` bytes, and always at least one, so every piece moves the
+ * resolution on. The first piece begins at 0 and carries the text's own slash; a later one begins at the first
+ * byte of a component, after the slash that ended the piece before it. A text with no component, the root, is
+ * one piece: its slash. */
+static size_t piece_end_of(const uint8_t *text, size_t length, size_t start, size_t limit) {
+    size_t end = start == 0 ? 1 : start;
+    bool took_a_component = false;
+    size_t cursor = start;
+    size_t offset = 0;
+    size_t component_length = 0;
+    while (bc_file_system_path_text_next_component(text, length, &cursor, &offset, &component_length)) {
+        const size_t candidate = offset + component_length;
+        if (took_a_component && candidate - start > limit) {
+            break;
+        }
+        end = candidate;
+        took_a_component = true;
+    }
+    return end;
+}
+
 /* ---- resolve ------------------------------------------------------------------------------------------------ */
 
 /* The location's text is the path module's to judge; the layer checks only what belongs to the location: its
@@ -404,15 +443,75 @@ static void locate_leaf(const uint8_t *path, size_t length, size_t *leaf_offset,
     *parent_length = *leaf_offset - 1;
 }
 
+/* Resolves an `at` location's parent text as the system resolves any absolute path, which is what the header
+ * promises: by path, every symlink on the way followed, in one call (step `open`) where the text fits the
+ * system's limit. No stat precedes the open and no identity check follows it: a component swapped between the
+ * two would be one the system's own resolution follows as well, so the bracket guards nothing `at` promises,
+ * and the window `beneath` closes is not closed here. The root, `at("/")`, opens `/` as its own parent.
+ *
+ * A text one call cannot take (PATH_MAX bytes or more, the NUL counted: 1024 on Apple platforms, 4096 on Linux)
+ * is opened piece after piece, each as many whole components as fit, beneath the descriptor the piece before it
+ * became (step `openat`): the kernel resolves each piece as it would have resolved that stretch of the whole
+ * text, so the answer is the one a system without the limit would give, at one call per PATH_MAX bytes rather
+ * than one per component. A piece the system answers ENAMETOOLONG for is one in which a symlink's text, joined
+ * to the rest of the piece, outgrew what the system resolves in one call (Apple platforms bound that expansion
+ * by PATH_MAX; Linux does not). That piece is opened again one component at a time, where a symlink's text is
+ * joined to nothing after it, so `at` still resolves every path whose links each fit, as the walk it replaces
+ * did.
+ *
+ * The errno table of the by-path open, `kind_of`'s with nothing added, since every answer the open can give is
+ * one the table already reads: ENOENT `not_found` (a component, or a symlink's target, is missing); ENOTDIR
+ * `not_directory` (a file in the middle, or at the end: the system saw it, no stat preceded the open); ELOOP
+ * `symlink_refused` (a loop, or more symlinks than the system follows); EACCES `permission_denied` (a directory
+ * on the way the process may not search); ENAMETOOLONG `invalid_argument`, only for a single component the
+ * system refuses (a name longer than the volume's own limit), since a longer text is opened in pieces and a
+ * piece of several components is opened again one at a time; EMFILE, ENFILE and ENOMEM `resource_exhausted`.
+ *
+ * On a platform whose search-only open checks no permission (Linux's O_PATH) the last directory opened is asked
+ * for search permission by a step of its own (`faccessat`), as the walk's opens are; a piece after the first is
+ * looked up beneath the one before it, which the system refuses without search permission there, so the
+ * earlier ones need no step. */
 static int32_t resolve_at(bc_file_system_engine *engine, int32_t operation, const uint8_t *path, size_t parent_length,
                           bc_file_system_resolved *resolved, bc_file_system_error *error) {
-    const bc_file_system_call_outcome outcome = open_root(engine, operation, &resolved->opened.value);
-    if (!outcome.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_open, &outcome, kind_of(outcome.code));
+    /* The one PATH_MAX buffer of this call: each piece, NUL-terminated for the system. */
+    uint8_t piece[PATH_MAX] = {};
+    size_t start = 0;
+    /* Where a piece the system refused as too long ended: up to there, one component per call. */
+    size_t one_component_at_a_time_until = 0;
+    for (;;) {
+        const size_t limit = start < one_component_at_a_time_until ? one_component_only : at_piece_capacity;
+        const size_t end = piece_end_of(path, parent_length, start, limit);
+        assert(end - start < sizeof piece);
+        memcpy(piece, path + start, end - start);
+        piece[end - start] = 0;
+        /* The first piece begins the absolute text and is opened by path; a later one is relative to the last. */
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+        int32_t step = bc_file_system_step_open;
+        bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+        if (start == 0) {
+            outcome = open_by_path(engine, operation, (const char *)piece, &opened.value);
+        } else {
+            step = bc_file_system_step_openat;
+            outcome = bc_file_system_call_openat(engine, operation, resolved->parent, (const char *)piece,
+                                                 open_flags_for(bc_file_system_directory_access_search), &opened.value);
+        }
+        if (!outcome.succeeded) {
+            const bool several_components = piece_end_of(path, parent_length, start, one_component_only) < end;
+            if (!outcome.stopped && outcome.code == ENAMETOOLONG && several_components) {
+                one_component_at_a_time_until = end;
+                continue;
+            }
+            return report_outcome(error, operation, step, &outcome, kind_of(outcome.code));
+        }
+        /* The previous piece's directory is closed here: one descriptor is held at a time. */
+        adopt_descriptor(&resolved->opened, &opened);
+        resolved->parent = resolved->opened.value;
+        if (end >= parent_length) {
+            break;
+        }
+        start = end + 1;
     }
-    resolved->parent = resolved->opened.value;
-    /* The header promises that the system resolves an absolute path, symlinks on the way included. */
-    return walk(engine, operation, path, parent_length, bc_file_system_final_symlink_follow, resolved, error);
+    return verify_search_permission(engine, operation, resolved->parent, error);
 }
 
 static int32_t resolve_beneath(bc_file_system_engine *engine, int32_t operation, int held, const uint8_t *path,

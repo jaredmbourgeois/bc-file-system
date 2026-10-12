@@ -288,7 +288,7 @@ fn a_status_call_through_an_observed_engine_travels_the_same_way_and_is_counted(
     assert_eq!(status.entry_type, EntryType::Directory);
     assert_eq!(
         root_opens, 1,
-        "resolving an absolute path opens the root once"
+        "resolving the root opens it once, by path, as its own parent"
     );
 }
 

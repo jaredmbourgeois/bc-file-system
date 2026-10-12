@@ -258,10 +258,10 @@ struct ContractTests {
 
     // MARK: - Durability
 
-    /// A directory with mode 0o300 lets a path-based open create files in it, but the engine never opens by
-    /// path: the walk holds the destination's directory as a descriptor, opened read-only, which the mode
-    /// forbids a read-only open of; the walk opens it for search only, as the system treats such a directory,
-    /// so the file lands, and what cannot be opened read-only afterwards for its sync lowers the answer.
+    /// A directory with mode 0o300 lets a path-based open create files in it, and the engine creates the file
+    /// beneath the destination's directory held as a descriptor: the resolution opens it for search only, as the
+    /// system treats such a directory, never read-only, which the mode forbids, so the file lands, and what
+    /// cannot be opened read-only afterwards for its sync lowers the answer.
     @Test
     func durableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten() throws {
         let observed = try observedFileSystem()

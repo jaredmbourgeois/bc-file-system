@@ -190,18 +190,6 @@ auto stop_at(Operation operation, Step step, std::uint32_t occurrence) -> Fault 
         .operation = operation, .step = step, .occurrence = occurrence, .action = FaultAction::stop, .system_code = 0};
 }
 
-// How many components the test's own directory has: the walk from the root opens each of them with `openat`,
-// so an operation's own `openat` of its leaf is the next occurrence after them.
-auto components_of(const std::filesystem::path& path) -> std::uint64_t {
-    std::uint64_t count = 0;
-    for (const std::filesystem::path& part : path) {
-        if (part != "/") {
-            count += 1;
-        }
-    }
-    return count;
-}
-
 // The names in `directory` that are staged files of `leaf`: a staged write's temporary is `.<leaf>.bc-tmp-…`
 // beside its destination, and must never be seen after the write ends, however it ends.
 auto staged_names_of(const std::filesystem::path& directory, std::string_view leaf) -> std::vector<std::string> {
@@ -829,12 +817,11 @@ TEST_F(ObservedContract, WriteWhoseRenameFailsLeavesTheDestinationWholeAndNoTemp
     EXPECT_EQ(count(Operation::write_file, durable_sync_step()), 1U);
 }
 
-// The temporary file's creation is the first `openat` of a write after the walk's component opens: the one
-// that creates it O_EXCL beside the destination.
+// The temporary file's creation is a write's first `openat` (an `at` location's parent is opened by path, under
+// `open`): the one that creates it O_EXCL beside the destination.
 TEST_F(ObservedContract, WriteWhoseTemporaryFileCannotBeCreatedReportsWhy) {
     const auto bytes = bytes_of("content");
-    const auto staging_open = static_cast<std::uint32_t>(components_of(root_path()) + 1);
-    script(fail_step(Operation::write_file, Step::openat, staging_open, EROFS));
+    script(fail_step(Operation::write_file, Step::openat, 1, EROFS));
 
     const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
 
@@ -849,14 +836,13 @@ TEST_F(ObservedContract, WriteWhoseTemporaryFileCannotBeCreatedReportsWhy) {
 // next token: one more `openat`, and the write lands.
 TEST_F(ObservedContract, AStagedNameThatIsTakenIsTriedAgainWithTheNextToken) {
     const auto bytes = bytes_of("content");
-    const auto staging_open = static_cast<std::uint32_t>(components_of(root_path()) + 1);
-    script(fail_step(Operation::write_file, Step::openat, staging_open, EEXIST));
+    script(fail_step(Operation::write_file, Step::openat, 1, EEXIST));
 
     const auto achieved = files().write_file(in("file"), bytes, kWrittenExactly0644);
 
     ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
-    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 2);
+    EXPECT_EQ(count(Operation::write_file, Step::openat), 2U);
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file"));
 }
 
@@ -904,10 +890,10 @@ TEST_F(ObservedContract, DurableWriteWhoseDirectorySyncFailsReportsWritten) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
 }
 
-// A directory with mode 0300 (write and search, no read) takes a file: the walk opens the destination's directory
-// for search only (O_SEARCH on Apple platforms, O_PATH on Linux), as the system itself treats a directory the
-// process may enter but not read, so the file is staged and renamed into place; what the mode forbids is
-// opening the directory read-only afterwards for its sync, which lowers the answer to `written`.
+// A directory with mode 0300 (write and search, no read) takes a file: the resolution opens the destination's
+// directory for search only (O_SEARCH on Apple platforms, O_PATH on Linux), as the system itself treats a
+// directory the process may enter but not read, so the file is staged and renamed into place; what the mode
+// forbids is opening the directory read-only afterwards for its sync, which lowers the answer to `written`.
 TEST_P(FileSystemContract, DurableWriteIntoADirectoryThatCannotBeOpenedForItsSyncReportsWritten) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process opens what its permission bits forbid";
@@ -935,8 +921,9 @@ TEST_F(ObservedContract, DurableWriteSyncsTheFileThenRenamesThenSyncsTheDirector
 
     ASSERT_TRUE(achieved.has_value());
     EXPECT_EQ(*achieved, Durability::durable);
-    // The walk's component opens, the staged file's creation, and the directory opened read-only for its sync.
-    EXPECT_EQ(count(Operation::write_file, Step::openat), components_of(root_path()) + 2);
+    // The staged file's creation and the directory opened read-only for its sync; the parent was opened by path.
+    EXPECT_EQ(count(Operation::write_file, Step::open), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::openat), 2U);
     EXPECT_EQ(count(Operation::write_file, Step::write), 1U);
     EXPECT_EQ(count(Operation::write_file, Step::fchmod), 1U);
     EXPECT_EQ(count(Operation::write_file, durable_sync_step()), 2U);
@@ -1273,14 +1260,16 @@ TEST_P(FileSystemContract, SyncOfNothingIsNotFoundAndOfASymlinkIsRefused) {
     EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
 }
 
-// What a sync costs: the leaf's open and one sync under this platform's step, never the other platform's.
+// What a sync costs: the parent's open by path, the leaf's open and one sync under this platform's step, never
+// the other platform's.
 TEST_F(ObservedContract, SyncOpensTheLeafAndMakesOneSyncCallUnderThePlatformsStep) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto achieved = files().sync(in("file"));
 
     ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
-    EXPECT_EQ(count(Operation::sync, Step::openat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::sync, Step::open), 1U);
+    EXPECT_EQ(count(Operation::sync, Step::openat), 1U);
     EXPECT_EQ(count(Operation::sync, durable_sync_step()), 1U);
     EXPECT_EQ(count(Operation::sync, wrong_sync_step()), 0U);
 }
@@ -1455,8 +1444,8 @@ TEST_P(FileSystemContract, ListReturnsMoreEntriesThanTheFirstArrayHolds) {
     EXPECT_EQ(names_of(*entries), expected);
 }
 
-// The root of the file system lists like any directory: the walk opens it for search, the listing opens `.`
-// beneath it read-only.
+// The root of the file system lists like any directory: the resolution opens it for search, the listing opens
+// `.` beneath it read-only.
 TEST_P(FileSystemContract, ListOfTheRootOfTheFileSystemIsNotEmpty) {
     const auto entries = files().list_directory(Location::at(std::filesystem::path{"/"}), FinalSymlink::refuse);
 
@@ -1479,8 +1468,9 @@ TEST_F(ObservedContract, ListCountsTheEntriesThenStoresThemAndReadsEveryEntryTwi
 
     ASSERT_TRUE(entries.has_value()) << entries.error().message();
     EXPECT_EQ(entries->size(), 3U);
-    // The walk's component opens below the root, and the listed directory itself.
-    EXPECT_EQ(count(Operation::list_directory, Step::openat), components_of(root_path()));
+    // The listed directory's parent by path, and the listed directory itself.
+    EXPECT_EQ(count(Operation::list_directory, Step::open), 1U);
+    EXPECT_EQ(count(Operation::list_directory, Step::openat), 1U);
     EXPECT_EQ(count(Operation::list_directory, Step::fdopendir), 1U);
     // Three entries, `.` and `..`, and the end of the stream: six reads, twice.
     EXPECT_EQ(count(Operation::list_directory, Step::readdir), 12U);
@@ -1769,21 +1759,20 @@ TEST_P(FileSystemContract, OpenDirectoryWithoutPermissionIsPermissionDenied) {
     EXPECT_EQ(below_it.error().kind, ErrorKind::permission_denied);
 }
 
-// What resolving an `at` location costs, read from the system calls it made: the root once, then every
-// component of the test's own directory and the leaf, each opened against the one before it, each bracketed
-// by the identity check.
-TEST_F(ObservedContract, OpenDirectoryOpensTheRootThenEveryComponentThenTheLeaf) {
+// What resolving an `at` location costs, read from the system calls it made: the parent, the test's own
+// directory, opened by path in one call with nothing around it, as the system resolves a path; then the leaf,
+// the operation's own, opened against it and bracketed by the identity check.
+TEST_F(ObservedContract, OpenDirectoryOpensTheParentByPathThenTheLeaf) {
     lay_out_directories(root_path());
 
     const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
 
     ASSERT_TRUE(directory.has_value()) << directory.error().message();
-    const std::uint64_t opens = components_of(root_path()) + 1;
     EXPECT_EQ(count(Operation::open_directory, Step::open), 1U);
-    EXPECT_EQ(count(Operation::open_directory, Step::openat), opens);
-    EXPECT_EQ(count(Operation::open_directory, Step::fstatat), opens);
-    EXPECT_EQ(count(Operation::open_directory, Step::fstat), opens);
-    EXPECT_EQ(count(Operation::open_directory, Step::identity_check), opens);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstatat), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstat), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::identity_check), 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::openat2), 0U);
     EXPECT_EQ(count(Operation::open_directory, Step::openat_nofollow_any), 0U);
 }
@@ -1868,6 +1857,7 @@ TEST_F(ObservedContract, ARefusedIdentityCheckIsSymlinkRefused) {
     EXPECT_EQ(directory.error().path, path_of("sub").string());
 }
 
+// The leaf's open is the first `openat` under `at`: interrupted, it is asked again.
 TEST_F(ObservedContract, AnInterruptedComponentOpenIsAskedAgain) {
     lay_out_directories(root_path());
     script(fail_step(Operation::open_directory, Step::openat, 1, EINTR));
@@ -1875,7 +1865,7 @@ TEST_F(ObservedContract, AnInterruptedComponentOpenIsAskedAgain) {
     const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
 
     ASSERT_TRUE(directory.has_value()) << directory.error().message();
-    EXPECT_EQ(count(Operation::open_directory, Step::openat), components_of(root_path()) + 2);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat), 2U);
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -1890,14 +1880,13 @@ TEST_F(ObservedContract, ReadFileOpensTheLeafMeasuresItReadsItAndProbesOnceForMo
     const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
 
     ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
-    const std::uint64_t components = components_of(root_path());
     EXPECT_EQ(count(Operation::read_file, Step::open), 1U);
-    EXPECT_EQ(count(Operation::read_file, Step::openat), components + 1);
-    EXPECT_EQ(count(Operation::read_file, Step::fstat), components + 1);
+    EXPECT_EQ(count(Operation::read_file, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::read_file, Step::fstat), 1U);
     EXPECT_EQ(count(Operation::read_file, Step::pread), 2U);
 }
 
-// An empty file is one probe and no other read; its status is one stat of the leaf after the walk.
+// An empty file is one probe and no other read; its status is one stat of the leaf after the parent's open.
 TEST_F(ObservedContract, AnEmptyFileIsProbedOnceAndStatusStatsTheLeafOnce) {
     bc::file_system_test::write_raw(path_of("empty"), "", 0644);
 
@@ -1908,8 +1897,9 @@ TEST_F(ObservedContract, AnEmptyFileIsProbedOnceAndStatusStatsTheLeafOnce) {
     EXPECT_THAT(*bytes, IsEmpty());
     ASSERT_TRUE(status.has_value()) << status.error().message();
     EXPECT_EQ(count(Operation::read_file, Step::pread), 1U);
-    EXPECT_EQ(count(Operation::status, Step::fstatat), components_of(root_path()) + 1);
-    EXPECT_EQ(count(Operation::status, Step::openat), components_of(root_path()));
+    EXPECT_EQ(count(Operation::status, Step::open), 1U);
+    EXPECT_EQ(count(Operation::status, Step::fstatat), 1U);
+    EXPECT_EQ(count(Operation::status, Step::openat), 0U);
 }
 
 // A read interrupted by a signal is asked again, and the answer is whole.
@@ -2668,7 +2658,7 @@ TEST_F(ObservedContract, SetPermissionsIsOneFchmodatAndUnderRefuseOneLookFirst) 
     ASSERT_TRUE(followed.has_value()) << followed.error().message();
     ASSERT_TRUE(refused.has_value()) << refused.error().message();
     EXPECT_EQ(count(Operation::set_permissions, Step::fchmodat), 2U);
-    EXPECT_EQ(count(Operation::set_permissions, Step::fstatat), components_of(root_path()) * 2 + 1);
+    EXPECT_EQ(count(Operation::set_permissions, Step::fstatat), 1U);
     EXPECT_EQ(count(Operation::set_permissions, Step::fchmod), 0U);
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0640U);
 }
@@ -2683,7 +2673,7 @@ TEST_F(ObservedContract, SetPermissionsFallsBackToOpenAndFchmodWhereTheFlagIsNot
 
     ASSERT_TRUE(changed.has_value()) << changed.error().message();
     EXPECT_EQ(count(Operation::set_permissions, Step::fchmod), 1U);
-    EXPECT_EQ(count(Operation::set_permissions, Step::openat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::set_permissions, Step::openat), 1U);
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("file")), 0600U);
 }
 
@@ -2882,9 +2872,10 @@ TEST_F(ObservedContract, DurableRenameAcrossDirectoriesSyncsBothOfThem) {
     EXPECT_EQ(*achieved, Durability::durable);
     EXPECT_EQ(count(Operation::rename, durable_sync_step()), 2U);
     EXPECT_EQ(count(Operation::rename, wrong_sync_step()), 0U);
-    // The parents the two walks hold are open for search only; each directory is opened again, read-only, as
-    // `.` beneath its parent, for its sync: two more openat beyond the two walks' own.
-    EXPECT_EQ(count(Operation::rename, Step::openat), (components_of(root_path()) * 2) + 4);
+    // The two parents are opened by path for search only; each is opened again, read-only, as `.` beneath
+    // itself, for its sync: two openat, beyond the two `open`s of the resolutions.
+    EXPECT_EQ(count(Operation::rename, Step::open), 2U);
+    EXPECT_EQ(count(Operation::rename, Step::openat), 2U);
 }
 
 TEST_F(ObservedContract, DurableRenameWithinOneDirectorySyncsItOnce) {
@@ -3017,7 +3008,7 @@ TEST_F(ObservedContract, RenameOfNothingStopsAtTheSourcesStatAndNeverRenames) {
 }
 
 // The root of the file system is neither moved nor replaced: a rename with the root at either end is refused
-// with nothing asked of the system beyond the walks. The net below (a stop at the first rename of either kind)
+// with nothing asked of the system beyond the resolutions. The net below (a stop at the first rename of either kind)
 // makes a broken refusal the proof rather than the damage, as the RootRefusal cases do for remove_tree.
 TEST_F(ObservedContract, RenameOfTheRootOrOntoTheRootIsInvalidArgumentAndMovesNothing) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
@@ -3296,8 +3287,8 @@ TEST_F(ObservedContract, AStopAtTheCloneMakesNothingAndAStopAtItsReopenLeavesThe
     if (!cloned) {
         return;
     }
-    // The reopen is the first openat after the two walks and the source's own open.
-    const auto reopen = static_cast<std::uint32_t>((components_of(root_path()) * 2) + 2);
+    // The reopen is the first openat after the source's own open (the two parents are opened by path).
+    const auto reopen = static_cast<std::uint32_t>(2);
     const std::uint64_t reopens_so_far = count(Operation::copy_file, Step::openat);
     script(stop_at(Operation::copy_file, Step::openat, static_cast<std::uint32_t>(reopens_so_far) + reopen));
     const auto at_the_reopen = files().copy_file(in("source"), in("existing"), kDurableExactly0644);
@@ -3382,8 +3373,8 @@ TEST_F(ObservedContract, TryLockIsOneOpenOneLookAndOneFlockAndReadsTheTwoRefusal
     const auto acquired = files().try_lock(in("file.lock"));
     ASSERT_TRUE(acquired.has_value()) << acquired.error().message();
     EXPECT_TRUE(acquired->has_value());
-    EXPECT_EQ(count(Operation::try_lock, Step::openat), components_of(root_path()) + 1);
-    EXPECT_EQ(count(Operation::try_lock, Step::fstat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::try_lock, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::try_lock, Step::fstat), 1U);
     EXPECT_EQ(count(Operation::try_lock, Step::flock), 1U);
 
     const auto held_elsewhere = files().try_lock(in("file.lock"));
@@ -3842,9 +3833,9 @@ TEST_F(PortableOnlyContract, DurableWriteSyncsByFsyncAndTakesTheNameWithRenameat
 }
 
 // What only the no-replace rename keeps is refused before any system call: a rename, a write and a copy told to
-// refuse an existing destination, and a condemn. Not one step is counted (the walk of an `at` location begins
-// with opening the root), nothing is staged, nothing moves, and a two-location refusal names the destination,
-// whose promise it is.
+// refuse an existing destination, and a condemn. Not one step is counted (the resolution of an `at` location
+// begins with the open of its parent by path), nothing is staged, nothing moves, and a two-location refusal names
+// the destination, whose promise it is.
 TEST_F(PortableOnlyContract, WhatOnlyTheNoReplaceRenameKeepsIsUnsupportedBeforeAnySystemCall) {
     bc::file_system_test::write_raw(path_of("source"), "the new content", 0644);
     bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
@@ -3969,7 +3960,7 @@ TEST_F(ObservedContract, EveryOperationClosesWhatItOpened) {
 struct KillPoint {
     const char* label; // the case's name
     Step step;
-    std::uint32_t occurrence;                 // of `step` within one write, after the walk's own openat calls
+    std::uint32_t occurrence;                 // of `step` within one write
     ExistingDestination existing_destination; // `refuse` rows start with no destination
     bool destination_replaced;                // the rename had happened when the kill landed
     bool staged_file_remains;                 // the staged file had been created and not yet renamed
@@ -4038,15 +4029,6 @@ protected:
         const Result<void> added = engine().add_fault(fault);
         ASSERT_TRUE(added.has_value()) << added.error().message();
     }
-
-    // The occurrence the row names, counted from the write's own first openat: the walk opens every component
-    // of the test's directory with openat before the write opens anything of its own.
-    [[nodiscard]] auto occurrence_of(const KillPoint& point) const -> std::uint32_t {
-        if (point.step == Step::openat) {
-            return static_cast<std::uint32_t>(components_of(root_path()) + point.occurrence);
-        }
-        return point.occurrence;
-    }
 };
 
 INSTANTIATE_TEST_SUITE_P(Steps, WriteKillPoints, testing::ValuesIn(kill_points), kill_point_name);
@@ -4059,7 +4041,8 @@ TEST_P(WriteKillPoints, LeavesTheDestinationWholeOrReplacedAndNeverAMixture) {
     }
     const auto bytes = bytes_of("the new ledger");
     const WriteOptions options = starts_with_a_destination ? kDurableExactly0644 : kDurableExactly0644Refusing;
-    script(stop_at(Operation::write_file, point.step, occurrence_of(point)));
+    // An `at` location's parent is opened by path (step `open`), so the row's occurrence is the write's own.
+    script(stop_at(Operation::write_file, point.step, point.occurrence));
 
     const auto achieved = files().write_file(in("ledger"), bytes, options);
 
@@ -4166,11 +4149,11 @@ protected:
         ASSERT_TRUE(added.has_value()) << added.error().message();
     }
 
-    // The occurrence the row names, counted from the copy's own first openat of the staged file: the two walks
-    // open every component of the test's directory, and the source is opened once, before that.
-    [[nodiscard]] auto occurrence_of(const KillPoint& point) const -> std::uint32_t {
+    // The occurrence the row names, counted from the copy's own first openat of the staged file: the source is
+    // opened once before it (the two parents are opened by path, under `open`).
+    [[nodiscard]] static auto occurrence_of(const KillPoint& point) -> std::uint32_t {
         if (point.step == Step::openat) {
-            return static_cast<std::uint32_t>((components_of(root_path()) * 2) + 1 + point.occurrence);
+            return 1 + point.occurrence;
         }
         return point.occurrence;
     }

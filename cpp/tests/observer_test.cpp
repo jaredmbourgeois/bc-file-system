@@ -298,7 +298,7 @@ TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeOnOpenDirectory) {
     EXPECT_EQ(directory.error().path, path_of("folder").string());
 }
 
-// The root is opened once per `at` resolution, so its occurrences count the calls.
+// The parent is opened by path once per `at` resolution, so its occurrences count the calls.
 TEST_F(ObserverTest, OnlyTheNthOccurrenceFailsOnOpenDirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
     script(fail_step(Operation::open_directory, Step::open, 2, EIO));
@@ -342,8 +342,8 @@ TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeAndNothingIsWritten) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
-// The root is opened once per `at` resolution, so its occurrences count the calls (the component opens of the
-// walk would make the second `openat` fall inside the first call).
+// The parent is opened by path once per `at` resolution, so its occurrences count the calls (an `openat` would
+// count the leaf's open and any other the operation makes as well).
 TEST_F(ObserverTest, OnlyTheNthOccurrenceFails) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
     script(fail_step(Operation::read_file, Step::open, 2, EIO));
@@ -392,7 +392,7 @@ TEST_F(ObserverTest, ARenameCanFailAfterTheStagedFileWasWritten) {
 }
 
 // A scripted failure of a two-location operation is reported under the end it struck: the copy's first openat
-// is the walk to its source, so the error names the source; the rename's one step names the destination.
+// is its source's own, so the error names the source; the rename's one step names the destination.
 TEST_F(ObserverTest, RenameAndCopyErrorsNameTheEndTheyBelongTo) {
     bc::file_system_test::write_raw(path_of("source"), "content", 0644);
     script(fail_step(Operation::copy_file, Step::openat, 1, ENOSPC));

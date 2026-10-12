@@ -595,7 +595,7 @@ fn an_observed_engine_shared_between_threads_counts_every_step() {
     assert_eq!(
         root_opens,
         2 * calls_per_thread,
-        "each status opens `/` once"
+        "each status opens its parent by path once"
     );
 }
 

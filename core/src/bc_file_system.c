@@ -1067,9 +1067,10 @@ static bool spell_location(const bc_file_system_location *location, uint8_t *buf
  * it is resolved again as an `at` location, so the write stages beside what the link points at and the link
  * itself is never replaced. `current` holds the absolute text of the entry `resolved` names and is replaced by
  * the target's; it is empty until the first link is followed, when it is composed from the location. This
- * frame and its caller's hold one PATH_MAX buffer each, the one place in the core where two are live at once:
- * the system bounds a link's text and any path it opens by PATH_MAX, so a text that does not fit is refused as
- * `invalid_argument`, the kind of the ENAMETOOLONG the system would answer. */
+ * frame and its caller's hold one PATH_MAX buffer each, and the `at` resolution they end in holds a third, the
+ * one place in the core where more than one is live at once (three times PATH_MAX: 12 KiB on Linux): the system
+ * bounds a link's text by PATH_MAX and the text followed is held in one such buffer, so a text that does not fit
+ * is refused as `invalid_argument`, the kind of the ENAMETOOLONG the system would answer. */
 static int32_t follow_destination_symlink(bc_file_system_engine *engine, int32_t operation,
                                           const bc_file_system_location *location, uint8_t *current,
                                           size_t *current_length, bc_file_system_resolved *resolved,
@@ -2547,8 +2548,8 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
         return kind;
     }
     /* The directory the name goes into is opened for search, bracketed; a final symlink is the system's to
-     * resolve under `at` and refused under `beneath`, as for any component. The root is the descriptor the walk
-     * opened. */
+     * resolve under `at` and refused under `beneath`, as for any component. The root is the descriptor the
+     * resolution opened. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
     int directory = resolved.parent;
     if (resolved.leaf_length > 0) {

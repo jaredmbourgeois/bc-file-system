@@ -4,19 +4,24 @@
  * asks the system where temporary files go. Under that root it plants the S2 spike's tree with mkdirat,
  * symlinkat and openat on held descriptors, the one place the C tests touch the file system, and removes it
  * when it ends. The cases drive resolve.h directly, with no operation in between, and the public
- * `bc_file_system_directory_open` through the header: every refusal, the walk over an `at` path and a
- * `beneath` path, the fast path where the platform has one and the walk it falls back to when the fast
- * path's step is scripted to refuse, and the identity check against a directory swapped between the stat and
- * the open, which is deterministic here because the two halves of a checked open are called one at a time
- * and the swap lands between them. Every case counts the open descriptors before and after itself: a leaked
- * descriptor is the one leak no sanitizer reports.
+ * `bc_file_system_directory_open` and `bc_file_system_status_of` through the header: every refusal, the one
+ * open of an `at` parent text (in pieces past PATH_MAX, and one component at a time where the system refuses a
+ * piece as too long), the walk over a `beneath` path, the fast path where the platform has one and the walk it
+ * falls back to when the fast path's step is scripted to refuse, and the identity check against a directory
+ * swapped between the stat and the open, which is deterministic here because the two halves of a checked open
+ * are called one at a time and the swap lands between them. Every case counts the open descriptors before and
+ * after itself: a leaked descriptor is the one leak no sanitizer reports.
  *
- *   root/a/b/target.txt   "INSIDE"      what a correct walk reaches
+ *   root/a/b/target.txt   "INSIDE"      what a correct resolution reaches
  *   root/file                           a regular file where a directory is needed
  *   root/link_to_a -> a                 a symlink on the way, followed under `at`, refused under `beneath`
  *   root/dangling -> nowhere            a symlink to nothing
+ *   root/loop -> loop                   a symlink to itself, which no resolution gets through
  *   root/locked/              0000      a directory that cannot be opened (where permissions are enforced)
- *   root/<255 x's>/… five deep          a parent text longer than PATH_MAX, which only the walk can open
+ *   root/<255 x's>/… seventeen deep     a parent text longer than PATH_MAX on every platform
+ *   root/long_link -> <255 x's>/…       three levels of that chain: a link whose text, joined to the rest of a
+ *                                       path, outgrows what Apple platforms resolve in one call
+ *   root/c/c/…/c          200 deep      the depths `status_of` is counted at
  *   outside/target.txt    "OUTSIDE"     the sibling tree a swapped-in symlink points at
  *   staging/b_symlink -> ../../outside  swapped for root/a/b: a symlink where a directory was
  *   staging/b_decoy/target.txt "DECOY"  swapped for root/a/b: a directory where another directory was
@@ -83,7 +88,13 @@ enum : int32_t {
     long_component_length = NAME_MAX,
     /* Seventeen components of NAME_MAX bytes: 17 * 256 bytes of parent text, longer than PATH_MAX on every
      * platform the library ships for (4096 on Linux, 1024 on Apple), so no one-call open can take it. */
-    long_component_depth = 17
+    long_component_depth = 17,
+    /* How many levels of the long chain `long_link`'s text names: 767 bytes, which with two more long
+     * components after the link is more than Apple's PATH_MAX once the system joins them, while the path that
+     * names them is well under it. */
+    long_link_levels = 3,
+    /* The deepest level of the short chain, root/c/…/c: the benchmark's deepest `status_of` row. */
+    short_chain_depth = 200
 };
 
 static const int32_t operation = bc_file_system_operation_open_directory;
@@ -163,38 +174,65 @@ static void fill_long_name(char *name) {
     name[long_component_length] = 0;
 }
 
-static void remove_tree(fixture *tree) {
-    if (tree->base < 0) {
-        return;
+/* Plants `depth` directories nested in one another under `parent`, each named `name`, one level at a time on
+ * held descriptors. */
+static bool plant_chain(int parent, const char *name, int depth) {
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor level = {.value = -1};
+    int current = parent;
+    for (int index = 0; index < depth; ++index) {
+        if (!plant_directory(current, name, directory_mode)) {
+            return false;
+        }
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor next = {.value =
+                                                                              openat(current, name, directory_flags)};
+        if (next.value < 0) {
+            return false;
+        }
+        adopt_descriptor(&level, &next);
+        current = level.value;
     }
-    /* The deep chain, from the bottom: each level is removed through the one above it, reached one openat at a
-     * time on a single held descriptor. */
-    char long_name[long_component_length + 1];
-    fill_long_name(long_name);
-    for (int depth = long_component_depth; depth >= 1; --depth) {
+    return true;
+}
+
+/* Removes a chain `plant_chain` planted, from the bottom: each level is removed through the one above it, reached
+ * one openat at a time on a single held descriptor. A level already gone is fine. */
+static void remove_chain(int parent, const char *name, int depth) {
+    for (int bottom = depth; bottom >= 1; --bottom) {
         [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor level = {.value = -1};
-        int parent = tree->root;
-        bool reachable = tree->root >= 0;
-        for (int index = 0; reachable && index < depth - 1; ++index) {
+        int current = parent;
+        bool reachable = parent >= 0;
+        for (int index = 0; reachable && index < bottom - 1; ++index) {
             [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor next = {
-                .value = openat(parent, long_name, directory_flags)};
+                .value = openat(current, name, directory_flags)};
             if (next.value < 0) {
                 reachable = false;
                 break;
             }
             adopt_descriptor(&level, &next);
-            parent = level.value;
+            current = level.value;
         }
         if (reachable) {
-            remove_planted(parent, long_name);
+            remove_planted(current, name);
         }
     }
+}
+
+static void remove_tree(fixture *tree) {
+    if (tree->base < 0) {
+        return;
+    }
+    char long_name[long_component_length + 1];
+    fill_long_name(long_name);
+    remove_chain(tree->root, long_name, long_component_depth);
+    remove_chain(tree->root, "c", short_chain_depth);
     static const char *const under_base[] = {"root/a/b/target.txt",
                                              "root/a/b",
                                              "root/a",
                                              "root/file",
                                              "root/link_to_a",
                                              "root/dangling",
+                                             "root/loop",
+                                             "root/long_link",
                                              "root/locked",
                                              "root",
                                              "outside/target.txt",
@@ -247,7 +285,7 @@ static bool plant_tree(fixture *tree, const char *root_text, int handed_root) {
         plant_directory(tree->base, "root/a/b", directory_mode) &&
         plant_file(tree->base, "root/a/b/target.txt", "INSIDE\n") && plant_file(tree->base, "root/file", "a file\n") &&
         plant_symlink(tree->base, "root/link_to_a", "a") && plant_symlink(tree->base, "root/dangling", "nowhere") &&
-        plant_directory(tree->base, "root/locked", no_access_mode) &&
+        plant_symlink(tree->base, "root/loop", "loop") && plant_directory(tree->base, "root/locked", no_access_mode) &&
         plant_directory(tree->base, "outside", directory_mode) &&
         plant_file(tree->base, "outside/target.txt", "OUTSIDE\n") &&
         plant_directory(tree->base, "staging", directory_mode) &&
@@ -261,22 +299,28 @@ static bool plant_tree(fixture *tree, const char *root_text, int handed_root) {
     if (tree->root < 0) {
         return false;
     }
-    /* The deep chain of long names under root, one level at a time on held descriptors. */
+    /* The deep chain of long names under root, the link into its third level, and the short chain. */
     char long_name[long_component_length + 1];
     fill_long_name(long_name);
-    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor level = {.value = -1};
-    int parent = tree->root;
-    for (int depth = 0; depth < long_component_depth; ++depth) {
-        if (!plant_directory(parent, long_name, directory_mode)) {
-            return false;
+    if (!plant_chain(tree->root, long_name, long_component_depth)) {
+        return false;
+    }
+    char long_link_text[long_link_levels * (long_component_length + 1)];
+    size_t position = 0;
+    for (int level = 0; level < long_link_levels; ++level) {
+        if (level > 0) {
+            long_link_text[position] = '/';
+            position += 1;
         }
-        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor next = {
-            .value = openat(parent, long_name, directory_flags)};
-        if (next.value < 0) {
-            return false;
-        }
-        adopt_descriptor(&level, &next);
-        parent = level.value;
+        memcpy(long_link_text + position, long_name, long_component_length);
+        position += long_component_length;
+    }
+    long_link_text[position] = 0;
+    if (!plant_symlink(tree->root, "long_link", long_link_text)) {
+        return false;
+    }
+    if (!plant_chain(tree->root, "c", short_chain_depth)) {
+        return false;
     }
     const int base_written = snprintf(tree->base_text, sizeof tree->base_text, "%s/resolve_test", root_text);
     const int root_written =
@@ -348,12 +392,26 @@ static void script(report *tally, bc_file_system_engine *engine, bc_file_system_
     expect(tally, bc_file_system_observed_fault_add(engine, &fault, &error) == 0, "fault_add succeeds", what);
 }
 
-static uint64_t count_of(report *tally, const bc_file_system_engine *engine, int32_t step) {
+static uint64_t count_under(report *tally, const bc_file_system_engine *engine, int32_t counted_operation,
+                            int32_t step) {
     uint64_t count = 0;
     bc_file_system_error error;
-    expect(tally, bc_file_system_observed_step_count(engine, operation, step, &count, &error) == 0,
+    expect(tally, bc_file_system_observed_step_count(engine, counted_operation, step, &count, &error) == 0,
            "step_count succeeds", "");
     return count;
+}
+
+static uint64_t count_of(report *tally, const bc_file_system_engine *engine, int32_t step) {
+    return count_under(tally, engine, operation, step);
+}
+
+/* How many search-permission steps the last open of a resolution takes: none where the platform's search-only
+ * open checks the permission itself (Apple's O_SEARCH), one `faccessat` where it does not (Linux's O_PATH). */
+static uint64_t search_permission_steps(void) {
+    if (bc_file_system_platform_search_open_checks_permission()) {
+        return 0;
+    }
+    return 1;
 }
 
 /* Which fast-path step this platform reports, or 0 where it walks always. */
@@ -402,6 +460,35 @@ static bool descriptor_is(int descriptor, const struct stat *expected) {
         return false;
     }
     return actual.st_ino == expected->st_ino;
+}
+
+/* The identity of the `depth`-th level of a chain `plant_chain` planted under `parent`, as the test sees it. */
+static bool chain_level_identity(int parent, const char *name, int depth, struct stat *info) {
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor level = {.value = -1};
+    int current = parent;
+    for (int index = 0; index < depth - 1; ++index) {
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor next = {.value =
+                                                                              openat(current, name, directory_flags)};
+        if (next.value < 0) {
+            return false;
+        }
+        adopt_descriptor(&level, &next);
+        current = level.value;
+    }
+    return identity_of(current, name, info);
+}
+
+/* `count` long components and a leaf, `<x255>/…/<x255>/leaf`, into the caller's buffer, built from the
+ * component length so that no platform's PATH_MAX is spelled here. */
+static void spell_long_components(char *text, int count) {
+    size_t position = 0;
+    for (int depth = 0; depth < count; ++depth) {
+        memset(text + position, 'x', long_component_length);
+        position += long_component_length;
+        text[position] = '/';
+        position += 1;
+    }
+    memcpy(text + position, "leaf", 5);
 }
 
 static bool leaf_is(const bc_file_system_resolved *resolved, const char *expected) {
@@ -460,14 +547,16 @@ static void test_at_resolves_to_the_parent_and_the_leaf(report *tally, const fix
     struct stat b;
     expect(tally, identity_of(tree->base, "root/a/b", &b), "the test can stat root/a/b", "");
     expect(tally, descriptor_is(resolved.parent, &b), "the parent is root/a/b", "");
-    expect(tally, resolved.opened.value == resolved.parent, "the parent was opened by the walk", "");
+    expect(tally, resolved.opened.value == resolved.parent, "the parent was opened by the layer", "");
     expect(tally, leaf_is(&resolved, "target.txt"), "the leaf is target.txt", "");
-    /* The root, then every component of the handed root, then resolve_test, root, a and b; never the leaf. */
-    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1, "the root was opened once", "");
-    expect(tally, count_of(tally, engine, bc_file_system_step_openat) == component_count(tree->root_text) + 4,
-           "every component but the leaf was opened", "");
-    expect(tally, count_of(tally, engine, bc_file_system_step_identity_check) == component_count(tree->root_text) + 4,
-           "every component was identity-checked", "");
+    /* The whole parent text, by path, in one call, with nothing around it; never the leaf. */
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1, "the parent was opened by path once", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) == 0, "no component was opened on its own", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_fstatat) == 0, "nothing was stated before the open", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_fstat) == 0, "nothing was stated after the open", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_identity_check) == 0, "nothing was identity-checked", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_faccessat) == search_permission_steps(),
+           "the parent was asked for search permission where the open does not check it", "");
     expect(tally, count_of(tally, engine, bc_file_system_step_openat2) == 0, "an at location never takes openat2", "");
     expect(tally, count_of(tally, engine, bc_file_system_step_openat_nofollow_any) == 0,
            "an at location never takes O_NOFOLLOW_ANY", "");
@@ -488,6 +577,9 @@ static void test_at_follows_a_symlink_on_the_way(report *tally, const fixture *t
     struct stat b;
     expect(tally, identity_of(tree->base, "root/a/b", &b), "the test can stat root/a/b", "");
     expect(tally, descriptor_is(resolved.parent, &b), "the parent is the directory behind the link", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1,
+           "the system followed the link in the one open", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) == 0, "no component was opened on its own", "");
     bc_file_system_engine_release(engine);
 }
 
@@ -507,6 +599,7 @@ static void test_at_root_is_its_own_parent_with_an_empty_leaf(report *tally) {
     struct stat above;
     expect(tally, fstatat(resolved.parent, "..", &above, 0) == 0, "the test can stat above the root", "");
     expect(tally, descriptor_is(resolved.parent, &above), "the parent of the root is the root", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1, "the root was opened once, by path", "");
     expect(tally, count_of(tally, engine, bc_file_system_step_openat) == 0, "nothing but the root was opened", "");
     bc_file_system_engine_release(engine);
 }
@@ -518,7 +611,7 @@ typedef struct refusal_case {
     const char *what;
 } refusal_case;
 
-static void expect_at_refusal(report *tally, const fixture *tree, const refusal_case *item) {
+static void expect_at_refusal(report *tally, const fixture *tree, const refusal_case *item, int32_t step) {
     bc_file_system_engine *engine = create_observed(tally);
     if (engine == nullptr) {
         return;
@@ -531,30 +624,221 @@ static void expect_at_refusal(report *tally, const fixture *tree, const refusal_
            item->relative);
     expect(tally, error.kind == item->kind, "the error carries the kind", item->relative);
     expect(tally, error.operation == operation, "the error names the operation", item->relative);
-    expect(tally, error.step != 0, "the error names a step", item->relative);
+    expect(tally, error.step == step, "the error names the step that answered", item->relative);
     expect(tally, error.system_code == item->system_code, "the error carries the errno", item->relative);
     expect(tally, error.name_length == 0, "the error names no entry: the location itself failed", item->relative);
     expect(tally, resolved.parent == -1, "nothing was resolved", item->relative);
     bc_file_system_engine_release(engine);
 }
 
+/* The system's answers to the one open of the parent text, each read by the core's one table; no stat preceded
+ * the open, so a file on the way is the system's ENOTDIR, `not_directory`. */
 static void test_at_refusals(report *tally, const fixture *tree) {
     static const refusal_case cases[] = {
         {"missing/x/leaf", bc_file_system_error_kind_not_found, ENOENT, "a missing component is not_found"},
         {"a/b/missing/leaf", bc_file_system_error_kind_not_found, ENOENT, "a missing deeper component is not_found"},
         {"file/leaf", bc_file_system_error_kind_not_directory, ENOTDIR, "a file on the way is not_directory"},
         {"dangling/leaf", bc_file_system_error_kind_not_found, ENOENT, "a dangling symlink on the way is not_found"},
+        {"loop/leaf", bc_file_system_error_kind_symlink_refused, ELOOP, "a symlink loop on the way is symlink_refused"},
     };
     for (size_t index = 0; index < sizeof cases / sizeof cases[0]; ++index) {
-        expect_at_refusal(tally, tree, &cases[index]);
+        expect_at_refusal(tally, tree, &cases[index], bc_file_system_step_open);
     }
     if (tree->permissions_enforced) {
         const refusal_case locked = {"locked/leaf", bc_file_system_error_kind_permission_denied, EACCES,
                                      "a directory without permission is permission_denied"};
-        expect_at_refusal(tally, tree, &locked);
+        /* Apple's O_SEARCH open refuses it; Linux's O_PATH open checks nothing, and the step after it refuses. */
+        const int32_t step = search_permission_steps() == 0 ? bc_file_system_step_open : bc_file_system_step_faccessat;
+        expect_at_refusal(tally, tree, &locked, step);
     } else {
         printf("NOTE: this process opens what its permission bits forbid; the permission case did not run\n");
     }
+}
+
+/* What no planted tree provokes, scripted on the open: running out of descriptors is `resource_exhausted`, and
+ * ENAMETOOLONG for a piece that cannot be split (the root's slash alone) is `invalid_argument`. */
+static void expect_scripted_open_refusal(report *tally, const char *text, int system_code, int32_t kind,
+                                         const char *what) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    script(tally, engine, fail_step(bc_file_system_step_open, 1, system_code), what);
+    const bc_file_system_location location = at_text(text);
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_error error;
+    expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == kind, what, text);
+    expect(tally, error.step == bc_file_system_step_open, "at the open", what);
+    expect(tally, error.system_code == system_code, "with the errno", what);
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1, "the open was asked once", what);
+    bc_file_system_engine_release(engine);
+}
+
+static void test_at_errno_table_of_the_open(report *tally, const fixture *tree) {
+    char text[text_capacity];
+    const char *beneath_root = under_root(tree, "a/b/target.txt", text, sizeof text);
+    expect_scripted_open_refusal(tally, beneath_root, EMFILE, bc_file_system_error_kind_resource_exhausted,
+                                 "EMFILE on the open is resource_exhausted");
+    expect_scripted_open_refusal(tally, beneath_root, ENFILE, bc_file_system_error_kind_resource_exhausted,
+                                 "ENFILE on the open is resource_exhausted");
+    expect_scripted_open_refusal(tally, "/top-level", ENAMETOOLONG, bc_file_system_error_kind_invalid_argument,
+                                 "ENAMETOOLONG for the root's slash alone is invalid_argument");
+}
+
+/* What `status_of` costs under `at`, read through the public function at four depths below the planted root
+ * (the benchmark's 1, 8, 50 and 200): the parent text opened by path once and the leaf stated once, at every
+ * depth, with the search-permission step where the platform's open does not check it. */
+static void test_at_status_is_one_open_and_one_stat_at_every_depth(report *tally, const fixture *tree) {
+    static const int depths[] = {1, 8, 50, short_chain_depth};
+    for (size_t index = 0; index < sizeof depths / sizeof depths[0]; ++index) {
+        bc_file_system_engine *engine = create_observed(tally);
+        if (engine == nullptr) {
+            return;
+        }
+        char relative[text_capacity];
+        size_t position = 0;
+        for (int level = 0; level < depths[index]; ++level) {
+            if (level > 0) {
+                relative[position] = '/';
+                position += 1;
+            }
+            relative[position] = 'c';
+            position += 1;
+        }
+        relative[position] = 0;
+        char text[text_capacity];
+        const bc_file_system_location location = at_text(under_root(tree, relative, text, sizeof text));
+        int32_t present = 0;
+        bc_file_system_status status;
+        bc_file_system_error error;
+        const int32_t status_operation = bc_file_system_operation_status;
+        expect(tally,
+               bc_file_system_status_of(engine, &location, bc_file_system_final_symlink_refuse, &present, &status,
+                                        &error) == 0,
+               "status_of under at succeeds", relative);
+        expect(tally, present == 1, "the directory at that depth is present", relative);
+        expect(tally, count_under(tally, engine, status_operation, bc_file_system_step_open) == 1,
+               "the parent was opened by path once", relative);
+        expect(tally, count_under(tally, engine, status_operation, bc_file_system_step_fstatat) == 1,
+               "the leaf was stated once", relative);
+        expect(tally,
+               count_under(tally, engine, status_operation, bc_file_system_step_faccessat) == search_permission_steps(),
+               "the search-permission step where the open does not check it", relative);
+        expect(tally, count_under(tally, engine, status_operation, bc_file_system_step_openat) == 0,
+               "no component was opened on its own", relative);
+        expect(tally, count_under(tally, engine, status_operation, bc_file_system_step_fstat) == 0,
+               "nothing was stated through a descriptor", relative);
+        expect(tally, count_under(tally, engine, status_operation, bc_file_system_step_identity_check) == 0,
+               "nothing was identity-checked", relative);
+        bc_file_system_engine_release(engine);
+    }
+}
+
+/* A parent text longer than PATH_MAX on every platform (the long chain's seventeen NAME_MAX components) is
+ * opened piece after piece: the first by path, each later one beneath the last, fewer calls than components. */
+static void test_at_parent_longer_than_path_max_opens_in_pieces(report *tally, const fixture *tree) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    char relative[text_capacity];
+    spell_long_components(relative, long_component_depth);
+    char text[text_capacity];
+    const bc_file_system_location location = at_text(under_root(tree, relative, text, sizeof text));
+    /* Seventeen components of 256 bytes exceed both values PATH_MAX takes (1024 on Apple, 4096 on Linux). */
+    expect(tally, strlen(text) >= PATH_MAX, "the at text was spelled whole, longer than PATH_MAX", "");
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_error error;
+    expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
+           "an at parent text longer than PATH_MAX resolves", "");
+    expect(tally, leaf_is(&resolved, "leaf"), "the leaf is leaf", "");
+    char long_name[long_component_length + 1];
+    fill_long_name(long_name);
+    struct stat deepest;
+    expect(tally, chain_level_identity(tree->root, long_name, long_component_depth, &deepest),
+           "the test can stat the chain's deepest level", "");
+    expect(tally, descriptor_is(resolved.parent, &deepest), "the parent is the chain's deepest level", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 1, "the first piece was opened by path", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) >= 1, "a later piece was opened beneath it", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) < long_component_depth,
+           "fewer opens than components: whole pieces, not one component at a time", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_identity_check) == 0, "nothing was identity-checked", "");
+    bc_file_system_engine_release(engine);
+}
+
+/* A piece the system answers ENAMETOOLONG for is opened again one component at a time, scripted here so the
+ * count is exact on every platform: the first open refused, then `/` with the first component by path, then
+ * every other component of the parent text beneath the one before it. */
+static void test_at_piece_refused_as_too_long_is_opened_one_component_at_a_time(report *tally, const fixture *tree) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    script(tally, engine, fail_step(bc_file_system_step_open, 1, ENAMETOOLONG), "the whole parent is too long");
+    char text[text_capacity];
+    const bc_file_system_location location = at_text(under_root(tree, "a/b/target.txt", text, sizeof text));
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_error error;
+    expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
+           "a piece refused as too long still resolves", "");
+    struct stat b;
+    expect(tally, identity_of(tree->base, "root/a/b", &b), "the test can stat root/a/b", "");
+    expect(tally, descriptor_is(resolved.parent, &b), "the parent is root/a/b", "");
+    /* The parent text is the handed root's components, then resolve_test, root, a and b. */
+    const uint64_t components = component_count(tree->root_text) + 4;
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 2, "the refused open, then the first component",
+           "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) == components - 1,
+           "every other component, one at a time", "");
+    bc_file_system_engine_release(engine);
+}
+
+/* The real case behind the fallback: `long_link`'s text is 767 bytes, and the path names two more long
+ * components after it, so the expanded text outgrows Apple's PATH_MAX while the path is far under it (Linux
+ * bounds no expansion and resolves it in one call). Either way the operation resolves. */
+static void test_at_symlink_whose_text_outgrows_one_call_still_resolves(report *tally, const fixture *tree) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    char after_link[text_capacity];
+    spell_long_components(after_link, 2);
+    char relative[text_capacity];
+    const int written = snprintf(relative, sizeof relative, "long_link/%s", after_link);
+    expect(tally, written > 0, "the relative text was spelled", "");
+    char text[text_capacity];
+    const bc_file_system_location location = at_text(under_root(tree, relative, text, sizeof text));
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_error error;
+    expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
+           "a link whose text outgrows one call still resolves", "");
+    char long_name[long_component_length + 1];
+    fill_long_name(long_name);
+    struct stat level;
+    expect(tally, chain_level_identity(tree->root, long_name, long_link_levels + 2, &level),
+           "the test can stat the chain's fifth level", "");
+    expect(tally, descriptor_is(resolved.parent, &level), "the parent is the chain's fifth level", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_identity_check) == 0, "nothing was identity-checked", "");
+    bc_file_system_engine_release(engine);
+}
+
+static void test_an_interrupted_open_of_the_parent_is_asked_again(report *tally, const fixture *tree) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    script(tally, engine, fail_step(bc_file_system_step_open, 1, EINTR), "the open of the parent is interrupted");
+    char text[text_capacity];
+    const bc_file_system_location location = at_text(under_root(tree, "a/b/target.txt", text, sizeof text));
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_error error;
+    expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
+           "an interrupted open still resolves", "");
+    expect(tally, count_of(tally, engine, bc_file_system_step_open) == 2, "the interrupted open was asked again", "");
+    struct stat b;
+    expect(tally, identity_of(tree->base, "root/a/b", &b), "the test can stat root/a/b", "");
+    expect(tally, descriptor_is(resolved.parent, &b), "the parent is root/a/b", "");
+    bc_file_system_engine_release(engine);
 }
 
 /* ---- The cases: beneath ----------------------------------------------------------------------------------- */
@@ -795,35 +1079,59 @@ static void test_a_parent_longer_than_path_max_is_walked(report *tally, const fi
     bc_file_system_engine_release(engine);
 }
 
+/* The walk's own EINTR, under `beneath` with the fast path refused so the walk runs: the walk's first openat
+ * and the resolution's second fstatat are interrupted, and each is asked again. Where the platform has a fast
+ * path its refused attempt made one stat first. (An `at` location walks nothing; its interrupted open is the
+ * case above.) */
 static void test_an_interrupted_component_open_is_asked_again(report *tally, const fixture *tree) {
     bc_file_system_engine *engine = create_observed(tally);
     if (engine == nullptr) {
         return;
     }
-    script(tally, engine, fail_step(bc_file_system_step_openat, 1, EINTR), "the first openat is interrupted");
-    script(tally, engine, fail_step(bc_file_system_step_fstatat, 2, EINTR), "the second fstatat is interrupted");
-    char text[text_capacity];
-    const bc_file_system_location location = at_text(under_root(tree, "a/b/target.txt", text, sizeof text));
+    bc_file_system_directory *root = open_root_directory(tally, engine, tree);
+    if (root == nullptr) {
+        bc_file_system_engine_release(engine);
+        return;
+    }
+    const int32_t fast_step = script_fast_path(tally, engine, ENOSYS);
+    const uint64_t opens_before = count_of(tally, engine, bc_file_system_step_openat);
+    const uint64_t stats_before = count_of(tally, engine, bc_file_system_step_fstatat);
+    script(tally, engine, fail_step(bc_file_system_step_openat, (uint32_t)opens_before + 1, EINTR),
+           "the walk's first openat is interrupted");
+    script(tally, engine, fail_step(bc_file_system_step_fstatat, (uint32_t)stats_before + 2, EINTR),
+           "the second fstatat is interrupted");
+    const bc_file_system_location location = beneath_text(root, "a/b/target.txt");
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
     bc_file_system_error error;
     expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
            "an interrupted walk still resolves", "");
-    const uint64_t components = component_count(tree->root_text) + 4;
-    expect(tally, count_of(tally, engine, bc_file_system_step_openat) == components + 1,
+    /* a and b, and the interrupted one asked again; a refused fast path's stat before them. */
+    const uint64_t fast_path_stats = fast_step != 0 ? 1 : 0;
+    expect(tally, count_of(tally, engine, bc_file_system_step_openat) - opens_before == 3,
            "the interrupted openat was asked again", "");
-    expect(tally, count_of(tally, engine, bc_file_system_step_fstatat) == components + 1,
+    expect(tally, count_of(tally, engine, bc_file_system_step_fstatat) - stats_before == fast_path_stats + 3,
            "the interrupted fstatat was asked again", "");
+    bc_file_system_directory_release(root);
     bc_file_system_engine_release(engine);
 }
 
+/* The identity check is the walk's (and the fast path's), never `at`'s: under `beneath`, with the walk forced, a
+ * scripted failure of the first check is the mismatch. */
 static void test_a_scripted_identity_check_is_symlink_refused(report *tally, const fixture *tree) {
     bc_file_system_engine *engine = create_observed(tally);
     if (engine == nullptr) {
         return;
     }
-    script(tally, engine, fail_step(bc_file_system_step_identity_check, 1, EIO), "the first identity check fails");
-    char text[text_capacity];
-    const bc_file_system_location location = at_text(under_root(tree, "a/b/target.txt", text, sizeof text));
+    bc_file_system_directory *root = open_root_directory(tally, engine, tree);
+    if (root == nullptr) {
+        bc_file_system_engine_release(engine);
+        return;
+    }
+    (void)script_fast_path(tally, engine, ENOSYS);
+    const uint64_t checks_before = count_of(tally, engine, bc_file_system_step_identity_check);
+    script(tally, engine, fail_step(bc_file_system_step_identity_check, (uint32_t)checks_before + 1, EIO),
+           "the walk's first identity check fails");
+    const bc_file_system_location location = beneath_text(root, "a/b/target.txt");
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
     bc_file_system_error error;
     expect(tally,
@@ -832,6 +1140,7 @@ static void test_a_scripted_identity_check_is_symlink_refused(report *tally, con
            "a scripted identity mismatch is symlink_refused", "");
     expect(tally, error.step == bc_file_system_step_identity_check, "at the identity check", "");
     expect(tally, error.system_code == EIO, "with the scripted errno", "");
+    bc_file_system_directory_release(root);
     bc_file_system_engine_release(engine);
 }
 
@@ -939,6 +1248,32 @@ static void test_a_symlink_swapped_in_before_the_walk_is_refused(report *tally, 
                    "a symlink swapped in for b is refused", forced == 1 ? "by the walk" : "by the fast path");
             bc_file_system_directory_release(root);
         }
+        bc_file_system_engine_release(engine);
+    }
+    expect(tally, swap_entries(tree, "staging/b_symlink"), "the swap was undone", "");
+}
+
+/* The same swap under `at`: nothing guards the window, because the system resolves an `at` path and would follow
+ * the symlink itself. The resolution answers what the system answers, the directory the link points at, and the
+ * outside tree is reached; containment is `beneath`'s, which refuses the same swap above. */
+static void test_a_symlink_swapped_in_under_at_is_followed_as_the_system_follows_it(report *tally,
+                                                                                    const fixture *tree) {
+    if (!platform_can_swap()) {
+        return;
+    }
+    expect(tally, swap_entries(tree, "staging/b_symlink"), "the swap landed", "");
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine != nullptr) {
+        char text[text_capacity];
+        const bc_file_system_location location = at_text(under_root(tree, "a/b/target.txt", text, sizeof text));
+        [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved =
+            bc_file_system_resolved_empty();
+        bc_file_system_error error;
+        expect(tally, bc_file_system_resolve(engine, operation, &location, &resolved, &error) == 0,
+               "at resolves through the swapped-in symlink", "");
+        struct stat outside;
+        expect(tally, identity_of(tree->base, "outside", &outside), "the test can stat outside", "");
+        expect(tally, descriptor_is(resolved.parent, &outside), "the parent is where the link points: outside", "");
         bc_file_system_engine_release(engine);
     }
     expect(tally, swap_entries(tree, "staging/b_symlink"), "the swap was undone", "");
@@ -1088,6 +1423,13 @@ int main(int argument_count, char **arguments) {
         expect(&tally, before == count_open_descriptors(), "the case left every descriptor as it found it", "the root");
     }
     run_balanced(&tally, &tree, test_at_refusals, "at refusals");
+    run_balanced(&tally, &tree, test_at_errno_table_of_the_open, "at errno table");
+    run_balanced(&tally, &tree, test_at_status_is_one_open_and_one_stat_at_every_depth, "at status depths");
+    run_balanced(&tally, &tree, test_at_parent_longer_than_path_max_opens_in_pieces, "at longer than PATH_MAX");
+    run_balanced(&tally, &tree, test_at_piece_refused_as_too_long_is_opened_one_component_at_a_time,
+                 "at piece too long");
+    run_balanced(&tally, &tree, test_at_symlink_whose_text_outgrows_one_call_still_resolves, "at long link");
+    run_balanced(&tally, &tree, test_an_interrupted_open_of_the_parent_is_asked_again, "at EINTR");
     run_balanced(&tally, &tree, test_beneath_resolves_with_the_fast_path_where_there_is_one, "beneath resolves");
     run_balanced(&tally, &tree, test_beneath_one_component_needs_no_open, "beneath one component");
     run_balanced(&tally, &tree, test_a_refused_fast_path_falls_back_to_the_walk, "fallback");
@@ -1099,6 +1441,8 @@ int main(int argument_count, char **arguments) {
     run_balanced(&tally, &tree, test_a_scripted_identity_check_is_symlink_refused, "scripted identity check");
     run_balanced(&tally, &tree, test_the_identity_check_catches_a_swapped_directory, "the race");
     run_balanced(&tally, &tree, test_a_symlink_swapped_in_before_the_walk_is_refused, "swapped before the walk");
+    run_balanced(&tally, &tree, test_a_symlink_swapped_in_under_at_is_followed_as_the_system_follows_it,
+                 "swapped under at");
     run_balanced(&tally, &tree, test_directory_open_remembers_its_text, "directory_open text");
     run_balanced(&tally, &tree, test_directory_open_leaf_refusals, "directory_open refusals");
     run_balanced(&tally, &tree, test_directory_open_follows_a_final_symlink_when_told_to, "directory_open follow");
