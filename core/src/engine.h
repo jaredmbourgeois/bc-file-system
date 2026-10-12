@@ -45,7 +45,8 @@ typedef struct bc_file_system_step_verdict {
     int32_t system_code; /* the errno to fail with under `fail`; 0 otherwise */
 } bc_file_system_step_verdict;
 
-/* The fast paths the factory probed when it created `engine`. Borrowed; lives as long as the engine. */
+/* The fast paths `engine` was created with: what the platform's probe found, or none at all for the
+ * portable-only engine. Borrowed; lives as long as the engine. */
 const bc_file_system_platform_fast_paths *bc_file_system_engine_fast_paths(const bc_file_system_engine *engine);
 
 /* The operation has validated its arguments and is about to make its first system call. On a live engine this

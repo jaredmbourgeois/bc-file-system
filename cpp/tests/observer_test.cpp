@@ -9,6 +9,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <bc_file_system/engine.hpp>
@@ -152,8 +153,11 @@ TEST_F(LiveEngineTest, RefusesStepCountWithInvalidArgument) {
 // The observed engine's bookkeeping
 // -------------------------------------------------------------------------------------------------------------
 
-class ObserverTest : public bc::file_system_test::DescriptorBalanced {
+// What the cases below share: a directory the test owns, an engine created for tests, and the file system over it.
+class ObserverFixture : public bc::file_system_test::DescriptorBalanced {
 protected:
+    explicit ObserverFixture(Result<Engine> engine) : engine_(std::move(engine)) {}
+
     auto SetUp() -> void override {
         ASSERT_TRUE(directory_.has_value());
         ASSERT_TRUE(engine_.has_value()) << engine_.error().message();
@@ -187,8 +191,19 @@ protected:
 
 private:
     std::optional<TemporaryDirectory> directory_ = TemporaryDirectory::create_under(temporary_root());
-    Result<Engine> engine_ = Engine::observed_for_tests();
+    Result<Engine> engine_;
     std::optional<FileSystem> files_;
+};
+
+class ObserverTest : public ObserverFixture {
+protected:
+    ObserverTest() : ObserverFixture(Engine::observed_for_tests()) {}
+};
+
+// The portable-only engine is the observed engine refused every fast path.
+class PortableOnlyObserverTest : public ObserverFixture {
+protected:
+    PortableOnlyObserverTest() : ObserverFixture(Engine::portable_only_for_tests()) {}
 };
 
 TEST_F(ObserverTest, AFreshEngineHasCountedNothing) {
@@ -528,6 +543,34 @@ TEST_F(ObserverTest, AStopFaultReturnsFromTheStepWithoutCleanup) {
     EXPECT_FALSE(achieved.has_value());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the old ledger");
     EXPECT_EQ(bc::file_system_test::names_raw(root_path()).size(), 2U);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// The portable-only engine's observer
+// -------------------------------------------------------------------------------------------------------------
+
+// The portable-only engine refuses nothing the observed one accepts: a fault is scripted and takes effect at its
+// step, the faults are cleared, the counts read. A fault on a fast path's step is accepted too and never fires,
+// since no operation of this engine reaches that step.
+TEST_F(PortableOnlyObserverTest, AcceptsEveryObserverCallTheObservedEngineAccepts) {
+    bc::file_system_test::write_raw(path_of("source"), "content", 0644);
+    script(fail_step(Operation::copy_file, Step::clone_file, 1, ENOTSUP));
+    script(fail_step(Operation::copy_file, Step::pread, 1, EIO));
+
+    const auto failed = files().copy_file(in("source"), in("copy"), kWrittenExactly0644);
+    const Result<void> cleared = engine().clear_faults();
+    const auto copied = files().copy_file(in("source"), in("copy"), kWrittenExactly0644);
+
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(failed.error().step, Step::pread);
+    EXPECT_EQ(failed.error().system_code, EIO);
+    ASSERT_TRUE(cleared.has_value()) << cleared.error().message();
+    ASSERT_TRUE(copied.has_value()) << copied.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("copy")), "content");
+    EXPECT_EQ(count(Operation::copy_file, Step::clone_file), 0U);
+    // The failed read, then the second copy's read of the bytes and its read of the end.
+    EXPECT_EQ(count(Operation::copy_file, Step::pread), 3U);
 }
 
 } // namespace

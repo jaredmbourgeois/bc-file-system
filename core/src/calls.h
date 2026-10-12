@@ -69,13 +69,14 @@ bc_file_system_call_outcome bc_file_system_call_write(bc_file_system_engine *eng
 
 /* ---- Making a change stick --------------------------------------------------------------------------------- */
 
-/* The step a sync is made under on this engine's platform: `fcntl_fullfsync` where the engine probed
- * F_FULLFSYNC, `fsync` elsewhere. What `bc_file_system_call_sync` asks the observer with, and what an operation
- * reports a failed sync at. */
+/* The step a sync is made under on this engine: `fcntl_fullfsync` where the engine holds F_FULLFSYNC among its
+ * fast paths, `fsync` elsewhere (an engine refused its fast paths included). What `bc_file_system_call_sync` asks
+ * the observer with, and what an operation reports a failed sync at. */
 int32_t bc_file_system_call_sync_step(const bc_file_system_engine *engine);
-/* The platform's durable sync of one open file or directory (`bc_file_system_platform_sync_descriptor`), under
- * the step above. ENOTSUP, and the codes a scripted fault may spell for the same fact (EOPNOTSUPP, EINVAL,
- * ENOTTY), mean the volume offers no sync. */
+/* The engine's durable sync of one open file or directory, the call the step above names: the platform's full
+ * sync (`bc_file_system_platform_full_sync_descriptor`) where the engine holds one, fsync
+ * (`bc_file_system_platform_sync_descriptor`) otherwise. ENOTSUP, and the codes a scripted fault may spell for
+ * the same fact (EOPNOTSUPP, EINVAL, ENOTTY), mean the volume offers no sync. */
 bc_file_system_call_outcome bc_file_system_call_sync(bc_file_system_engine *engine, int32_t operation, int descriptor);
 /* `close`, made once and never asked again: after EINTR the descriptor's state is unspecified, and a second
  * close is the double-close class. The descriptor is consumed whatever the answer, so the caller releases it

@@ -305,6 +305,11 @@ unsafe extern "C" {
         engine: *mut *mut bc_file_system_engine,
         error: *mut bc_file_system_error,
     ) -> i32;
+    /// The observed engine with every fast path refused; test code only.
+    pub fn bc_file_system_engine_create_portable_only_for_tests(
+        engine: *mut *mut bc_file_system_engine,
+        error: *mut bc_file_system_error,
+    ) -> i32;
     /// Releases an engine; `engine` may be null.
     pub fn bc_file_system_engine_release(engine: *mut bc_file_system_engine);
     /// Scripts one fault into an observed engine; `fault` is copied.

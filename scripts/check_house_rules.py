@@ -22,8 +22,9 @@ check, one finding per violation, each named for its rule:
                                   a CMake `macro()`; a compile definition of a name that is not a knob, in a
                                   CMake command, a `CMakePresets.json` `*_FLAGS*` cache variable, or a `.define`
     face-parity                   a function the configured C header declares that a face's files never name
-    test-only-factory             the observed-engine factory (the only way to install the observer) named
-                                  outside the header, the core, the one face wrapper per language and test code
+    test-only-factory             a factory for tests (the observed and the portable-only engine, the only ways
+                                  to install the observer) named outside the header, the core, the one face
+                                  wrapper per language and test code
 
 The checks are lexical, over text with comments and literals blanked. What they cannot see, and a review must:
 a default respelled (a forwarding overload, an in-body fallback), a reach through an alias of one's own or a
@@ -83,9 +84,9 @@ class Configuration:
     face_parity_header: str
     face_parity_prefix: str
     face_parity_faces: dict[str, tuple[str, ...]]
-    # The test-only factory: patterns (over blanked text) that name the observed-engine factory in any language,
-    # and the files or directory prefixes (ending in "/") where naming it is legal: the header and the core that
-    # declare and define it, the one wrapper per face, the test fixtures and the tests.
+    # The test-only factories: patterns (over blanked text) that name a factory for tests in any language, and the
+    # files or directory prefixes (ending in "/") where naming one is legal: the header and the core that declare
+    # and define them, the one wrapper per face, the test fixtures and the tests.
     test_only_factory_patterns: tuple[str, ...]
     test_only_factory_is_legal_in: tuple[str, ...]
 
@@ -176,10 +177,14 @@ CONFIGURATION: Final = Configuration(
         ),
         "Rust": ("crates/bc-file-system/src/live.rs", "crates/bc-file-system/src/location.rs"),
     },
+    # Each factory three ways: the C name, the C++ and Rust spelling, the Swift one.
     test_only_factory_patterns=(
         r"\bbc_file_system_engine_create_observed_for_tests\b",
         r"\bobserved_for_tests\b",
         r"\.\s*observed\s*\(\s*root\s*:",
+        r"\bbc_file_system_engine_create_portable_only_for_tests\b",
+        r"\bportable_only_for_tests\b",
+        r"\.\s*portableOnly\s*\(\s*root\s*:",
     ),
     test_only_factory_is_legal_in=(
         "core/include/bc_file_system/bc_file_system.h",
@@ -979,8 +984,8 @@ def face_parity_findings(
 def test_only_factory_findings(
     source: str, path: str, language: str, patterns: tuple[str, ...], legal: tuple[str, ...]
 ) -> list[Finding]:
-    """Return one finding per line that names the observed-engine factory in a file where that is not legal: a
-    legal entry is the file's own path or a directory prefix of it."""
+    """Return one finding per line that names a factory for tests in a file where that is not legal: a legal
+    entry is the file's own path or a directory prefix of it."""
     if any(path == entry or (entry.endswith("/") and path.startswith(entry)) for entry in legal):
         return []
     blanked = blank_comments_and_literals(source, "swift" if language == "swift" else "c")
@@ -992,7 +997,7 @@ def test_only_factory_findings(
                     "test-only-factory",
                     path,
                     line_index + 1,
-                    "the observed-engine factory is named outside the header, the core, the face wrapper and test code",
+                    "a factory for tests is named outside the header, the core, the face wrapper and test code",
                 )
             )
     return findings
@@ -1317,11 +1322,16 @@ SELFTEST_CONFIGURATION: Final = Configuration(
     face_parity_header="",
     face_parity_prefix="",
     face_parity_faces={},
-    test_only_factory_patterns=(r"\bplanted_engine_create_observed_for_tests\b", r"\.\s*observed\s*\(\s*root\s*:"),
+    test_only_factory_patterns=(
+        r"\bplanted_engine_create_observed_for_tests\b",
+        r"\.\s*observed\s*\(\s*root\s*:",
+        r"\bplanted_engine_create_portable_only_for_tests\b",
+        r"\.\s*portableOnly\s*\(\s*root\s*:",
+    ),
     test_only_factory_is_legal_in=("core/src/planted_core.c", "cpp/src/engine.cpp", "Tests/"),
 )
-# (source, path, expected) for the test-only factory: the C name and the Swift spelling, in the library, in a
-# legal file, under a legal directory, and commented out.
+# (source, path, expected) for the test-only factories, the observed one and a second beside it: the C name and
+# the Swift spelling, in the library, in a legal file, under a legal directory, and commented out.
 TEST_ONLY_FACTORY_PLANTS: Final = (
     ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "cpp/src/file_system.cpp", 1),
     ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "cpp/src/engine.cpp", 0),
@@ -1330,6 +1340,11 @@ TEST_ONLY_FACTORY_PLANTS: Final = (
     ("let files = FileSystem.observed(root: root)", "Tests/PlantedTests/PlantedTests.swift", 0),
     ("// planted_engine_create_observed_for_tests is what this file does not call", "cpp/src/file_system.cpp", 0),
     ("let files = FileSystem.observedElsewhere(root: root)", "Sources/Planted/Planted.swift", 0),
+    ("engine = planted_engine_create_portable_only_for_tests(&engine, &error);", "cpp/src/file_system.cpp", 1),
+    ("engine = planted_engine_create_portable_only_for_tests(&engine, &error);", "cpp/src/engine.cpp", 0),
+    ("let files = FileSystem.portableOnly(root: root)", "Sources/Planted/Planted.swift", 1),
+    ("let files = FileSystem.portableOnly(root: root)", "Tests/PlantedTests/PlantedTests.swift", 0),
+    ("let files = FileSystem.portableOnlyElsewhere(root: root)", "Sources/Planted/Planted.swift", 0),
 )
 
 

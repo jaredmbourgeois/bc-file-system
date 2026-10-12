@@ -580,7 +580,7 @@ TEST(ErrorMappingTest, TheFirstSixKindsKeepTheirValues) {
 }
 
 TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
-    const std::array<std::string_view, 39> names = {"engine_create_live",
+    const std::array<std::string_view, 40> names = {"engine_create_live",
                                                     "engine_create_observed_for_tests",
                                                     "open_directory",
                                                     "directory_opened_as",
@@ -618,7 +618,8 @@ TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
                                                     "path_relate",
                                                     "path_lexically_normalize",
                                                     "path_resolve_against",
-                                                    "path_library_name"};
+                                                    "path_library_name",
+                                                    "engine_create_portable_only_for_tests"};
 
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto value = static_cast<std::int32_t>(index + 1);
@@ -628,7 +629,7 @@ TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
         EXPECT_EQ(name_of(*operation), names[index]);
     }
     EXPECT_FALSE(bc::file_system::operation_from(0).has_value());
-    EXPECT_FALSE(bc::file_system::operation_from(40).has_value());
+    EXPECT_FALSE(bc::file_system::operation_from(41).has_value());
 }
 
 TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {

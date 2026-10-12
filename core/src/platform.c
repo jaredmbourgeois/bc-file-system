@@ -1,4 +1,4 @@
-/* platform.c — the bodies behind platform.h: the fast-path probe and the five platform operations.
+/* platform.c — the bodies behind platform.h: the fast-path probe and the six platform operations.
  *
  * The one translation unit of the core that names an operating system. Each platform's bodies sit together
  * under one guard on a predefined name (`__APPLE__`, `__EMSCRIPTEN__`, `__linux__`, which covers glibc, musl
@@ -39,6 +39,10 @@ static_assert(sizeof(off_t) == 8, "bc-file-system requires a 64-bit off_t");
 
 /* ---- Shared pieces ----------------------------------------------------------------------------------------- */
 
+/* Only the platforms that make a sync call read these: Emscripten's sync bodies answer ENOTSUP without one, and an
+ * unused static is an error under its full warning set. */
+#if defined(__APPLE__) || defined(__linux__)
+
 /* The errnos a volume answers when it offers no sync at all (a pipe, a special file, a network mount without the
  * call); each becomes ENOTSUP so the engine reports `written` instead of an error. */
 static bool means_no_sync_offered(int code) {
@@ -57,6 +61,8 @@ static int sync_refusal(int code) {
     }
     return code;
 }
+
+#endif
 
 #ifdef __APPLE__
 
@@ -115,8 +121,20 @@ int bc_file_system_platform_open_beneath(int root, const char *relative, int ope
     return code;
 }
 
-/* fsync on Apple platforms stops at the drive's cache; F_FULLFSYNC asks the drive to flush that cache. */
+/* fsync on Apple platforms stops at the drive's cache: the sync of an engine refused its fast paths. */
 int bc_file_system_platform_sync_descriptor(int descriptor) {
+    int code = 0;
+    do {
+        if (fsync(descriptor) == 0) {
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    return sync_refusal(code);
+}
+
+/* F_FULLFSYNC asks the drive to flush its own cache, which fsync on Apple platforms leaves alone. */
+int bc_file_system_platform_full_sync_descriptor(int descriptor) {
     int code = 0;
     do {
         if (fcntl(descriptor, F_FULLFSYNC) == 0) {
@@ -215,6 +233,11 @@ int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unus
 /* Both backends' fsync return 0 and do nothing, so the honest answer is "no sync offered": the engine reports
  * `written`, which is what the bytes achieved. */
 int bc_file_system_platform_sync_descriptor([[maybe_unused]] int descriptor) {
+    return ENOTSUP;
+}
+
+/* No backend has F_FULLFSYNC, and the engine never asks for it here (the probe says so). */
+int bc_file_system_platform_full_sync_descriptor([[maybe_unused]] int descriptor) {
     return ENOTSUP;
 }
 
@@ -379,6 +402,12 @@ int bc_file_system_platform_sync_descriptor(int descriptor) {
         code = errno;
     } while (code == EINTR);
     return sync_refusal(code);
+}
+
+/* fsync on Linux reaches stable storage itself; there is no fuller sync, and the engine never asks for one here
+ * (the probe says so). */
+int bc_file_system_platform_full_sync_descriptor([[maybe_unused]] int descriptor) {
+    return ENOTSUP;
 }
 
 #if __has_include(<linux/fs.h>)

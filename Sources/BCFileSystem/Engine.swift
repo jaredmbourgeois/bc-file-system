@@ -1,8 +1,8 @@
 import CBCFileSystem
 
 /// The context every operation runs in: the platform's probed fast paths and, for tests, the observer. Created
-/// by `live()` at a composition root, or by the fixtures' observed factory in a test, and handed down inside a
-/// `FileSystem`.
+/// by `live()` at a composition root, or by one of the fixtures' two factories for tests, and handed down inside
+/// a `FileSystem`.
 ///
 /// Naming `live()` is itself a reach: it is legal only at a composition root.
 ///
@@ -16,8 +16,8 @@ import CBCFileSystem
 public final class Engine: @unchecked Sendable {
     private let handle: OpaquePointer
 
-    /// Adopts a handle one of the two C factories created. `package`, so the fixtures' observed factory can
-    /// build an engine without this module naming the test-only factory.
+    /// Adopts a handle one of the three C factories created. `package`, so the fixtures' two factories for tests
+    /// can build an engine without this module naming either test-only factory.
     package init(adopting handle: OpaquePointer) {
         self.handle = handle
     }

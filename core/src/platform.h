@@ -1,7 +1,7 @@
 /* platform.h — the private seam between the engine and the operating system.
  *
  * The one place the core's platform differences live: the probe of the fast paths the running platform offers,
- * and five operations, each with one whole-file-guarded body per platform in `platform.c`, each answering
+ * and six operations, each with one whole-file-guarded body per platform in `platform.c`, each answering
  * `ENOTSUP` where the fast path is absent so the engine takes its portable path. The resolution layer above
  * never keys a branch on an errno the kernels disagree on. This header is private to `core/src`: it is C23,
  * never a common subset, and nothing outside the core includes it.
@@ -78,18 +78,25 @@ int bc_file_system_platform_access_check_flags(void);
  * rather than hand out a lock that excludes nobody. A fact of the platform, not a probe. */
 bool bc_file_system_platform_enforces_locks(void);
 
-/* ---- The five operations ------------------------------------------------------------------------------------- */
+/* ---- The six operations -------------------------------------------------------------------------------------- */
 
 /* Each operation returns 0 or the errno it failed with, so a call reads `const int code = sync_descriptor(…)`.
  * A name is NUL-terminated text, one component, as the system call takes it: the resolver NUL-terminates each
  * component into its own bounded buffer before calling here. A descriptor is borrowed; nothing here closes one
- * it was given. All five are real; where a platform has no body for one, that body answers ENOTSUP and says so
+ * it was given. All six are real; where a platform has no body for one, that body answers ENOTSUP and says so
  * in `platform.c`. */
 
-/* Pushes one open file or directory to stable storage: fcntl(F_FULLFSYNC) on Apple platforms, where fsync stops
- * at the drive's cache, fsync elsewhere. A volume that offers no sync (EINVAL, ENOTSUP, ENOTTY; every Emscripten
- * backend) answers ENOTSUP so the engine reports `written`. Retries on EINTR. */
+/* Pushes one open file or directory to stable storage with fsync, the sync every platform has: the durable sync
+ * on Linux, and on Apple platforms the one an engine refused its fast paths makes, which stops at the drive's
+ * cache. A volume that offers no sync (EINVAL, ENOTSUP, ENOTTY; every Emscripten backend) answers ENOTSUP so the
+ * engine reports `written`. Retries on EINTR. */
 int bc_file_system_platform_sync_descriptor(int descriptor);
+
+/* Pushes one open file or directory through the drive's own cache to stable storage: fcntl(F_FULLFSYNC), the
+ * durable sync on Apple platforms, where fsync stops at that cache. The engine asks for it wherever the probe
+ * found it (`has_full_fsync`); everywhere else this answers ENOTSUP. A volume that offers no full sync answers
+ * ENOTSUP so the engine reports `written`. Retries on EINTR. */
+int bc_file_system_platform_full_sync_descriptor(int descriptor);
 
 /* Makes `destination_name` under `destination_directory` a clone of the open regular file `source`, in one step
  * that either creates the whole file or creates nothing: fclonefileat on Apple platforms, which creates the file

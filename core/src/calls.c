@@ -231,12 +231,20 @@ bc_file_system_call_outcome bc_file_system_call_write(bc_file_system_engine *eng
 /* ---- Making a change stick --------------------------------------------------------------------------------- */
 
 /* The step names the call the platform makes, so the suite can hold that fsync is never the durable sync on a
- * platform where fsync stops at the drive's cache. */
+ * platform where fsync stops at the drive's cache, unless the engine was refused its fast paths. */
 int32_t bc_file_system_call_sync_step(const bc_file_system_engine *engine) {
     if (bc_file_system_engine_fast_paths(engine)->has_full_fsync) {
         return bc_file_system_step_fcntl_fullfsync;
     }
     return bc_file_system_step_fsync;
+}
+
+/* The call the step above names, made once: the same reading of the same fast path, so the two never part. */
+static int sync_as_the_step_names(const bc_file_system_engine *engine, int descriptor) {
+    if (bc_file_system_engine_fast_paths(engine)->has_full_fsync) {
+        return bc_file_system_platform_full_sync_descriptor(descriptor);
+    }
+    return bc_file_system_platform_sync_descriptor(descriptor);
 }
 
 bc_file_system_call_outcome bc_file_system_call_sync(bc_file_system_engine *engine, int32_t operation, int descriptor) {
@@ -251,7 +259,7 @@ bc_file_system_call_outcome bc_file_system_call_sync(bc_file_system_engine *engi
             outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
-        const int code = bc_file_system_platform_sync_descriptor(descriptor);
+        const int code = sync_as_the_step_names(engine, descriptor);
         if (code == 0) {
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }

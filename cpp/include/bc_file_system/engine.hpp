@@ -38,11 +38,12 @@ struct Fault {
 [[nodiscard]] auto fault_from(const bc_file_system_fault& c_fault) noexcept -> std::optional<Fault>;
 
 /// The context every operation runs in: the platform's probed fast paths and, for tests, the observer. Created
-/// by one of the two factories at a composition root, handed down as `Engine&`, released when it goes out of
-/// scope. Move-only over the C handle.
+/// by `live()` at a composition root, or by one of the two factories for tests, handed down as `Engine&`,
+/// released when it goes out of scope. Move-only over the C handle.
 ///
-/// Naming `live()` is itself a reach: it is legal only at a composition root. `observed_for_tests()` is the
-/// only way to install the observer, and the house-rules guard confines its callers to test code.
+/// Naming `live()` is itself a reach: it is legal only at a composition root. `observed_for_tests()` and
+/// `portable_only_for_tests()` are the only ways to install the observer, and the house-rules guard confines
+/// their callers to test code.
 class Engine {
 public:
     /// The live engine of a composition root.
@@ -50,6 +51,12 @@ public:
 
     /// The same engine with the observer installed: every step is counted and scripted faults take effect.
     [[nodiscard]] static auto observed_for_tests() -> Result<Engine>;
+
+    /// The observed engine with every fast path refused: every operation takes the path every platform has
+    /// (the walk, the read-and-write loop, fsync), and one whose promise a fast path alone keeps (the no-replace
+    /// rename of a `refuse` and of a condemn) answers `unsupported`, as a platform without that path does. For
+    /// running a suite a second time, to prove the fallbacks on a platform that has every fast path.
+    [[nodiscard]] static auto portable_only_for_tests() -> Result<Engine>;
 
     Engine(Engine&& other) noexcept;
     auto operator=(Engine&& other) noexcept -> Engine&;

@@ -52,7 +52,8 @@ extern "C" {
 /* ---- Handles ---------------------------------------------------------------------------------------------- */
 
 /* The context every operation runs in: the platform's probed fast paths and, in a test build, the observer.
- * Created at a composition root by one of the two factories below; released once. */
+ * Created at a composition root by the live factory below, or in a test by one of the two factories created for
+ * tests; released once. */
 typedef struct bc_file_system_engine bc_file_system_engine;
 
 /* An open directory that remembers the text it was opened with, so that an error beneath it can be reported as
@@ -150,7 +151,8 @@ typedef enum bc_file_system_operation {
     bc_file_system_operation_path_relate = 36,
     bc_file_system_operation_path_lexically_normalize = 37,
     bc_file_system_operation_path_resolve_against = 38,
-    bc_file_system_operation_path_library_name = 39
+    bc_file_system_operation_path_library_name = 39,
+    bc_file_system_operation_engine_create_portable_only_for_tests = 40
 } bc_file_system_operation;
 
 /* The system call an operation was making when it failed, and the observer's vocabulary: one enumerator per
@@ -418,9 +420,22 @@ static inline bc_file_system_location bc_file_system_location_beneath(const bc_f
 int32_t bc_file_system_engine_create_live(bc_file_system_engine **engine, bc_file_system_error *error);
 
 /* The same engine with the observer installed: every step is counted, and the faults scripted with
- * `bc_file_system_observed_fault_add` take effect. The only way to install an observer; test code only, which
- * the house-rules guard enforces. Parameters as `bc_file_system_engine_create_live`. */
+ * `bc_file_system_observed_fault_add` take effect. One of the two ways to install an observer (the other, below,
+ * also refuses every fast path); test code only, which the house-rules guard enforces. Parameters as
+ * `bc_file_system_engine_create_live`. */
 int32_t bc_file_system_engine_create_observed_for_tests(bc_file_system_engine **engine, bc_file_system_error *error);
+
+/* The observed engine above, with every fast path refused: nothing is probed, and every operation takes the
+ * path every platform has. A `beneath` location is walked one component at a time, a copy moves its bytes
+ * through the read-and-write loop, and a durable sync is fsync. An operation whose promise a fast path alone
+ * keeps answers `unsupported` before any system call, as a platform without that path answers: a rename, a
+ * write or a copy told to refuse an existing destination, and every condemn, each of which needs the
+ * platform's no-replace rename. What it is for: running a suite a second time, to prove on a platform that
+ * has every fast path what a platform with none does. Every step is counted and the scripted faults take
+ * effect, as on `bc_file_system_engine_create_observed_for_tests`; test code only, which the house-rules guard
+ * enforces. Parameters as `bc_file_system_engine_create_live`. */
+int32_t bc_file_system_engine_create_portable_only_for_tests(bc_file_system_engine **engine,
+                                                             bc_file_system_error *error);
 
 /* Releases an engine. `engine` may be NULL (nothing happens); must not be used afterwards. Every directory and
  * lock opened through it must have been released first. */
@@ -499,7 +514,9 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
 /* Replaces or creates the regular file at `location` with `byte_count` bytes, atomically: the bytes are staged
  * in a temporary file in the same directory, synced as asked, and renamed into place, so a reader sees the old
  * content or the new, never a mixture. The directory must exist. `*durability_achieved` receives a
- * bc_file_system_durability. */
+ * bc_file_system_durability. Where the engine has no no-replace rename (a platform without one, or the
+ * portable-only engine), `refuse` answers `unsupported` before any system call: nothing else keeps that promise
+ * without a window. */
 int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_system_location *location,
                                   const uint8_t *bytes, size_t byte_count, const bc_file_system_write_options *options,
                                   int32_t *durability_achieved, bc_file_system_error *error);
@@ -558,13 +575,15 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
 
 /* Renames `source` to `destination` in one step. Under `replace` a file replaces a file and a directory replaces an
  * empty directory (`directory_not_empty` otherwise); under `refuse` an existing destination is `already_exists` and
- * untouched. A durable rename syncs both directories. Different devices are `cross_device`. */
+ * untouched. A durable rename syncs both directories. Different devices are `cross_device`. Where the engine
+ * has no no-replace rename, `refuse` answers `unsupported` before any system call, naming the destination. */
 int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_system_location *source,
                               const bc_file_system_location *destination, int32_t existing_destination,
                               int32_t durability, int32_t *durability_achieved, bc_file_system_error *error);
 
 /* Copies the regular file at `source` to `destination` with the guarantees of `bc_file_system_write_file`: atomic at
- * the destination, the platform's clone path when it has one, the copy loop otherwise. */
+ * the destination, the platform's clone path when it has one, the copy loop otherwise; `refuse` without a
+ * no-replace rename is `unsupported` before any system call, naming the destination. */
 int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_system_location *source,
                                  const bc_file_system_location *destination,
                                  const bc_file_system_write_options *options, int32_t *durability_achieved,
@@ -598,7 +617,8 @@ int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_sys
 /* Renames the entry at `location` (a file, a symlink or a directory tree) to `.bc-condemned-<name>` beside it,
  * in one step that replaces nothing, so a later sweep removes it, and stores the condemned name (one component)
  * under the buffer protocol. A condemned name a previous condemn left behind is never an error: the name is
- * tried again with a token of the engine's own appended, so the answer may be longer than the first name. */
+ * tried again with a token of the engine's own appended, so the answer may be longer than the first name. The
+ * one step is the no-replace rename, so an engine without one answers `unsupported` before any system call. */
 int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_system_location *location, uint8_t *buffer,
                                size_t capacity, size_t *length, bc_file_system_error *error);
 

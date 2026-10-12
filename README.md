@@ -30,7 +30,9 @@ Two products: `BCFileSystem` is the library (the engine, the `FileSystem` a piec
 `Location` it acts on, the path values `AbsolutePath` and `RelativePath` with the path module's functions on
 `PathText`, and the typed `FileSystemError`); `BCFileSystemTestFixtures` is for a consumer's tests only (a
 `TemporaryDirectory` the test owns, and `FileSystem.observed(root:)`, a file system over an engine with the
-observer installed, so a test can script a failing system call or a kill point and read step counts). Neither
+observer installed, so a test can script a failing system call or a kill point and read step counts, with
+`FileSystem.portableOnly(root:)` beside it, the same engine refused every fast path, so a test can run a second
+time over the path every platform has). Neither
 needs C++ interoperability switched on. Until `1.0.0` any release may change the interface, so pin a commit; the
 public URL is decided before `0.1.0`:
 
@@ -156,4 +158,8 @@ method on `Engine` per header operation, over `Location`, `Directory`, `Lock`, t
 the path module's ten functions and the compositions (`read_file_if_present`, `lines`, the bounded grow loop);
 `bc-file-system-testing` holds the observed engine and the temporary directory a consumer's tests use; the error is
 one pointer wide; `cargo doc` joins the `rust` leg; and bc-mutants' four `fs.rs` tests pass, copied into the
-crate's binding suite over compositions of its API. `0.1.0` is tagged when every face is green on every platform.
+crate's binding suite over compositions of its API. Stage 26 `portable-only-run` is in: a third factory for
+tests, `bc_file_system_engine_create_portable_only_for_tests` (on every face beside the observed one), makes the
+observed engine with every fast path refused, and the C++ contract suite runs every case on it as well, so the
+walk, the read-and-write copy loop, fsync and the `unsupported` answer of every `refuse` and condemn without a
+no-replace rename are proven on every platform. `0.1.0` is tagged when every face is green on every platform.

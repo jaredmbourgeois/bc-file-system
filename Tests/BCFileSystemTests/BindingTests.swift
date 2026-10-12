@@ -308,6 +308,23 @@ struct BindingTests {
         #expect(try observed.stepCount(operation: .writeFile, step: .write) == 0)
     }
 
+    /// The portable-only factory reaches C once, and the engine kind crosses with it: its copy takes no fast path,
+    /// so neither the clone's step nor the in-kernel copy's is reached and the bytes pass through the
+    /// read-and-write loop.
+    @Test func portableOnlyReachesCAndItsCopyTakesNoFastPath() throws {
+        let portable = try FileSystem.portableOnly(root: TemporaryDirectory.create())
+        try portable.root.rawWrite("content", to: "from", mode: 0o644)
+
+        let achieved = try portable.fileSystem.copyFile(
+            from: try portable.location("from"), to: try portable.location("to"), options: Self.writtenExactly0644)
+
+        #expect(achieved == .written)
+        #expect(try portable.root.rawRead("to") == "content")
+        #expect(try portable.stepCount(operation: .copyFile, step: .cloneFile) == 0)
+        #expect(try portable.stepCount(operation: .copyFile, step: .copyRange) == 0)
+        #expect(try portable.stepCount(operation: .copyFile, step: .pread) > 0)
+    }
+
     /// The observer's own bookkeeping, which is real this stage.
     @Test func aFaultWithOccurrenceZeroIsRefusedAndTheSlotHoldsSixtyFour() throws {
         let observed = try observedFileSystem()
@@ -447,15 +464,17 @@ struct BindingTests {
             (bc_file_system_operation_path_lexically_normalize, .pathLexicallyNormalize),
             (bc_file_system_operation_path_resolve_against, .pathResolveAgainst),
             (bc_file_system_operation_path_library_name, .pathLibraryName),
+            (bc_file_system_operation_engine_create_portable_only_for_tests, .engineCreatePortableOnlyForTests),
         ]
         for (core, operation) in pairs {
             #expect(Operation(rawValue: Int32(core.rawValue)) == operation)
         }
         // The list above and the enum are both the whole header: the last value pins the count.
         #expect(Operation.allCases.count == pairs.count)
-        #expect(Operation.allCases.count == Int(bc_file_system_operation_path_library_name.rawValue))
+        let lastOperation = bc_file_system_operation_engine_create_portable_only_for_tests
+        #expect(Operation.allCases.count == Int(lastOperation.rawValue))
         #expect(Operation(rawValue: 0) == nil)
-        #expect(Operation(rawValue: 40) == nil)
+        #expect(Operation(rawValue: 41) == nil)
     }
 
     /// The message names each path operation by its Swift case, as it names every other operation.

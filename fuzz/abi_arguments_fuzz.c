@@ -36,7 +36,7 @@ enum : size_t { answer_capacity = 512, entry_capacity = 8 };
 
 /* The last enumerator of each closed enum, so `take_enum` reads `take_enum(input, operation_last)`. */
 enum : int32_t {
-    operation_last = bc_file_system_operation_path_library_name,
+    operation_last = bc_file_system_operation_engine_create_portable_only_for_tests,
     step_last = bc_file_system_step_faccessat,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
@@ -272,12 +272,21 @@ static void fuzz_engine_factories(reader *input) {
     bc_file_system_error *error = take_error(input, &storage);
     bc_file_system_engine *created = nullptr;
     bc_file_system_engine **slot = maybe(input, &created);
-    const bool live = take_flag(input);
-    const int32_t status = live ? bc_file_system_engine_create_live(slot, error)
-                                : bc_file_system_engine_create_observed_for_tests(slot, error);
-    check_answer(status, error,
-                 live ? bc_file_system_operation_engine_create_live
-                      : bc_file_system_operation_engine_create_observed_for_tests);
+    /* One of the three factories: the live one, the observed one, the portable-only one. */
+    const uint8_t factory = take_byte(input) % 3;
+    int32_t status = 0;
+    int32_t operation = 0;
+    if (factory == 0) {
+        status = bc_file_system_engine_create_live(slot, error);
+        operation = bc_file_system_operation_engine_create_live;
+    } else if (factory == 1) {
+        status = bc_file_system_engine_create_observed_for_tests(slot, error);
+        operation = bc_file_system_operation_engine_create_observed_for_tests;
+    } else {
+        status = bc_file_system_engine_create_portable_only_for_tests(slot, error);
+        operation = bc_file_system_operation_engine_create_portable_only_for_tests;
+    }
+    check_answer(status, error, operation);
     if (status == 0) {
         require(created != nullptr);
     } else {

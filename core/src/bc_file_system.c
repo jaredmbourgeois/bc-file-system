@@ -158,7 +158,7 @@ enum : int32_t {
 /* The last enumerator of each closed enum, so a range check reads `is_in_enum(value, operation_last)`. Every
  * enum in the header runs from 1 to its last value without a gap. */
 enum : int32_t {
-    operation_last = bc_file_system_operation_path_library_name,
+    operation_last = bc_file_system_operation_engine_create_portable_only_for_tests,
     step_last = bc_file_system_step_faccessat,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
@@ -169,11 +169,14 @@ enum : int32_t {
 };
 
 struct bc_file_system_engine {
-    /* Created by the observed factory: the fault slot and the step counters are live. A live engine carries the
-     * same fields and never touches them, which is the one decision per step a release build pays. */
+    /* Created by a factory for tests (the observed one, or the portable-only one): the fault slot and the step
+     * counters are live. A live engine carries the same fields and never touches them, which is the one decision
+     * per step a release build pays. */
     bool observed;
-    /* The platform's fast paths, probed once by whichever factory created the engine and read by the operations
-     * that have one (the resolution layer, writes, moves and copies). */
+    /* The fast paths the operations may take, read by the ones that have one (the resolution layer, writes, the
+     * sync, moves, copies and condemn): what the platform's probe found, handed in once by the live and the
+     * observed factory, or none at all from the portable-only factory, so that every operation takes the path
+     * every platform has. */
     bc_file_system_platform_fast_paths fast_paths;
     /* What makes a staged file's name unique: the id of the process the engine was created in, read once by the
      * factory, and a token drawn from this counter for every staged file (never the clock, never a random
@@ -298,8 +301,28 @@ static bool is_valid_fault(const bc_file_system_fault *fault) {
 
 /* ---- The engine ---------------------------------------------------------------------------------------------- */
 
-static int32_t create_engine(bool observed, int32_t operation, bc_file_system_engine **engine,
-                             bc_file_system_error *error) {
+/* Whether a factory installs the observer: a two-case switch, so each factory's call says which engine it
+ * makes. */
+typedef enum observer_choice : int32_t { observer_absent = 1, observer_installed = 2 } observer_choice;
+
+/* No fast path at all: what the portable-only engine is created with, so that every operation takes the path
+ * every platform has. Spelled field by field, as each platform's probe spells its answer. */
+static bc_file_system_platform_fast_paths no_fast_paths(void) {
+    return (bc_file_system_platform_fast_paths){
+        .has_openat2 = false,
+        .has_openat_nofollow_any = false,
+        .has_rename_no_replace = false,
+        .has_clone = false,
+        .has_copy_range = false,
+        .has_full_fsync = false,
+    };
+}
+
+/* The one body of the three factories. The fast paths are a parameter, never something the engine looks up:
+ * the live and the observed factory hand in what the platform's probe found, the portable-only factory hands
+ * in none. */
+static int32_t create_engine(observer_choice observer, bc_file_system_platform_fast_paths fast_paths, int32_t operation,
+                             bc_file_system_engine **engine, bc_file_system_error *error) {
     if (error == nullptr) {
         return bc_file_system_error_kind_invalid_argument;
     }
@@ -311,10 +334,8 @@ static int32_t create_engine(bool observed, int32_t operation, bc_file_system_en
     if (created == nullptr) {
         return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
     }
-    created->observed = observed;
-    /* Probed once, here, so no operation asks the kernel twice; the observed engine probes the same way, so the
-     * suite runs over the same fast paths a composition root gets. */
-    created->fast_paths = bc_file_system_platform_probe_fast_paths();
+    created->observed = observer == observer_installed;
+    created->fast_paths = fast_paths;
     /* The process id is a fact of the process, read here, in the factory, and carried by the engine: no
      * operation asks for it. A pid is never negative, so the cast only changes the type. */
     created->process_id = (uint64_t)getpid(); /* reach-ok: the factory is the one live site of the engine */
@@ -323,12 +344,22 @@ static int32_t create_engine(bool observed, int32_t operation, bc_file_system_en
     return succeed(error);
 }
 
+/* The live and the observed factory probe the platform once each, here, so no operation asks the kernel twice,
+ * and the observed engine runs over the same fast paths a composition root gets. */
 int32_t bc_file_system_engine_create_live(bc_file_system_engine **engine, bc_file_system_error *error) {
-    return create_engine(false, bc_file_system_operation_engine_create_live, engine, error);
+    return create_engine(observer_absent, bc_file_system_platform_probe_fast_paths(),
+                         bc_file_system_operation_engine_create_live, engine, error);
 }
 
 int32_t bc_file_system_engine_create_observed_for_tests(bc_file_system_engine **engine, bc_file_system_error *error) {
-    return create_engine(true, bc_file_system_operation_engine_create_observed_for_tests, engine, error);
+    return create_engine(observer_installed, bc_file_system_platform_probe_fast_paths(),
+                         bc_file_system_operation_engine_create_observed_for_tests, engine, error);
+}
+
+int32_t bc_file_system_engine_create_portable_only_for_tests(bc_file_system_engine **engine,
+                                                             bc_file_system_error *error) {
+    return create_engine(observer_installed, no_fast_paths(),
+                         bc_file_system_operation_engine_create_portable_only_for_tests, engine, error);
 }
 
 void bc_file_system_engine_release(bc_file_system_engine *engine) {
@@ -1173,9 +1204,12 @@ static int32_t settle_staged_file(bc_file_system_engine *engine, int32_t operati
 }
 
 /* The staged file takes the destination's name in one step: `replace` with renameat, which replaces a file
- * atomically; `refuse` with the platform's no-replace rename, whose EEXIST is `already_exists` with the
- * destination untouched. Afterwards the staged name is gone, so the file is kept from the cleanup; a failure
- * leaves it to be discarded. */
+ * atomically; `refuse` with the platform's no-replace rename (an engine without one refused the operation before
+ * staging anything), whose EEXIST is `already_exists` with the destination untouched. The no-replace rename's
+ * EINVAL is `unsupported` with the code kept: a staged file is a sibling of its destination, never an ancestor,
+ * so the one reading left is a volume without RENAME_NOREPLACE, which the probe cannot see and the library
+ * refuses rather than replace through. Afterwards the staged name is gone, so the file is kept from the cleanup;
+ * a failure leaves it to be discarded. */
 static int32_t rename_into_place(bc_file_system_engine *engine, int32_t operation, staged_file *staged,
                                  const uint8_t *leaf, int32_t existing_destination, bc_file_system_error *error) {
     const char *from = (const char *)staged->name;
@@ -1189,8 +1223,11 @@ static int32_t rename_into_place(bc_file_system_engine *engine, int32_t operatio
         outcome = bc_file_system_call_rename_no_replace(engine, operation, staged->parent, from, staged->parent, to);
     }
     if (!outcome.succeeded) {
-        return report_staged_outcome(staged, error, operation, step, &outcome,
-                                     bc_file_system_call_kind_of_errno(outcome.code));
+        int32_t kind = bc_file_system_call_kind_of_errno(outcome.code);
+        if (step == bc_file_system_step_rename_no_replace && outcome.code == EINVAL) {
+            kind = bc_file_system_error_kind_unsupported;
+        }
+        return report_staged_outcome(staged, error, operation, step, &outcome, kind);
     }
     staged->kept = true;
     return 0;
@@ -1228,6 +1265,19 @@ static int32_t place_staged_file(bc_file_system_engine *engine, int32_t operatio
     return 0;
 }
 
+/* Whether an operation told to refuse an existing destination cannot keep that promise on this engine. The
+ * promise is kept by the platform's no-replace rename, the one step that takes a name only while nothing holds
+ * it; an engine without one (a platform that offers none, or the portable-only engine, refused every fast path)
+ * has nothing else that keeps it: a plain rename would replace what the caller said to keep, and a look before
+ * it would leave open the window the one step exists to close. Such an operation answers `unsupported` before
+ * any system call rather than weaken the promise, and so does every condemn, which never replaces. */
+static bool cannot_refuse_to_replace(const bc_file_system_engine *engine, int32_t existing_destination) {
+    if (engine->fast_paths.has_rename_no_replace) {
+        return false;
+    }
+    return existing_destination == bc_file_system_existing_destination_refuse;
+}
+
 int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_system_location *location,
                                   const uint8_t *bytes, size_t byte_count, const bc_file_system_write_options *options,
                                   int32_t *durability_achieved, bc_file_system_error *error) {
@@ -1240,6 +1290,9 @@ int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_s
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
+    if (cannot_refuse_to_replace(engine, options->existing_destination)) {
+        return refuse(error, bc_file_system_error_kind_unsupported, operation);
+    }
 
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
     int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
@@ -2729,6 +2782,10 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
+    /* The promise that cannot be kept is the destination's, so the refusal is named for it. */
+    if (cannot_refuse_to_replace(engine, existing_destination)) {
+        return failed_at(error, refuse(error, bc_file_system_error_kind_unsupported, operation), second_location);
+    }
 
     /* Both locations resolve first, the source then the destination, so both parents are held before anything
      * moves. The root of the file system is neither moved nor replaced. */
@@ -2989,6 +3046,10 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
+    /* The promise that cannot be kept is the destination's, as for a rename. */
+    if (cannot_refuse_to_replace(engine, options->existing_destination)) {
+        return failed_at(error, refuse(error, bc_file_system_error_kind_unsupported, operation), second_location);
+    }
 
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
     int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
@@ -3254,6 +3315,10 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
+    /* A condemn never replaces: its one step is the no-replace rename, whatever the caller holds. */
+    if (cannot_refuse_to_replace(engine, bc_file_system_existing_destination_refuse)) {
+        return refuse(error, bc_file_system_error_kind_unsupported, operation);
+    }
 
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
     const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);

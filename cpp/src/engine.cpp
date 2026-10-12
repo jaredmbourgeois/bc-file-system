@@ -10,7 +10,8 @@
 #include <bc_file_system/result.hpp>
 
 // The one C++ file that names the core's factories: `live()` is the live seam's body, and
-// `observed_for_tests()` is the test-only factory the house-rules guard confines to test code.
+// `observed_for_tests()` and `portable_only_for_tests()` are the test-only factories the house-rules guard
+// confines to test code.
 
 namespace bc::file_system {
 
@@ -69,6 +70,16 @@ auto Engine::observed_for_tests() -> Result<Engine> {
     bc_file_system_engine* handle = nullptr;
     const std::optional<Error> failure =
         create(Operation::engine_create_observed_for_tests, bc_file_system_engine_create_observed_for_tests, &handle);
+    if (failure.has_value()) {
+        return *failure;
+    }
+    return Engine{handle};
+}
+
+auto Engine::portable_only_for_tests() -> Result<Engine> {
+    bc_file_system_engine* handle = nullptr;
+    const std::optional<Error> failure = create(Operation::engine_create_portable_only_for_tests,
+                                                bc_file_system_engine_create_portable_only_for_tests, &handle);
     if (failure.has_value()) {
         return *failure;
     }

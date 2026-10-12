@@ -81,6 +81,7 @@ public enum Operation: Int32, CaseIterable, Sendable {
     case pathLexicallyNormalize = 37
     case pathResolveAgainst = 38
     case pathLibraryName = 39
+    case engineCreatePortableOnlyForTests = 40
 }
 
 /// The system call an operation was making when it failed, and the observer's vocabulary.

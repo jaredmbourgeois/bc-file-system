@@ -15,7 +15,8 @@ pub struct ObservedEngine {
 }
 
 impl ObservedEngine {
-    /// The only way to install the observer.
+    /// The observed engine over the fast paths the platform's probe found: one of the two ways to install the
+    /// observer.
     ///
     /// # Errors
     ///
@@ -23,6 +24,21 @@ impl ObservedEngine {
     pub fn observed_for_tests() -> Result<Self, Error> {
         Ok(Self {
             engine: testing_support::observed_for_tests()?,
+        })
+    }
+
+    /// The observed engine with every fast path refused, the other way to install the observer: every operation
+    /// takes the path every platform has (the walk, the read-and-write loop, fsync), and one whose promise a fast
+    /// path alone keeps (the no-replace rename of a `Refuse` and of a condemn) answers `Unsupported`, as a
+    /// platform without that path does. For running a test a second time, to prove the fallbacks on a platform
+    /// that has every fast path.
+    ///
+    /// # Errors
+    ///
+    /// `ResourceExhausted` when the engine cannot be allocated.
+    pub fn portable_only_for_tests() -> Result<Self, Error> {
+        Ok(Self {
+            engine: testing_support::portable_only_for_tests()?,
         })
     }
 

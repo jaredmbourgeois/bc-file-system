@@ -226,10 +226,10 @@ fn every_operation_round_trips_through_its_integer() {
             operation.name()
         );
     }
-    assert_eq!(Operation::ALL.len(), 39);
-    assert_eq!(Operation::PathLibraryName as i32, 39);
+    assert_eq!(Operation::ALL.len(), 40);
+    assert_eq!(Operation::EngineCreatePortableOnlyForTests as i32, 40);
     assert!(Operation::try_from(0).is_err());
-    assert!(Operation::try_from(40).is_err());
+    assert!(Operation::try_from(41).is_err());
 }
 
 #[test]

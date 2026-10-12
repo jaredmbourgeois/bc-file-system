@@ -88,6 +88,7 @@ enum class Operation : std::int32_t {
     path_lexically_normalize = 37,
     path_resolve_against = 38,
     path_library_name = 39,
+    engine_create_portable_only_for_tests = 40,
 };
 
 static_assert(static_cast<std::int32_t>(Operation::engine_create_live) == bc_file_system_operation_engine_create_live);
@@ -138,6 +139,8 @@ static_assert(static_cast<std::int32_t>(Operation::path_lexically_normalize) ==
 static_assert(static_cast<std::int32_t>(Operation::path_resolve_against) ==
               bc_file_system_operation_path_resolve_against);
 static_assert(static_cast<std::int32_t>(Operation::path_library_name) == bc_file_system_operation_path_library_name);
+static_assert(static_cast<std::int32_t>(Operation::engine_create_portable_only_for_tests) ==
+              bc_file_system_operation_engine_create_portable_only_for_tests);
 
 /// The system call an operation was making when it failed, and the observer's vocabulary.
 enum class Step : std::int32_t {

@@ -106,10 +106,13 @@ the finding.** A new legal site is a change to this section first (see [Changing
 **The test double for a file system is the real file system**, in a temporary directory, behind the engine's
 observer, run through the same contract suite as the live engine; an in-memory imitation is a second set of
 rename, symlink and permission rules to keep honest, invisible to another language reading the same paths. The
-observer is installed by one factory, `bc_file_system_engine_create_observed_for_tests` (`Engine::observed_for_tests()`
-in C++, `FileSystem.observed(root:)` in Swift, `ObservedEngine::observed_for_tests()` in Rust, in
-`bc-file-system-testing`, over `bc-file-system`'s documentation-hidden door `testing_support::observed_for_tests`),
-and the guard's `test-only-factory` leg confines its callers to the header, the core, the one wrapper per face
+observer is installed by two factories, both for tests: `bc_file_system_engine_create_observed_for_tests`
+(`Engine::observed_for_tests()` in C++, `FileSystem.observed(root:)` in Swift, `ObservedEngine::observed_for_tests()`
+in Rust, in `bc-file-system-testing`, over `bc-file-system`'s documentation-hidden door
+`testing_support::observed_for_tests`), and `bc_file_system_engine_create_portable_only_for_tests`, the same
+engine with every fast path refused (`Engine::portable_only_for_tests()`, `FileSystem.portableOnly(root:)`,
+`ObservedEngine::portable_only_for_tests()` over `testing_support::portable_only_for_tests`); the guard's
+`test-only-factory` leg confines their callers to the header, the core, the one wrapper per face
 (`cpp/src/engine.cpp`; `crates/bc-file-system/src/ffi.rs` and `src/live.rs`), `core/tests/`, `cpp/tests/`,
 `crates/bc-file-system/tests/`, `crates/bc-file-system-testing/` (the Rust face's test companion, which a consumer
 names under `[dev-dependencies]` only), `fuzz/` (the engine fuzzers drive the observed engine so a fuzzed fault
@@ -338,8 +341,9 @@ comment that explains it. Brevity is never worth obscurity.
 - **Errors are typed**: every function is `throws(FileSystemError)`; across a continuation, resume a non-throwing
   continuation with `Result<T, FileSystemError>` and `.get()`.
 - **The face is an engine-holding struct**, `struct FileSystem: Sendable { let engine: Engine }`, with
-  `Engine.live()` here and `FileSystem.observed(root:)` in the `BCFileSystemTestFixtures` product, which answers
-  an `ObservedFileSystem` (the file system, its directory, the faults and the step counts). `Engine` is a `final class`
+  `Engine.live()` here and `FileSystem.observed(root:)` and `FileSystem.portableOnly(root:)` in the
+  `BCFileSystemTestFixtures` product, each of which answers an `ObservedFileSystem` (the file system, its
+  directory, the faults and the step counts). `Engine` is a `final class`
   that is `@unchecked Sendable` with the proof written at the class and the release in `deinit`. A closure
   witness is written only where a caller substitutes closures.
 - **The path module is called, never restated.** `RelativePath(validatingBytes:)` and
@@ -369,23 +373,33 @@ comment that explains it. Brevity is never worth obscurity.
 
 ## Tests
 
-- **The contract suite is the specification.** `cpp/tests/contract_test.cpp` runs every case against the live
-  engine and the same engine behind the observer, driving C through the C++ face; new behaviour gets its case
-  there. Each face adds a binding suite (`cpp/tests/binding_test.cpp`, `Tests/BCFileSystemTests/BindingTests.swift`,
+- **The contract suite is the specification.** `cpp/tests/contract_test.cpp` runs every case against three
+  engines, driving C through the C++ face: the live engine, the same engine behind the observer, and the
+  portable-only engine, the observed engine refused every fast path the platform's probe found. On that third
+  engine every operation takes the path every platform has (a `beneath` location walked one component at a
+  time, a copy through the read-and-write loop, fsync for a durable sync) and answers `unsupported` where a fast
+  path alone keeps the promise (the no-replace rename of every `refuse` and every condemn), so the portable run
+  proves on a platform with every fast path what a platform without one does, and the walk, the loop and the
+  `unsupported` answers are proven on every platform CI runs. A case whose answer differs there states both
+  answers through `expected_under(GetParam(), …)` with the reason at the case, and is never left out of the
+  portable run; `PortableOnlyContract` holds that the engine reaches no fast path's step and counts its
+  fallback's steps instead. New behaviour gets its case there.
+  Each face adds a binding suite (`cpp/tests/binding_test.cpp`, `Tests/BCFileSystemTests/BindingTests.swift`,
   `crates/bc-file-system/tests/binding.rs` with `abi_smoke.rs` beside it): every operation reaches the core once,
   the error mapping is total, one ABI round trip per value type. The Rust suite also runs bc-mutants' four
   `fs.rs` tests, copied as they are into `crates/bc-file-system/tests/bc_mutants_shapes.rs` over compositions of
   the crate's API, the shape the consumer's swap will take; a bridge the composition makes is named at its
   function, and an assertion the library's rules cannot hold is a finding for the consumer, never a rewrite. `cpp/tests/observer_test.cpp`
   holds the observer's own cases (a fault takes effect at the scripted step; a live engine refuses the observer
-  calls with `invalid_argument`).
+  calls with `invalid_argument`; the portable-only engine refuses none of them).
 - **The path module and the engine's mechanics are tested in C first**: `core/tests/path_test.c` is a `.c`
   main over tables of cases (every public path function, every refusal, every edge), registered with
   `add_test`, and the C++ suite `cpp/tests/path_test.cpp`, the Swift suite `Tests/BCFileSystemTests/PathTests.swift`
   and the Rust suite `crates/bc-file-system/tests/path.rs` run the same table through their faces;
   `core/tests/engine_test.c` drives the observer's two hooks (`engine.h`) with no operation in between (a step
   is counted, a fault fires at its occurrence and once, a stop is a verdict, a live engine neither counts nor
-  fires) and reports the platform probes, asserting only what the platform guarantees; `core/tests/resolve_test.c`
+  fires) and reports the platform probes, asserting only what the platform guarantees and that the
+  portable-only engine holds no fast path at all; `core/tests/resolve_test.c`
   plants the S2 spike's tree under the root it is handed and drives the resolution layer over it (every refusal,
   the `at` walk and the `beneath` walk, the fast path and the walk it falls back to when the fast path's step is
   scripted to refuse, and the identity check against a directory swapped between the stat and the open, made
@@ -427,7 +441,8 @@ comment that explains it. Brevity is never worth obscurity.
   suite's pairs, count and out-of-range value; `crates/bc-file-system/src/error.rs` (the variant, the `ALL`
   array's size, the name), `crates/bc-file-system/tests/abi_smoke.rs` (the count, the last value, the
   out-of-range value) and `crates/bc-file-system/tests/binding.rs` (the name table and its out-of-range value);
-  for a field, every face's `Error` (in Rust `ErrorDetails`), its conversion and the layout pins in all three.
+  `fuzz/abi_arguments_fuzz.c` (its own `operation_last` or `step_last`, which bound the enums it fuzzes); for a
+  field, every face's `Error` (in Rust `ErrorDetails`), its conversion and the layout pins in all three.
 
 ## Verification
 

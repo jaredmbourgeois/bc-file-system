@@ -125,6 +125,8 @@ auto name_of(Operation operation) noexcept -> std::string_view {
         return "path_resolve_against";
     case Operation::path_library_name:
         return "path_library_name";
+    case Operation::engine_create_portable_only_for_tests:
+        return "engine_create_portable_only_for_tests";
     }
     return "unknown";
 }
@@ -199,7 +201,8 @@ auto error_kind_from(std::int32_t value) noexcept -> std::optional<ErrorKind> {
 }
 
 auto operation_from(std::int32_t value) noexcept -> std::optional<Operation> {
-    if (value >= bc_file_system_operation_engine_create_live && value <= bc_file_system_operation_path_library_name) {
+    if (value >= bc_file_system_operation_engine_create_live &&
+        value <= bc_file_system_operation_engine_create_portable_only_for_tests) {
         return static_cast<Operation>(value);
     }
     return std::nullopt;

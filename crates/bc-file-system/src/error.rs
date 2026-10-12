@@ -144,11 +144,12 @@ pub enum Operation {
     PathLexicallyNormalize = 37,
     PathResolveAgainst = 38,
     PathLibraryName = 39,
+    EngineCreatePortableOnlyForTests = 40,
 }
 
 impl Operation {
     /// Every operation, in the header's order.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::EngineCreateLive,
         Self::EngineCreateObservedForTests,
         Self::OpenDirectory,
@@ -188,6 +189,7 @@ impl Operation {
         Self::PathLexicallyNormalize,
         Self::PathResolveAgainst,
         Self::PathLibraryName,
+        Self::EngineCreatePortableOnlyForTests,
     ];
 
     /// The operation's name as the header spells it.
@@ -233,6 +235,7 @@ impl Operation {
             Self::PathLexicallyNormalize => "path_lexically_normalize",
             Self::PathResolveAgainst => "path_resolve_against",
             Self::PathLibraryName => "path_library_name",
+            Self::EngineCreatePortableOnlyForTests => "engine_create_portable_only_for_tests",
         }
     }
 }

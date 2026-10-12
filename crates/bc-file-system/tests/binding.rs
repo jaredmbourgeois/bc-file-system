@@ -533,6 +533,40 @@ fn add_fault_clear_faults_and_step_count_reach_c() {
     assert_eq!(counted, 0);
 }
 
+// The portable-only factory reaches C once through the companion crate, and the engine kind crosses with it: its
+// copy takes no fast path, so neither the clone's step nor the in-kernel copy's is reached and the bytes pass
+// through the read-and-write loop.
+#[test]
+fn the_portable_only_factory_reaches_c_and_its_copy_takes_no_fast_path() {
+    let directory = TemporaryDirectory::create("portable-only").expect("a temporary directory");
+    let portable = ObservedEngine::portable_only_for_tests().expect("a portable-only engine");
+    directory
+        .write_raw("from", b"content", 0o644)
+        .expect("setup");
+    let from = AbsolutePath::from_path(&directory.path_of("from")).expect("an absolute path");
+    let to = AbsolutePath::from_path(&directory.path_of("to")).expect("an absolute path");
+
+    let copied = portable
+        .engine()
+        .copy_file(
+            &Location::At(&from),
+            &Location::At(&to),
+            &WRITTEN_EXACTLY_0644,
+        )
+        .expect("the file is copied");
+
+    assert_eq!(copied, Durability::Written);
+    assert_eq!(directory.read_raw("to").expect("raw read"), b"content");
+    let count_of = |step| {
+        portable
+            .step_count(Operation::CopyFile, step)
+            .expect("the count is read")
+    };
+    assert_eq!(count_of(Step::CloneFile), 0);
+    assert_eq!(count_of(Step::CopyRange), 0);
+    assert!(count_of(Step::Pread) > 0);
+}
+
 // An engine created for tests is used from one thread at a time (the header); the face keeps that promise for a
 // shared `&Engine` by taking the observer's turn on every call, so two threads' calls are serialised and every
 // step is counted.
@@ -869,6 +903,7 @@ fn every_operation_has_its_name_and_its_c_value() {
         "path_lexically_normalize",
         "path_resolve_against",
         "path_library_name",
+        "engine_create_portable_only_for_tests",
     ];
 
     for (value, name) in (1..).zip(names) {
@@ -878,7 +913,7 @@ fn every_operation_has_its_name_and_its_c_value() {
     }
     assert_eq!(Operation::ALL.len(), names.len());
     assert!(Operation::try_from(0).is_err());
-    assert!(Operation::try_from(40).is_err());
+    assert!(Operation::try_from(41).is_err());
 }
 
 #[test]

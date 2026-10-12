@@ -1164,7 +1164,7 @@ pub(crate) fn path_library_name(component: &[u8]) -> Result<(i32, Range<usize>),
     Ok((kind, stem_offset..stem_offset.saturating_add(stem_length)))
 }
 
-/// The observer's door, for `bc-file-system-testing` alone: the factory that installs the observer and the
+/// The observer's door, for `bc-file-system-testing` alone: the two factories that install the observer and the
 /// three calls that script and read it, each a safe function over an [`Engine`]. Hidden from this crate's
 /// documentation (a production consumer has no use for it) and named for tests, so the house-rules guard's
 /// `test-only-factory` leg confines every caller in this repository to test code. A consumer's tests reach it
@@ -1183,6 +1183,25 @@ pub mod testing_support {
         let handle = create(
             ffi::bc_file_system_engine_create_observed_for_tests,
             Operation::EngineCreateObservedForTests,
+        )?;
+        Ok(Engine {
+            handle,
+            observed_turn: Some(Mutex::new(())),
+        })
+    }
+
+    /// The observed engine with every fast path refused: every operation takes the path every platform has (the
+    /// walk, the read-and-write loop, fsync), and one whose promise a fast path alone keeps (the no-replace rename
+    /// of a `Refuse` and of a condemn) answers `Unsupported`, as a platform without that path does. Every call into
+    /// it takes its turn, as on [`observed_for_tests`].
+    ///
+    /// # Errors
+    ///
+    /// `ResourceExhausted` when the engine cannot be allocated.
+    pub fn portable_only_for_tests() -> Result<Engine, Error> {
+        let handle = create(
+            ffi::bc_file_system_engine_create_portable_only_for_tests,
+            Operation::EngineCreatePortableOnlyForTests,
         )?;
         Ok(Engine {
             handle,

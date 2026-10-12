@@ -31,7 +31,13 @@
 // The contract every engine keeps, driving C through the C++ face, run against each engine:
 //
 //   - the live engine, in a directory the test created;
-//   - the same engine with the observer installed, which must change nothing it was not scripted to change.
+//   - the same engine with the observer installed, which must change nothing it was not scripted to change;
+//   - the portable-only engine, the observed engine refused every fast path the platform's probe found, so every
+//     operation takes the path every platform has: a `beneath` location walked one component at a time, a copy
+//     through the read-and-write loop, fsync for a durable sync. That run proves on a platform with every fast
+//     path what a platform with none does. Where an operation's promise is kept by a fast path alone (the
+//     no-replace rename of every `refuse` and every condemn) it answers `unsupported`, as such a platform does,
+//     and the case states both answers through `expected_under`, with the reason at the case.
 //
 // A failure that cannot be provoked for real (the disk filling up, a sync failing after the rename) is put into
 // the middle of an operation with a fault scripted into the observed engine; those cases run on the observed
@@ -218,18 +224,55 @@ auto staged_names_of(const std::filesystem::path& directory, std::string_view le
 enum class EngineKind : std::uint8_t {
     live,
     observed,
+    portable_only,
 };
 
 auto make_engine(EngineKind kind) -> Result<Engine> {
     if (kind == EngineKind::observed) {
         return Engine::observed_for_tests();
     }
+    if (kind == EngineKind::portable_only) {
+        return Engine::portable_only_for_tests();
+    }
     return Engine::live();
 }
 
 auto engine_name(const testing::TestParamInfo<EngineKind>& info) -> std::string {
-    return info.param == EngineKind::live ? "Live" : "Observed";
+    if (info.param == EngineKind::observed) {
+        return "Observed";
+    }
+    if (info.param == EngineKind::portable_only) {
+        return "PortableOnly";
+    }
+    return "Live";
 }
+
+// The answer a case expects from the engine it runs on, where the engines differ. The live and the observed
+// engine take the fast paths the platform's probe found; the portable-only engine takes none, so where an
+// operation's promise is kept by a fast path alone it answers what a platform without that path answers. The
+// call site says which fast path and why nothing replaces it.
+template <class Answer>
+auto expected_under(EngineKind kind, Answer with_the_platforms_fast_paths, Answer with_no_fast_path) -> Answer {
+    if (kind == EngineKind::portable_only) {
+        return with_no_fast_path;
+    }
+    return with_the_platforms_fast_paths;
+}
+
+// An operation's answer as a case compares it through `expected_under`: no kind for a success, the error's kind
+// for a failure.
+template <class Value>
+auto answer_of(const Result<Value>& result) -> std::optional<ErrorKind> {
+    if (result.has_value()) {
+        return std::nullopt;
+    }
+    return result.error().kind;
+}
+
+constexpr std::optional<ErrorKind> kSucceeds = std::nullopt;
+constexpr std::optional<ErrorKind> kUnsupported = ErrorKind::unsupported;
+constexpr std::optional<ErrorKind> kInvalidArgument = ErrorKind::invalid_argument;
+constexpr std::optional<ErrorKind> kNotFound = ErrorKind::not_found;
 
 // What every contract fixture shares: the directory this test owns, created under the root the build handed
 // the test binary, the engine, and the file system over it.
@@ -267,13 +310,14 @@ protected:
     FileSystemContract() : Contract(make_engine(GetParam())) {}
 };
 
-INSTANTIATE_TEST_SUITE_P(Engines, FileSystemContract, testing::Values(EngineKind::live, EngineKind::observed),
+INSTANTIATE_TEST_SUITE_P(Engines, FileSystemContract,
+                         testing::Values(EngineKind::live, EngineKind::observed, EngineKind::portable_only),
                          engine_name);
 
-// The cases that script a fault or read a step count, which only the observed engine offers.
-class ObservedContract : public Contract<bc::file_system_test::DescriptorBalanced> {
+// What a fixture over an engine created for tests adds: scripting a fault and reading a step count.
+class ContractWithObserver : public Contract<bc::file_system_test::DescriptorBalanced> {
 protected:
-    ObservedContract() : Contract(Engine::observed_for_tests()) {}
+    explicit ContractWithObserver(Result<Engine> engine) : Contract(std::move(engine)) {}
 
     // Scripts a fault, failing the case if the engine refuses it.
     auto script(const Fault& fault) -> void {
@@ -290,6 +334,19 @@ protected:
         }
         return *counted;
     }
+};
+
+// The cases that script a fault or read a step count, which only an engine created for tests offers.
+class ObservedContract : public ContractWithObserver {
+protected:
+    ObservedContract() : ContractWithObserver(Engine::observed_for_tests()) {}
+};
+
+// The cases that read what the portable-only engine did: never a fast path's step, and the steps of the path
+// every platform has instead.
+class PortableOnlyContract : public ContractWithObserver {
+protected:
+    PortableOnlyContract() : ContractWithObserver(Engine::portable_only_for_tests()) {}
 };
 
 // -------------------------------------------------------------------------------------------------------------
@@ -560,7 +617,10 @@ TEST_P(FileSystemContract, WriteUnderPreserveOrGivesANewFileTheStatedMode) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0600U);
 }
 
-// Under `refuse` an existing destination is left exactly as it was.
+// Under `refuse` an existing destination is left exactly as it was. The staged file takes the name with the
+// platform's no-replace rename, which the portable-only engine does not have; a plain rename would replace the
+// file and a look before it would leave the window open, so that engine answers `unsupported` before staging
+// anything, and the file is just as untouched.
 TEST_P(FileSystemContract, WriteUnderRefuseLeavesAnExistingFileAndIsAlreadyExists) {
     bc::file_system_test::write_raw(path_of("config"), "old", 0600);
     const auto bytes = bytes_of("new");
@@ -568,7 +628,7 @@ TEST_P(FileSystemContract, WriteUnderRefuseLeavesAnExistingFileAndIsAlreadyExist
     const auto achieved = files().write_file(in("config"), bytes, kWrittenExactly0644Refusing);
 
     ASSERT_FALSE(achieved.has_value());
-    EXPECT_EQ(achieved.error().kind, ErrorKind::already_exists);
+    EXPECT_EQ(achieved.error().kind, expected_under(GetParam(), ErrorKind::already_exists, ErrorKind::unsupported));
     EXPECT_EQ(achieved.error().path, path_of("config").string());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("config")), "old");
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("config")), 0600U);
@@ -899,6 +959,30 @@ TEST_F(ObservedContract, WriteUnderRefuseRenamesWithTheNoReplaceRename) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("fresh")), "content");
     EXPECT_EQ(count(Operation::write_file, Step::rename_no_replace), 1U);
     EXPECT_EQ(count(Operation::write_file, Step::renameat), 0U);
+}
+
+// A staged file is never an ancestor of its destination, so EINVAL from its no-replace rename can only be a volume
+// without RENAME_NOREPLACE (a Linux file system the probe cannot see): `unsupported` with the code kept, the
+// destination never created and the staged file discarded, for a write and a copy alike. Scripted, since no
+// volume of this suite's platforms lacks the flag.
+TEST_F(ObservedContract, AStagedNoReplaceRenameRefusedWithEinvalIsUnsupportedWithTheCodeKept) {
+    bc::file_system_test::write_raw(path_of("source"), "content", 0644);
+    script(fail_step(Operation::write_file, Step::rename_no_replace, 1, EINVAL));
+    script(fail_step(Operation::copy_file, Step::rename_no_replace, 1, EINVAL));
+
+    const auto written = files().write_file(in("written"), bytes_of("content"), kWrittenExactly0644Refusing);
+    const auto copied = files().copy_file(in("source"), in("copied"), kWrittenExactly0644Refusing);
+
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().kind, ErrorKind::unsupported);
+    EXPECT_EQ(written.error().step, Step::rename_no_replace);
+    EXPECT_EQ(written.error().system_code, EINVAL);
+    ASSERT_FALSE(copied.has_value());
+    EXPECT_EQ(copied.error().kind, ErrorKind::unsupported);
+    EXPECT_EQ(copied.error().step, Step::rename_no_replace);
+    EXPECT_EQ(copied.error().system_code, EINVAL);
+    EXPECT_EQ(copied.error().failed_location, FailedLocation::second);
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("source"));
 }
 
 // A `written` write makes no sync and no reported close: the staged file closes through its owner.
@@ -2687,6 +2771,8 @@ TEST_P(FileSystemContract, RenameReplacesAFileAtTheDestination) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("current")), "the new content");
 }
 
+// A rename under `refuse` is the platform's no-replace rename, which the portable-only engine does not have: it
+// answers `unsupported` rather than rename over what it was told to keep, and both ends stay as they were.
 TEST_P(FileSystemContract, RenameUnderRefuseLeavesAnExistingDestinationAndIsAlreadyExists) {
     bc::file_system_test::write_raw(path_of("staged"), "the new content", 0644);
     bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
@@ -2694,7 +2780,7 @@ TEST_P(FileSystemContract, RenameUnderRefuseLeavesAnExistingDestinationAndIsAlre
     const auto achieved = files().rename(in("staged"), in("current"), ExistingDestination::refuse, Durability::written);
 
     ASSERT_FALSE(achieved.has_value());
-    EXPECT_EQ(achieved.error().kind, ErrorKind::already_exists);
+    EXPECT_EQ(achieved.error().kind, expected_under(GetParam(), ErrorKind::already_exists, ErrorKind::unsupported));
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("staged")), "the new content");
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("current")), "the old content");
 }
@@ -3065,6 +3151,8 @@ TEST_P(FileSystemContract, CopyOfAFileOntoItselfIsInvalidArgumentAndTouchesNothi
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("same-file", "source"));
 }
 
+// A copy under `refuse` takes the destination's name as a write does, with the platform's no-replace rename; the
+// portable-only engine has none and answers `unsupported` before anything is staged, as for a write.
 TEST_P(FileSystemContract, CopyUnderRefuseLeavesAnExistingDestinationAndIsAlreadyExists) {
     bc::file_system_test::write_raw(path_of("source"), "the new content", 0644);
     bc::file_system_test::write_raw(path_of("existing"), "the old content", 0644);
@@ -3072,7 +3160,7 @@ TEST_P(FileSystemContract, CopyUnderRefuseLeavesAnExistingDestinationAndIsAlread
     const auto achieved = files().copy_file(in("source"), in("existing"), kWrittenExactly0644Refusing);
 
     ASSERT_FALSE(achieved.has_value());
-    EXPECT_EQ(achieved.error().kind, ErrorKind::already_exists);
+    EXPECT_EQ(achieved.error().kind, expected_under(GetParam(), ErrorKind::already_exists, ErrorKind::unsupported));
     EXPECT_EQ(achieved.error().path, path_of("existing").string());
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("existing")), "the old content");
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("existing", "source"));
@@ -3441,13 +3529,22 @@ TEST_P(FileSystemContract, CreateSymlinkBeneathADirectoryMakesTheLinkInsideAndRe
 // condemn and remove_condemned
 // -------------------------------------------------------------------------------------------------------------
 
+// A condemn is one step of the platform's no-replace rename, so that a condemned entry is whole under its new name
+// or untouched under its old one. The portable-only engine has no such rename, and a plain one would replace a
+// condemned name a previous condemn left: every condemn there answers `unsupported` before any system call, and
+// the cases below hold that nothing moved.
+
 TEST_P(FileSystemContract, CondemnRenamesATreeBesideItselfAndAnswersTheCondemnedName) {
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
     lay_out_a_small_tree(path_of("tree"));
 
     const auto name = files().condemn(in("tree"));
 
-    ASSERT_TRUE(name.has_value()) << name.error().message();
+    ASSERT_EQ(answer_of(name), expected_under(GetParam(), kSucceeds, kUnsupported));
+    if (!name.has_value()) {
+        EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("tree"));
+        return;
+    }
     EXPECT_EQ(*name, ".bc-condemned-tree");
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(".bc-condemned-tree"));
     EXPECT_EQ(bc::file_system_test::read_raw(path_of(".bc-condemned-tree/sub/b.txt")), "bee");
@@ -3459,7 +3556,11 @@ TEST_P(FileSystemContract, CondemnTwiceWithTheSameNameYieldsTwoNamesAndKeepsBoth
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
     bc::file_system_test::write_raw(path_of("tree/first"), "first", 0644);
     const auto first = files().condemn(in("tree"));
-    ASSERT_TRUE(first.has_value()) << first.error().message();
+    ASSERT_EQ(answer_of(first), expected_under(GetParam(), kSucceeds, kUnsupported));
+    if (!first.has_value()) {
+        EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("tree"));
+        return;
+    }
     bc::file_system_test::make_directory_raw(path_of("tree"), 0755);
     bc::file_system_test::write_raw(path_of("tree/second"), "second", 0644);
 
@@ -3485,6 +3586,17 @@ TEST_P(FileSystemContract, CondemnTakesAFileAndASymlinkAsThemselvesRefusesTheRoo
     const auto root_of_all = files().condemn(Location::at(std::filesystem::path{"/"}));
     const auto nothing = files().condemn(in("absent"));
 
+    // Before any system call, the portable-only engine's refusal comes first: of the file, the link, the root
+    // and nothing alike.
+    ASSERT_EQ(answer_of(file), expected_under(GetParam(), kSucceeds, kUnsupported));
+    ASSERT_EQ(answer_of(link), expected_under(GetParam(), kSucceeds, kUnsupported));
+    ASSERT_EQ(answer_of(root_of_all), expected_under(GetParam(), kInvalidArgument, kUnsupported));
+    ASSERT_EQ(answer_of(nothing), expected_under(GetParam(), kNotFound, kUnsupported));
+    if (!file.has_value()) {
+        EXPECT_FALSE(nothing.error().step.has_value());
+        EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("file", "link"));
+        return;
+    }
     ASSERT_TRUE(file.has_value()) << file.error().message();
     EXPECT_EQ(bc::file_system_test::read_raw(path_of(*file)), "content");
     ASSERT_TRUE(link.has_value()) << link.error().message();
@@ -3504,6 +3616,11 @@ TEST_P(FileSystemContract, CondemnOfALeafAsLongAsANameMayBeCutsItToFit) {
     bc::file_system_test::write_raw(path_of(leaf), "content", 0644);
 
     const auto first = files().condemn(in(leaf));
+    ASSERT_EQ(answer_of(first), expected_under(GetParam(), kSucceeds, kUnsupported));
+    if (!first.has_value()) {
+        EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre(leaf));
+        return;
+    }
     bc::file_system_test::write_raw(path_of(leaf), "again", 0644);
     const auto second = files().condemn(in(leaf));
 
@@ -3584,8 +3701,13 @@ TEST_P(FileSystemContract, CondemnThenRemoveCondemnedClearsTheTreeAndLeavesItsNe
     const auto name = files().condemn(in("tree"));
     const auto swept = files().remove_condemned(root());
 
-    ASSERT_TRUE(name.has_value()) << name.error().message();
+    // The sweep is no rename and runs on every engine; on the portable-only engine it finds nothing to sweep.
+    ASSERT_EQ(answer_of(name), expected_under(GetParam(), kSucceeds, kUnsupported));
     ASSERT_TRUE(swept.has_value()) << swept.error().message();
+    if (!name.has_value()) {
+        EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("neighbour", "tree"));
+        return;
+    }
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("neighbour"));
 }
 
@@ -3638,6 +3760,148 @@ TEST_F(ObservedContract, AWriteStoppedBeforeItsRenameLeavesAStagedFileTheSweepCl
     ASSERT_TRUE(swept.has_value()) << swept.error().message();
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("ledger"));
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the old ledger");
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// The portable-only engine: never a fast path's step, and the steps of the path every platform has instead
+// -------------------------------------------------------------------------------------------------------------
+
+// A `beneath` location is walked one component at a time, on every platform: neither fast path's step is reached,
+// and the walk opens each component and then the leaf, where a fast path would open the whole parent in one call.
+TEST_F(PortableOnlyContract, BeneathIsWalkedOneComponentAtATimeAndNeverTakesAFastPath) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    const std::uint64_t opens_before = count(Operation::open_directory, Step::openat);
+
+    const auto deeper =
+        files().open_directory(Location::beneath(*parent, relative("sub/deeper")), FinalSymlink::refuse);
+    const auto through_a_symlink =
+        files().open_directory(Location::beneath(*parent, relative("alias/deeper")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(deeper.has_value()) << deeper.error().message();
+    EXPECT_EQ(deeper->opened_as().value(), path_of("sub/deeper").string());
+    ASSERT_FALSE(through_a_symlink.has_value());
+    EXPECT_EQ(through_a_symlink.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat2), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat_nofollow_any), 0U);
+    // `sub` and the leaf `deeper` for the first; `alias`, refused at its own open, for the second.
+    EXPECT_EQ(count(Operation::open_directory, Step::openat) - opens_before, 3U);
+}
+
+// A copy moves its bytes through the read-and-write loop, on every platform: the clone's and the in-kernel copy's
+// steps are never reached, every byte passes through the process, and the copy is byte for byte.
+TEST_F(PortableOnlyContract, CopyMovesTheBytesThroughTheLoopAndNeverClonesOrCopiesInTheKernel) {
+    const std::string content((std::size_t{3} * 1024 * 1024) + 1, 'c');
+    bc::file_system_test::write_raw(path_of("source"), content, 0644);
+
+    const auto achieved = files().copy_file(in("source"), in("copy"), kWrittenExactly0644);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("copy")), content);
+    EXPECT_EQ(count(Operation::copy_file, Step::clone_file), 0U);
+    EXPECT_EQ(count(Operation::copy_file, Step::copy_range), 0U);
+    // The loop reads until the source answers no more bytes, so a file with any bytes takes two reads at least.
+    EXPECT_GE(count(Operation::copy_file, Step::pread), 2U);
+    EXPECT_GE(count(Operation::copy_file, Step::write), 1U);
+    EXPECT_THAT(staged_names_of(root_path(), "copy"), IsEmpty());
+}
+
+// A durable rename is one renameat and a sync of each directory by fsync, the sync every platform has: neither the
+// no-replace rename nor the full sync is reached.
+TEST_F(PortableOnlyContract, DurableRenameIsOneRenameatAndSyncsBothDirectoriesByFsync) {
+    bc::file_system_test::make_directory_raw(path_of("from"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("to"), 0755);
+    bc::file_system_test::write_raw(path_of("from/ledger"), "content", 0644);
+
+    const auto achieved =
+        files().rename(in("from/ledger"), in("to/ledger"), ExistingDestination::replace, Durability::durable);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::durable);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("to/ledger")), "content");
+    EXPECT_EQ(count(Operation::rename, Step::rename_no_replace), 0U);
+    EXPECT_EQ(count(Operation::rename, Step::renameat), 1U);
+    EXPECT_EQ(count(Operation::rename, Step::fsync), 2U);
+    EXPECT_EQ(count(Operation::rename, Step::fcntl_fullfsync), 0U);
+}
+
+// A durable write syncs its staged file and then its directory by fsync and takes the name with renameat.
+TEST_F(PortableOnlyContract, DurableWriteSyncsByFsyncAndTakesTheNameWithRenameat) {
+    const auto bytes = bytes_of("the ledger");
+
+    const auto achieved = files().write_file(in("ledger"), bytes, kDurableExactly0644);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::durable);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("ledger")), "the ledger");
+    EXPECT_EQ(count(Operation::write_file, Step::fsync), 2U);
+    EXPECT_EQ(count(Operation::write_file, Step::fcntl_fullfsync), 0U);
+    EXPECT_EQ(count(Operation::write_file, Step::renameat), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::rename_no_replace), 0U);
+}
+
+// What only the no-replace rename keeps is refused before any system call: a rename, a write and a copy told to
+// refuse an existing destination, and a condemn. Not one step is counted (the walk of an `at` location begins
+// with opening the root), nothing is staged, nothing moves, and a two-location refusal names the destination,
+// whose promise it is.
+TEST_F(PortableOnlyContract, WhatOnlyTheNoReplaceRenameKeepsIsUnsupportedBeforeAnySystemCall) {
+    bc::file_system_test::write_raw(path_of("source"), "the new content", 0644);
+    bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
+
+    const auto renamed = files().rename(in("source"), in("current"), ExistingDestination::refuse, Durability::written);
+    const auto written = files().write_file(in("fresh"), bytes_of("new"), kWrittenExactly0644Refusing);
+    const auto copied = files().copy_file(in("source"), in("fresh"), kWrittenExactly0644Refusing);
+    const auto condemned = files().condemn(in("source"));
+
+    ASSERT_FALSE(renamed.has_value());
+    EXPECT_EQ(renamed.error().kind, ErrorKind::unsupported);
+    EXPECT_FALSE(renamed.error().step.has_value());
+    EXPECT_EQ(renamed.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(renamed.error().path, path_of("current").string());
+    ASSERT_FALSE(written.has_value());
+    EXPECT_EQ(written.error().kind, ErrorKind::unsupported);
+    EXPECT_FALSE(written.error().step.has_value());
+    EXPECT_EQ(written.error().path, path_of("fresh").string());
+    ASSERT_FALSE(copied.has_value());
+    EXPECT_EQ(copied.error().kind, ErrorKind::unsupported);
+    EXPECT_FALSE(copied.error().step.has_value());
+    EXPECT_EQ(copied.error().failed_location, FailedLocation::second);
+    EXPECT_EQ(copied.error().path, path_of("fresh").string());
+    ASSERT_FALSE(condemned.has_value());
+    EXPECT_EQ(condemned.error().kind, ErrorKind::unsupported);
+    EXPECT_FALSE(condemned.error().step.has_value());
+    for (const Operation operation :
+         {Operation::rename, Operation::write_file, Operation::copy_file, Operation::condemn}) {
+        EXPECT_EQ(count(operation, Step::open), 0U) << name_of(operation);
+        EXPECT_EQ(count(operation, Step::rename_no_replace), 0U) << name_of(operation);
+        EXPECT_EQ(count(operation, Step::renameat), 0U) << name_of(operation);
+    }
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("current", "source"));
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("current")), "the old content");
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("source")), "the new content");
+}
+
+// The same operations under `replace` are unchanged by the missing rename: a rename and a write replace, a copy
+// copies, each through renameat.
+TEST_F(PortableOnlyContract, UnderReplaceTheSameOperationsReplaceThroughRenameat) {
+    bc::file_system_test::write_raw(path_of("source"), "the new content", 0644);
+    bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
+    bc::file_system_test::write_raw(path_of("copied"), "the old copy", 0644);
+
+    const auto copied = files().copy_file(in("source"), in("copied"), kWrittenExactly0644);
+    const auto written = files().write_file(in("current"), bytes_of("written"), kWrittenExactly0644);
+    const auto renamed = files().rename(in("source"), in("current"), ExistingDestination::replace, Durability::written);
+
+    ASSERT_TRUE(copied.has_value()) << copied.error().message();
+    ASSERT_TRUE(written.has_value()) << written.error().message();
+    ASSERT_TRUE(renamed.has_value()) << renamed.error().message();
+    EXPECT_THAT(bc::file_system_test::names_raw(root_path()), ElementsAre("copied", "current"));
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("copied")), "the new content");
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("current")), "the new content");
+    EXPECT_EQ(count(Operation::copy_file, Step::renameat), 1U);
+    EXPECT_EQ(count(Operation::write_file, Step::renameat), 1U);
+    EXPECT_EQ(count(Operation::rename, Step::renameat), 1U);
 }
 
 // -------------------------------------------------------------------------------------------------------------

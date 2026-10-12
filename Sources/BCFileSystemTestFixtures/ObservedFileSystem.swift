@@ -2,8 +2,9 @@ import BCFileSystem
 import CBCFileSystem
 
 // The observed engine: the same engine as the live one with the observer installed, so every step is counted
-// and scripted faults take effect. Created by one factory, the only way to install an observer, which the
-// house-rules guard confines to test code.
+// and scripted faults take effect. Created by one of two factories, the only ways to install an observer, which
+// the house-rules guard confines to test code: `observed(root:)` over the fast paths the platform's probe found,
+// and `portableOnly(root:)` with every fast path refused.
 
 /// What a scripted fault does when its step is reached.
 public enum FaultAction: Int32, CaseIterable, Sendable {
@@ -55,8 +56,9 @@ public struct Fault: Equatable, Sendable {
     }
 }
 
-/// A file system over an observed engine, in a directory the test created: the file system to act through,
-/// the directory to act in, the faults to script and the step counts to read.
+/// A file system over an observed engine (the observed one, or the portable-only one), in a directory the test
+/// created: the file system to act through, the directory to act in, the faults to script and the step counts
+/// to read.
 public struct ObservedFileSystem {
     public let fileSystem: FileSystem
     public let root: TemporaryDirectory
@@ -110,16 +112,42 @@ public struct ObservedFileSystem {
     }
 }
 
+/// One of the core's engine factories as Swift imports it: the slot the engine is stored in and the error struct,
+/// and the kind it failed with, or 0.
+private typealias CoreEngineFactory = (
+    UnsafeMutablePointer<OpaquePointer?>?, UnsafeMutablePointer<bc_file_system_error>?
+) -> Int32
+
 extension FileSystem {
     /// The file system of a test: an engine with the observer installed, over the directory the test created.
     public static func observed(root: TemporaryDirectory) throws(FileSystemError) -> ObservedFileSystem {
+        try observedFileSystem(
+            root: root, createdBy: bc_file_system_engine_create_observed_for_tests,
+            called: .engineCreateObservedForTests)
+    }
+
+    /// The file system of a test whose engine is refused every fast path: the observed engine, over the directory
+    /// the test created, on which every operation takes the path every platform has (the walk, the
+    /// read-and-write loop, fsync) and one whose promise a fast path alone keeps (the no-replace rename of a
+    /// `refuse` and of a condemn) answers `unsupported`, as a platform without that path does.
+    public static func portableOnly(root: TemporaryDirectory) throws(FileSystemError) -> ObservedFileSystem {
+        try observedFileSystem(
+            root: root, createdBy: bc_file_system_engine_create_portable_only_for_tests,
+            called: .engineCreatePortableOnlyForTests)
+    }
+
+    /// The one body of the two factories: the engine one of the core's two factories for tests creates, adopted,
+    /// over the test's directory.
+    private static func observedFileSystem(
+        root: TemporaryDirectory, createdBy factory: CoreEngineFactory, called: Operation
+    ) throws(FileSystemError) -> ObservedFileSystem {
         var created: OpaquePointer?
         var coreError = bc_file_system_error()
-        if bc_file_system_engine_create_observed_for_tests(&created, &coreError) != 0 {
-            throw FileSystemError(core: coreError, called: .engineCreateObservedForTests, locationText: [])
+        if factory(&created, &coreError) != 0 {
+            throw FileSystemError(core: coreError, called: called, locationText: [])
         }
         guard let handle = created else {
-            throw FileSystemError.answerOutsideEnum(called: .engineCreateObservedForTests, locationText: [])
+            throw FileSystemError.answerOutsideEnum(called: called, locationText: [])
         }
         return ObservedFileSystem(fileSystem: FileSystem(engine: Engine(adopting: handle)), root: root)
     }

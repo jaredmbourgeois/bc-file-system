@@ -51,6 +51,14 @@ static bc_file_system_engine *create_observed(report *tally) {
     return engine;
 }
 
+static bc_file_system_engine *create_portable_only(report *tally) {
+    bc_file_system_engine *engine = nullptr;
+    bc_file_system_error error;
+    expect(tally, bc_file_system_engine_create_portable_only_for_tests(&engine, &error) == 0,
+           "engine_create_portable_only_for_tests succeeds", "");
+    return engine;
+}
+
 /* A fault that fails `step` of `operation` with `system_code` the `occurrence`-th time it is reached. */
 static bc_file_system_fault fail_step(int32_t operation, int32_t step, uint32_t occurrence, int32_t system_code) {
     return (bc_file_system_fault){.operation = operation,
@@ -178,6 +186,38 @@ static void test_observed_engine_probes_the_same_way(report *tally) {
     bc_file_system_engine_release(observed);
 }
 
+/* Whatever the platform offers, the portable-only engine holds no fast path, and it is an observed engine: it
+ * counts its steps and fires a scripted fault like the observed one. Its factory reports its own operation. */
+static void test_the_portable_only_engine_holds_no_fast_path_and_observes(report *tally) {
+    bc_file_system_engine *engine = create_portable_only(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
+    expect_fast_path(tally, fast_paths->has_openat2, false, "portable only: no openat2");
+    expect_fast_path(tally, fast_paths->has_openat_nofollow_any, false, "portable only: no O_NOFOLLOW_ANY");
+    expect_fast_path(tally, fast_paths->has_rename_no_replace, false, "portable only: no no-replace rename");
+    expect_fast_path(tally, fast_paths->has_clone, false, "portable only: no clone");
+    expect_fast_path(tally, fast_paths->has_copy_range, false, "portable only: no copy_file_range");
+    expect_fast_path(tally, fast_paths->has_full_fsync, false, "portable only: fsync is the sync");
+
+    const int32_t copy_file = bc_file_system_operation_copy_file;
+    script(tally, engine, fail_step(copy_file, bc_file_system_step_pread, 1, EIO), "the loop's first read fails");
+    bc_file_system_engine_before_operation(engine, copy_file);
+    const bc_file_system_step_verdict verdict = step(engine, copy_file, bc_file_system_step_pread);
+    expect(tally, verdict.action == bc_file_system_step_action_fail, "the portable-only engine fires the fault", "");
+    expect(tally, verdict.system_code == EIO, "with the scripted errno", "");
+    expect(tally, count_of(tally, engine, copy_file, bc_file_system_step_pread) == 1,
+           "the portable-only engine counts the step", "");
+    bc_file_system_engine_release(engine);
+
+    bc_file_system_error error;
+    const int32_t refused = bc_file_system_engine_create_portable_only_for_tests(nullptr, &error);
+    expect(tally, refused == bc_file_system_error_kind_invalid_argument, "a NULL engine slot is invalid_argument", "");
+    expect(tally, error.operation == bc_file_system_operation_engine_create_portable_only_for_tests,
+           "the refusal names the portable-only factory", "");
+}
+
 /* ---- The platform operations ---------------------------------------------------------------------------------- */
 
 /* The operations with bodies, handed an invalid descriptor so nothing is touched: a platform with the call
@@ -185,6 +225,7 @@ static void test_observed_engine_probes_the_same_way(report *tally) {
 #ifdef __EMSCRIPTEN__
 static void expect_platform_operations(report *tally) {
     expect(tally, bc_file_system_platform_sync_descriptor(-1) == ENOTSUP, "Emscripten: sync is not offered", "");
+    expect(tally, bc_file_system_platform_full_sync_descriptor(-1) == ENOTSUP, "Emscripten: no full sync either", "");
     expect(tally, bc_file_system_platform_rename_no_replace(-1, "a", -1, "b") == ENOTSUP,
            "Emscripten: the no-replace rename is not offered", "");
     expect(tally, !bc_file_system_platform_enforces_locks(), "Emscripten: flock is a stub, so no lock is held", "");
@@ -192,7 +233,7 @@ static void expect_platform_operations(report *tally) {
 #else
 static void expect_platform_operations(report *tally) {
     const int sync_code = bc_file_system_platform_sync_descriptor(-1);
-    expect(tally, sync_code == EBADF, "sync_descriptor reports an invalid descriptor as EBADF", "");
+    expect(tally, sync_code == EBADF, "sync_descriptor (fsync) reports an invalid descriptor as EBADF", "");
     const int rename_code = bc_file_system_platform_rename_no_replace(-1, "a", -1, "b");
     expect(tally, rename_code != 0, "rename_no_replace on an invalid descriptor fails", "");
     expect(tally, rename_code != ENOTSUP, "rename_no_replace on an invalid descriptor is not ENOTSUP", "");
@@ -202,7 +243,7 @@ static void expect_platform_operations(report *tally) {
 
 static void test_platform_operations(report *tally) {
     expect_platform_operations(tally);
-    /* The three operations with a fast path are real where the probe says the platform has one: handed an
+    /* The four operations with a fast path are real where the probe says the platform has one: handed an
      * invalid descriptor each reports the descriptor (never ENOTSUP, never success, nothing stored); where the
      * platform has none, each answers ENOTSUP outright. */
     bc_file_system_engine *engine = create_live(tally);
@@ -210,6 +251,12 @@ static void test_platform_operations(report *tally) {
         return;
     }
     const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
+    const int full_sync_code = bc_file_system_platform_full_sync_descriptor(-1);
+    if (fast_paths->has_full_fsync) {
+        expect(tally, full_sync_code == EBADF, "full_sync_descriptor reports an invalid descriptor as EBADF", "");
+    } else {
+        expect(tally, full_sync_code == ENOTSUP, "full_sync_descriptor is not offered on this platform", "");
+    }
     int descriptor = -1;
     const int open_beneath_code = bc_file_system_platform_open_beneath(-1, "a/b", 0, &descriptor);
     if (fast_paths->has_openat2 || fast_paths->has_openat_nofollow_any) {
@@ -441,6 +488,7 @@ int main(void) {
     report tally = {.checked = 0, .failed = 0};
     test_live_engine_is_created_released_and_probed(&tally);
     test_observed_engine_probes_the_same_way(&tally);
+    test_the_portable_only_engine_holds_no_fast_path_and_observes(&tally);
     test_platform_operations(&tally);
     test_an_observed_engine_counts_every_step(&tally);
     test_a_fault_fires_at_its_occurrence_and_not_before(&tally);
