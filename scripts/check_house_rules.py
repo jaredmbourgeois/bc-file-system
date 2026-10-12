@@ -86,7 +86,8 @@ class Configuration:
     face_parity_faces: dict[str, tuple[str, ...]]
     # The test-only factories: patterns (over blanked text) that name a factory for tests in any language, and the
     # files or directory prefixes (ending in "/") where naming one is legal: the header and the core that declare
-    # and define them, the one wrapper per face, the test fixtures and the tests.
+    # and define them, the one wrapper per face, the test fixtures, the tests and the hand-run benchmark (whose
+    # observer rows and step counts are the observed engine's).
     test_only_factory_patterns: tuple[str, ...]
     test_only_factory_is_legal_in: tuple[str, ...]
 
@@ -119,24 +120,31 @@ CONFIGURATION: Final = Configuration(
             "fuzz/operation_sequence_fuzz.c",
         ),
         # The one C++ file that names `bc_file_system_engine_create_live` (the face's live factory), and the tests'
-        # own file system: the temporary directory and the descriptor-balance fixture.
+        # own file system: the temporary directory and the descriptor-balance fixture; and the C++ benchmark, a
+        # composition root whose comparison rows call std::filesystem, <fstream> and POSIX because those calls are
+        # what it measures (its harness, bench/cpp/harness.cpp, is handed the clock and the stream and reaches for
+        # nothing).
         "cpp": (
             "cpp/src/engine.cpp",
             "cpp/tests/support/temp_directory.cpp",
             "cpp/tests/support/descriptor_balance.cpp",
+            "bench/cpp/benchmark.cpp",
         ),
         # The build script (the build's composition root: cargo's environment and the directory of C sources),
         # the one Rust file that names the live factory (`Engine::live`), the ABI smoke, which creates a live
         # engine to prove the declarations against the real core and prints the error's measured size; the test
         # companion's temporary directory (the Rust tests' own directory: the system's temporary directory and the
         # process id, once each, and the raw helpers' file system), and the vendored bc-mutants tests, whose copied
-        # bodies set up and check their cases with std::fs inside the directory they own.
+        # bodies set up and check their cases with std::fs inside the directory they own; and the Rust benchmark,
+        # the composition root of `bc-file-system`'s bench target, whose comparison rows call std::fs because
+        # those calls are what it measures.
         "rust": (
             "crates/bc-file-system/build.rs",
             "crates/bc-file-system/src/live.rs",
             "crates/bc-file-system/tests/abi_smoke.rs",
             "crates/bc-file-system/tests/bc_mutants_shapes.rs",
             "crates/bc-file-system-testing/src/temporary_directory.rs",
+            "bench/rust/std_comparison.rs",
         ),
         # The fixtures' temporary directory: the one place `swift test` reads where its root is.
         "swift": ("Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift",),
@@ -200,6 +208,7 @@ CONFIGURATION: Final = Configuration(
         "fuzz/",
         "Sources/BCFileSystemTestFixtures/",
         "Tests/",
+        "bench/",
     ),
 )
 
@@ -1328,10 +1337,11 @@ SELFTEST_CONFIGURATION: Final = Configuration(
         r"\bplanted_engine_create_portable_only_for_tests\b",
         r"\.\s*portableOnly\s*\(\s*root\s*:",
     ),
-    test_only_factory_is_legal_in=("core/src/planted_core.c", "cpp/src/engine.cpp", "Tests/"),
+    test_only_factory_is_legal_in=("core/src/planted_core.c", "cpp/src/engine.cpp", "Tests/", "bench/"),
 )
 # (source, path, expected) for the test-only factories, the observed one and a second beside it: the C name and
-# the Swift spelling, in the library, in a legal file, under a legal directory, and commented out.
+# the Swift spelling, in the library, in a legal file, under a legal directory (the tests', the benchmark's), under
+# a directory whose name only begins like a legal one, and commented out.
 TEST_ONLY_FACTORY_PLANTS: Final = (
     ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "cpp/src/file_system.cpp", 1),
     ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "cpp/src/engine.cpp", 0),
@@ -1345,6 +1355,9 @@ TEST_ONLY_FACTORY_PLANTS: Final = (
     ("let files = FileSystem.portableOnly(root: root)", "Sources/Planted/Planted.swift", 1),
     ("let files = FileSystem.portableOnly(root: root)", "Tests/PlantedTests/PlantedTests.swift", 0),
     ("let files = FileSystem.portableOnlyElsewhere(root: root)", "Sources/Planted/Planted.swift", 0),
+    ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "bench/cpp/planted_benchmark.cpp", 0),
+    ("engine = planted_engine_create_portable_only_for_tests(&engine, &error);", "bench/cpp/planted_benchmark.cpp", 0),
+    ("engine = planted_engine_create_observed_for_tests(&engine, &error);", "benchmarks/planted_benchmark.cpp", 1),
 )
 
 

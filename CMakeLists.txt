@@ -38,4 +38,13 @@ endif()
 add_subdirectory(core)   # the C core: bc::file_system_core
 add_subdirectory(cpp)    # the C++ face: bc::file_system, and the contract and binding suites
 add_subdirectory(fuzz)   # the libFuzzer targets, behind BC_FILE_SYSTEM_BUILD_FUZZERS (the fuzz preset)
+
+# The hand-run benchmark exists only for the project that owns the code, as the tests do, and only when asked for
+# (the bench preset): a consumer that fetched us never sees the option or the target.
+if(PROJECT_IS_TOP_LEVEL)
+    option(BC_FILE_SYSTEM_BUILD_BENCHMARKS "Build the hand-run benchmark against std (the bench preset)" OFF)
+    if(BC_FILE_SYSTEM_BUILD_BENCHMARKS)
+        add_subdirectory(bench)
+    endif()
+endif()
 # No install(): consumers build from source through FetchContent and link the alias.

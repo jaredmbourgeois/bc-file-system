@@ -32,6 +32,7 @@ wrong even when it compiles and passes.
 | `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module `CBCFileSystem` (declared in `Package.swift` over `core/`): the engine, `FileSystem` and its operations, and the path values with `PathText`, the path module's ten functions, every value validated and every answer made by one call into C; its test fixtures (the temporary directory and the observed engine); its binding suites (`BindingTests.swift`, and `PathTests.swift`, the port of `cpp/tests/path_test.cpp`), its contract cases and its source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
 | `crates/` | The Rust face, a virtual workspace with one `Cargo.lock` and `publish = false` (consumers pin a git SHA), formatted by the root's `rustfmt.toml` and built locally by the root's `rust-toolchain.toml` (the MSRV). `bc-file-system/` compiles the core through `cc` (`build.rs`) and is the face: `src/ffi.rs` spells the ABI by hand with the layout pins beside it; `src/live.rs` is every call into the core (the `Engine` and its operations, `Directory::opened_as`, the three releases, the path module's calls, and `testing_support`, the observer's documentation-hidden door); the value types are modules of their own (`error.rs`, `options.rs`, `status.rs`, `location.rs` with `Location` and `Directory`, `lock.rs`, `path.rs` with the two path values and the module's ten functions); `buffer.rs` is the buffer protocol (the grow loop, the two calls) and `compositions.rs` the face's compositions; `tests/` holds the binding suite (`binding.rs`), the ported path tables (`path.rs`), the vendored bc-mutants tests (`bc_mutants_shapes.rs`) and the ABI smoke (`abi_smoke.rs`). `bc-file-system-testing/` is what a consumer's tests need and production never sees: `ObservedEngine` with `Fault` and `FaultAction`, over the door, and `TemporaryDirectory` with its raw helpers | — | — | `bc-file-system`, `bc-file-system-testing` |
 | `fuzz/` | The libFuzzer targets, behind `BC_FILE_SYSTEM_BUILD_FUZZERS` (on in the `fuzz` preset): `path_fuzz.c` over the path module; `abi_arguments_fuzz.c` over every public function with fuzzed arguments, and `operation_sequence_fuzz.c` over sequences of operations on one tree with faults scripted into them, each over a root it makes once under the directory the generated `fuzz_paths.h` hands it, sharing `harness.h` (the trap, the reader of fuzzed bytes, the root, the count of descriptors open under it) | `bc_file_system_path_fuzz`, `bc_file_system_abi_arguments_fuzz`, `bc_file_system_operation_sequence_fuzz` | — | — |
+| `bench/` | The hand-run benchmark against std, never a CI job or a leg of `scripts/verify.sh` (design doc, "Benchmark"): `bench/cpp/benchmark.cpp` the C++ face against `std::filesystem`, `<fstream>` and POSIX, with `harness.cpp` the timing and the table, built by the `bench` preset behind `BC_FILE_SYSTEM_BUILD_BENCHMARKS` (top-level only); `bench/rust/std_comparison.rs` the crate against `std::fs`, `bc-file-system`'s bench target, run by `cargo bench` | `bc_file_system_benchmark` | — | `bc-file-system` (bench target `std_comparison`) |
 | `examples/consumer/` | A separate CMake project that consumes the core through FetchContent | its own project | — | — |
 | `cmake/helpers.cmake` | The compile-options helper, the toolchain-knob list, the build posture, the four-way header check | included by the root | — | — |
 | `scripts/check_house_rules.py` | The guard for the three rules, over every language here | run by `scripts/verify.sh` | — | — |
@@ -65,9 +66,12 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
 **A reach is legal at exactly four kinds of site.** Anything else is a finding.
 
 1. **The composition root**: a program's `main`, and nothing below it. It is the only place a live value is
-   named. In this repository: the `main` of `examples/consumer/main.c`, which creates and releases a live engine,
-   and the `main` of `crates/bc-file-system/build.rs`, the build's own root, which reads cargo's environment and
-   the directory of C sources it compiles.
+   named. In this repository: the `main` of `examples/consumer/main.c`, which creates and releases a live engine;
+   the `main` of `crates/bc-file-system/build.rs`, the build's own root, which reads cargo's environment and the
+   directory of C sources it compiles; and the `main` of each hand-run benchmark, `bench/cpp/benchmark.cpp` and
+   `bench/rust/std_comparison.rs`, each file listed whole because the rows below its `main` call
+   `std::filesystem`, `<fstream>`, POSIX and `std::fs` directly, which is what a benchmark against std measures
+   (the C++ timing and table, `bench/cpp/harness.cpp`, is handed its clock and its stream and reaches for nothing).
 2. **The body of a seam's one live implementation.** In this repository: `core/src/bc_file_system.c`,
    `core/src/resolve.c` with `core/src/resolve.h`, `core/src/calls.c` with `core/src/calls.h`, and
    `core/src/owned.h` (the engine, which reads the process id once in its factory; the resolution layer that
@@ -116,7 +120,8 @@ engine with every fast path refused (`Engine::portable_only_for_tests()`, `FileS
 (`cpp/src/engine.cpp`; `crates/bc-file-system/src/ffi.rs` and `src/live.rs`), `core/tests/`, `cpp/tests/`,
 `crates/bc-file-system/tests/`, `crates/bc-file-system-testing/` (the Rust face's test companion, which a consumer
 names under `[dev-dependencies]` only), `fuzz/` (the engine fuzzers drive the observed engine so a fuzzed fault
-scripts real refusals), `Sources/BCFileSystemTestFixtures/` and `Tests/`.
+scripts real refusals), `bench/` (the hand-run benchmark's observer rows and step counts),
+`Sources/BCFileSystemTestFixtures/` and `Tests/`.
 **In a script, the path handed in is the injection**: a function may open the path and write the stream it
 was given, and `main(argv, …)` reads the command line and passes everything down.
 
@@ -467,6 +472,12 @@ CI runs it on Linux (Debian 13: GCC 14 and clang 19, Swift 6.4; the `rust` job i
 toolchains through rustup); macOS, iOS and the cross targets (Android, Emscripten, musl, `cargo test` on the two
 musl targets among them) run by hand until CI has runners and packages for them, and so does `fuzz-smoke`, which
 needs clang's compiler-rt (named in `ci.yml`'s gated list beside the clang sanitized leg).
+
+The hand-run benchmark (`bench/`) is no leg and no CI job: `cmake --preset bench && cmake --build --preset bench`
+builds the C++ program and `cargo bench --manifest-path crates/Cargo.toml -p bc-file-system --bench
+std_comparison -- …` runs the Rust one, by hand, with the command lines at the top of `bench/CMakeLists.txt` and
+`bench/rust/std_comparison.rs`. The `rust` leg's `cargo fmt --all` and `cargo clippy --all-targets` hold the Rust
+program to the crate's lints; the C++ program builds under the repository's warnings as errors.
 
 ## Changing a rule
 

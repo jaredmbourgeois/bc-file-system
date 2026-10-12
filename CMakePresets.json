@@ -52,6 +52,17 @@
                 "BC_FILE_SYSTEM_BUILD_FUZZERS": "ON",
                 "BUILD_TESTING": "OFF"
             }
+        },
+        {
+            "name": "bench",
+            "inherits": "base",
+            "displayName": "Release, no posture + the hand-run benchmark against std (what a consumer's release build compiles)",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "none",
+                "BC_FILE_SYSTEM_BUILD_BENCHMARKS": "ON",
+                "BUILD_TESTING": "OFF"
+            }
         }
     ],
     "buildPresets": [
@@ -89,6 +100,10 @@
         {
             "name": "fuzz",
             "configurePreset": "fuzz"
+        },
+        {
+            "name": "bench",
+            "configurePreset": "bench"
         }
     ],
     "testPresets": [

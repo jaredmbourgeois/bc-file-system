@@ -22,6 +22,15 @@ cc = "1"
 [dev-dependencies]
 bc-file-system-testing = { path = "../bc-file-system-testing" }
 
+# The hand-run benchmark against std::fs (design doc, "Benchmark"), beside the C++ one under bench/: run by hand
+# with `cargo bench`, never by `cargo test`, CI or scripts/verify.sh. A bench target, so it builds with release
+# optimisation, may use the observed engine from the dev-dependency, and is held to this crate's lints by
+# `cargo clippy --all-targets` and to rustfmt by `cargo fmt --all`. `harness = false`: it is its own `main`.
+[[bench]]
+name = "std_comparison"
+path = "../../bench/rust/std_comparison.rs"
+harness = false
+
 # The lint policy lives here so the IDE and CI read one table. `unsafe_code` is `deny`, not `forbid`: this crate
 # is the binding, and its two `unsafe` modules (`ffi`, `live`) each carry an `#[expect(unsafe_code)]` with the
 # invariant written at the block; every consumer keeps `forbid`. `missing_docs` is in lib.rs, because a `[lints]`
