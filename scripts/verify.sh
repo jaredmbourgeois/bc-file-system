@@ -27,7 +27,9 @@ fail() {
 # called on the left of || runs without set -e, and would otherwise answer with its last command alone.
 build_and_test_preset() {
     local preset=$1
-    cmake --preset "$preset" && cmake --build --preset "$preset" && ctest --preset "$preset"
+    # `-k 0` keeps ninja going past a failing unit, so one run on a compiler this Mac lacks reports every
+    # failing translation unit instead of the first.
+    cmake --preset "$preset" && cmake --build --preset "$preset" -- -k 0 && ctest --preset "$preset"
 }
 
 leg_build_debug() {
