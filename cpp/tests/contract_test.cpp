@@ -36,8 +36,9 @@
 // engine alone (`ObservedContract`), since a live engine takes no faults. Where a real provocation exists as
 // well, the suite carries both.
 //
-// Every case below that needs the engine is disabled, with the stage that turns it on in the comment above
-// it; the core is an honest stub until then. A case the stub's own argument check already answers is green.
+// A case whose operation the core does not build yet is disabled, with the stage that turns it on in the
+// comment above it; that operation is an honest stub until then. A case the stub's own argument check already
+// answers is green.
 
 namespace bc::file_system {
 
@@ -257,8 +258,7 @@ protected:
 // read_file
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileReturnsEveryByte) {
+TEST_P(FileSystemContract, ReadFileReturnsEveryByte) {
     bc::file_system_test::write_raw(path_of("notes.txt"), "first line\nsecond line\n", 0644);
 
     const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
@@ -267,8 +267,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileReturnsEveryByte) {
     EXPECT_EQ(text_of(*bytes), "first line\nsecond line\n");
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileOfAnEmptyFileIsEmpty) {
+TEST_P(FileSystemContract, ReadFileOfAnEmptyFileIsEmpty) {
     bc::file_system_test::write_raw(path_of("empty"), "", 0644);
 
     const auto bytes = files().read_file(in("empty"), kWholeFileRefusingSymlink);
@@ -277,8 +276,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileOfAnEmptyFileIsEmpty) {
     EXPECT_THAT(*bytes, IsEmpty());
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileReturnsAFileLargerThanAnyInternalBuffer) {
+TEST_P(FileSystemContract, ReadFileReturnsAFileLargerThanAnyInternalBuffer) {
     const std::string large(300 * 1024, 'x');
     bc::file_system_test::write_raw(path_of("large.bin"), large, 0644);
 
@@ -288,8 +286,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileReturnsAFileLargerThanAnyInternalBuf
     EXPECT_EQ(text_of(*bytes), large);
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileOfNothingIsNotFound) {
+TEST_P(FileSystemContract, ReadFileOfNothingIsNotFound) {
     const auto bytes = files().read_file(in("absent.txt"), kWholeFileRefusingSymlink);
 
     ASSERT_FALSE(bytes.has_value());
@@ -300,8 +297,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileOfNothingIsNotFound) {
     EXPECT_FALSE(bytes.error().message().empty());
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileIfPresentOfNothingIsAnEmptyValue) {
+TEST_P(FileSystemContract, ReadFileIfPresentOfNothingIsAnEmptyValue) {
     bc::file_system_test::write_raw(path_of("present.txt"), "here", 0644);
 
     const auto absent = files().read_file_if_present(in("absent.txt"), kWholeFileRefusingSymlink);
@@ -315,8 +311,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileIfPresentOfNothingIsAnEmptyValue) {
 }
 
 // Under `refuse` a final symlink is refused as what it is; under `follow` the read goes through it.
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileRefusesASymlinkEvenToARegularFileUnlessToldToFollow) {
+TEST_P(FileSystemContract, ReadFileRefusesASymlinkEvenToARegularFileUnlessToldToFollow) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
 
@@ -329,8 +324,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileRefusesASymlinkEvenToARegularFileUnl
     EXPECT_EQ(text_of(*followed), "behind the link");
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileRefusesADirectory) {
+TEST_P(FileSystemContract, ReadFileRefusesADirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
 
     const auto bytes = files().read_file(in("folder"), kWholeFileRefusingSymlink);
@@ -339,8 +333,27 @@ TEST_P(FileSystemContract, DISABLED_ReadFileRefusesADirectory) {
     EXPECT_EQ(bytes.error().kind, ErrorKind::not_regular_file);
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileBelowAFileIsNotDirectory) {
+// A FIFO is refused as what it is, and the refusal comes back at once: opening a FIFO with no writer would
+// otherwise wait for one forever.
+TEST_P(FileSystemContract, ReadFileRefusesAFifoWithoutWaitingForAWriter) {
+    bc::file_system_test::make_fifo_raw(path_of("pipe"), 0600);
+
+    const auto bytes = files().read_file(in("pipe"), kWholeFileRefusingSymlink);
+
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error().kind, ErrorKind::not_regular_file);
+    EXPECT_FALSE(bytes.error().step.has_value());
+}
+
+// The root is a directory, which the read refuses like any other.
+TEST_P(FileSystemContract, ReadFileOfTheRootIsNotRegularFile) {
+    const auto bytes = files().read_file(Location::at(std::filesystem::path{"/"}), kWholeFileRefusingSymlink);
+
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error().kind, ErrorKind::not_regular_file);
+}
+
+TEST_P(FileSystemContract, ReadFileBelowAFileIsNotDirectory) {
     bc::file_system_test::write_raw(path_of("file"), "not a directory", 0644);
 
     const auto bytes = files().read_file(in("file/child"), kWholeFileRefusingSymlink);
@@ -349,8 +362,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileBelowAFileIsNotDirectory) {
     EXPECT_EQ(bytes.error().kind, ErrorKind::not_directory);
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileWithoutPermissionIsPermissionDenied) {
+TEST_P(FileSystemContract, ReadFileWithoutPermissionIsPermissionDenied) {
     if (!bc::file_system_test::permissions_are_enforced(root_path())) {
         GTEST_SKIP() << "this process reads what its permission bits forbid";
     }
@@ -367,8 +379,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileWithoutPermissionIsPermissionDenied)
 // read_file under a limit (the draft's read_range cases: a bound is never a silent prefix)
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostReturnsAFileWithinTheLimit) {
+TEST_P(FileSystemContract, ReadFileUnderAtMostReturnsAFileWithinTheLimit) {
     bc::file_system_test::write_raw(path_of("alphabet"), "abcdefghij", 0644);
 
     const auto exactly_the_size = files().read_file(in("alphabet"), reading_at_most(10));
@@ -380,8 +391,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostReturnsAFileWithinTheLimi
     EXPECT_EQ(text_of(*under_the_size), "abcdefghij");
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostOfALargerFileIsTooLargeNeverAPrefix) {
+TEST_P(FileSystemContract, ReadFileUnderAtMostOfALargerFileIsTooLargeNeverAPrefix) {
     bc::file_system_test::write_raw(path_of("alphabet"), "abcdefghij", 0644);
 
     const auto bytes = files().read_file(in("alphabet"), reading_at_most(4));
@@ -390,8 +400,7 @@ TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostOfALargerFileIsTooLargeNe
     EXPECT_EQ(bytes.error().kind, ErrorKind::too_large);
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostOfAnEmptyFileIsEmpty) {
+TEST_P(FileSystemContract, ReadFileUnderAtMostOfAnEmptyFileIsEmpty) {
     bc::file_system_test::write_raw(path_of("empty"), "", 0644);
 
     const auto under_a_bound = files().read_file(in("empty"), reading_at_most(5));
@@ -403,16 +412,14 @@ TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostOfAnEmptyFileIsEmpty) {
     EXPECT_THAT(*under_zero, IsEmpty());
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostOfNothingIsNotFound) {
+TEST_P(FileSystemContract, ReadFileUnderAtMostOfNothingIsNotFound) {
     const auto bytes = files().read_file(in("absent"), reading_at_most(16));
 
     ASSERT_FALSE(bytes.has_value());
     EXPECT_EQ(bytes.error().kind, ErrorKind::not_found);
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_ReadFileUnderAtMostRefusesASymlinkAndADirectory) {
+TEST_P(FileSystemContract, ReadFileUnderAtMostRefusesASymlinkAndADirectory) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
@@ -1122,16 +1129,14 @@ TEST_P(FileSystemContract, DISABLED_ListReturnsMoreEntriesThanTheFirstArrayHolds
 // status
 // -------------------------------------------------------------------------------------------------------------
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_StatusOfNothingIsAnEmptyValueNotAnError) {
+TEST_P(FileSystemContract, StatusOfNothingIsAnEmptyValueNotAnError) {
     const auto status = files().status(in("absent"), FinalSymlink::refuse);
 
     ASSERT_TRUE(status.has_value());
     EXPECT_FALSE(status->has_value());
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_StatusBelowAFileIsAnEmptyValue) {
+TEST_P(FileSystemContract, StatusBelowAFileIsAnEmptyValue) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto status = files().status(in("file/child"), FinalSymlink::refuse);
@@ -1140,8 +1145,7 @@ TEST_P(FileSystemContract, DISABLED_StatusBelowAFileIsAnEmptyValue) {
     EXPECT_FALSE(status->has_value());
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_StatusReportsAFile) {
+TEST_P(FileSystemContract, StatusReportsAFile) {
     bc::file_system_test::write_raw(path_of("file"), "seven b", 0640);
 
     const auto status = files().status(in("file"), FinalSymlink::refuse);
@@ -1157,8 +1161,7 @@ TEST_P(FileSystemContract, DISABLED_StatusReportsAFile) {
               bc::file_system_test::identity_raw(path_of("file")));
 }
 
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_StatusReportsADirectory) {
+TEST_P(FileSystemContract, StatusReportsADirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0750);
 
     const auto status = files().status(in("folder"), FinalSymlink::refuse);
@@ -1170,10 +1173,43 @@ TEST_P(FileSystemContract, DISABLED_StatusReportsADirectory) {
     EXPECT_EQ((*status)->mode, 0750U);
 }
 
+// The root has no parent entry to ask about; it is described from the directory itself.
+TEST_P(FileSystemContract, StatusOfTheRootIsADirectory) {
+    const auto status = files().status(Location::at(std::filesystem::path{"/"}), FinalSymlink::refuse);
+
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    ASSERT_TRUE(status->has_value());
+    EXPECT_EQ((*status)->entry_type, EntryType::directory);
+    EXPECT_EQ((*status)->size, 0);
+    EXPECT_GE((*status)->link_count, 1U);
+    EXPECT_EQ((Identity{.device = (*status)->device, .inode = (*status)->inode}),
+              bc::file_system_test::identity_raw(std::filesystem::path{"/"}));
+}
+
+// Below a missing directory, as below a file, nothing is at the location.
+TEST_P(FileSystemContract, StatusBelowAMissingDirectoryIsAnEmptyValue) {
+    const auto status = files().status(in("missing/child"), FinalSymlink::follow);
+
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    EXPECT_FALSE(status->has_value());
+}
+
+// Absence is an answer; a refusal on the way is not: a directory that cannot be entered is an error.
+TEST_P(FileSystemContract, StatusBelowADirectoryWithoutPermissionIsPermissionDenied) {
+    if (!bc::file_system_test::permissions_are_enforced(root_path())) {
+        GTEST_SKIP() << "this process reads what its permission bits forbid";
+    }
+    bc::file_system_test::make_directory_raw(path_of("locked"), 0000);
+
+    const auto status = files().status(in("locked/child"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(status.has_value());
+    EXPECT_EQ(status.error().kind, ErrorKind::permission_denied);
+}
+
 // Under `refuse` a symlink is reported as a symlink whatever it points at; under `follow` the report is of
 // what it points at, and a dangling link is absence.
-// stage 13 status-and-reads
-TEST_P(FileSystemContract, DISABLED_StatusReportsASymlinkAsASymlinkWhateverItPointsAt) {
+TEST_P(FileSystemContract, StatusReportsASymlinkAsASymlinkWhateverItPointsAt) {
     bc::file_system_test::write_raw(path_of("target.txt"), "behind the link", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target.txt"), path_of("link"));
     bc::file_system_test::make_symlink_raw(path_of("nowhere"), path_of("dangling"));
@@ -1476,6 +1512,118 @@ TEST_F(ObservedContract, AnInterruptedComponentOpenIsAskedAgain) {
 
     ASSERT_TRUE(directory.has_value()) << directory.error().message();
     EXPECT_EQ(count(Operation::open_directory, Step::openat), components_of(root_path()) + 2);
+}
+
+// -------------------------------------------------------------------------------------------------------------
+// status and reads, observed: what the two operations cost and how a scripted step reaches them
+// -------------------------------------------------------------------------------------------------------------
+
+// What a read costs beyond resolving its location: the leaf is opened once, measured once, read once, and asked
+// once more past its measured size to be sure it did not grow in between.
+TEST_F(ObservedContract, ReadFileOpensTheLeafMeasuresItReadsItAndProbesOnceForMore) {
+    bc::file_system_test::write_raw(path_of("notes.txt"), "seven b", 0644);
+
+    const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
+
+    ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
+    const std::uint64_t components = components_of(root_path());
+    EXPECT_EQ(count(Operation::read_file, Step::open), 1U);
+    EXPECT_EQ(count(Operation::read_file, Step::openat), components + 1);
+    EXPECT_EQ(count(Operation::read_file, Step::fstat), components + 1);
+    EXPECT_EQ(count(Operation::read_file, Step::pread), 2U);
+}
+
+// An empty file is one probe and no other read; its status is one stat of the leaf after the walk.
+TEST_F(ObservedContract, AnEmptyFileIsProbedOnceAndStatusStatsTheLeafOnce) {
+    bc::file_system_test::write_raw(path_of("empty"), "", 0644);
+
+    const auto bytes = files().read_file(in("empty"), kWholeFileRefusingSymlink);
+    const auto status = files().status(in("empty"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
+    EXPECT_THAT(*bytes, IsEmpty());
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    EXPECT_EQ(count(Operation::read_file, Step::pread), 1U);
+    EXPECT_EQ(count(Operation::status, Step::fstatat), components_of(root_path()) + 1);
+    EXPECT_EQ(count(Operation::status, Step::openat), components_of(root_path()));
+}
+
+// A read interrupted by a signal is asked again, and the answer is whole.
+TEST_F(ObservedContract, AnInterruptedReadIsAskedAgainAndTheAnswerIsWhole) {
+    bc::file_system_test::write_raw(path_of("notes.txt"), "first line\nsecond line\n", 0644);
+    script(fail_step(Operation::read_file, Step::pread, 1, EINTR));
+
+    const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
+
+    ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
+    EXPECT_EQ(text_of(*bytes), "first line\nsecond line\n");
+    EXPECT_EQ(count(Operation::read_file, Step::pread), 3U);
+}
+
+// A read the system fails is the operation's error, at that step, with no bytes claimed.
+TEST_F(ObservedContract, AFailedReadIsIoFailedAtPreadAndClaimsNoBytes) {
+    bc::file_system_test::write_raw(path_of("notes.txt"), "content", 0644);
+    script(fail_step(Operation::read_file, Step::pread, 1, EIO));
+
+    const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
+
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(bytes.error().system_code, EIO);
+    EXPECT_EQ(bytes.error().step, Step::pread);
+    EXPECT_EQ(bytes.error().operation, Operation::read_file);
+    EXPECT_EQ(bytes.error().path, path_of("notes.txt").string());
+    EXPECT_EQ(count(Operation::read_file, Step::pread), 1U);
+}
+
+// The leaf's stat answering ENOENT is absence, whatever is really there. Beneath a held directory with one
+// component nothing is walked, so the first stat `status` makes is the leaf's.
+TEST_F(ObservedContract, AScriptedAbsenceOnTheLeafsStatIsAbsence) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    script(fail_step(Operation::status, Step::fstatat, 1, ENOENT));
+
+    const auto status = files().status(Location::beneath(*parent, relative("file")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    EXPECT_FALSE(status->has_value());
+    EXPECT_EQ(count(Operation::status, Step::fstatat), 1U);
+}
+
+// Any other refusal of the leaf's stat is the operation's error at that step.
+TEST_F(ObservedContract, AScriptedRefusalOnTheLeafsStatIsTheOperationsError) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    script(fail_step(Operation::status, Step::fstatat, 1, EIO));
+
+    const auto status = files().status(Location::beneath(*parent, relative("file")), FinalSymlink::refuse);
+
+    ASSERT_FALSE(status.has_value());
+    EXPECT_EQ(status.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(status.error().step, Step::fstatat);
+    EXPECT_EQ(status.error().path, path_of("file").string());
+}
+
+// Beneath a held directory the read is contained like every other operation: a symlink on the way is refused
+// and a file inside reads whole.
+TEST_P(FileSystemContract, ReadFileBeneathADirectoryReadsAFileAndRefusesASymlinkOnTheWay) {
+    lay_out_directories(root_path());
+    bc::file_system_test::write_raw(path_of("sub/deeper/notes.txt"), "beneath", 0644);
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto inside =
+        files().read_file(Location::beneath(*parent, relative("sub/deeper/notes.txt")), kWholeFileRefusingSymlink);
+    const auto through_a_link =
+        files().read_file(Location::beneath(*parent, relative("alias/deeper/notes.txt")), kWholeFileRefusingSymlink);
+
+    ASSERT_TRUE(inside.has_value()) << inside.error().message();
+    EXPECT_EQ(text_of(*inside), "beneath");
+    ASSERT_FALSE(through_a_link.has_value());
+    EXPECT_EQ(through_a_link.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(through_a_link.error().path, path_of("alias/deeper/notes.txt").string());
 }
 
 // -------------------------------------------------------------------------------------------------------------

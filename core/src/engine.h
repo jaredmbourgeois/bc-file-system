@@ -1,11 +1,15 @@
-/* engine.h — the engine's private face: the probed fast paths and the observer's two hooks.
+/* engine.h — the engine's private face: the probed fast paths, the observer's two hooks, and the vocabulary of a
+ * gated system call.
  *
- * Every operation in `bc_file_system.c` is written against these three functions: it announces itself with
- * `before_operation`, and gates every system call with `before_step`, whose verdict says whether the call runs,
- * fails as if the system had refused it, or is the point the operation returns from without cleanup, as if the
- * process had been killed there. The functions have external linkage, under the library's prefix, so the C-only
- * test in `core/tests` can drive the mechanics without an operation in between; they are declared only here and
- * are no part of the public header. Private to `core/src`: C23, never a common subset.
+ * Every operation in `bc_file_system.c` and the resolution layer in `resolve.c` are written against these: an
+ * operation announces itself with `before_operation`, and gates every system call with `before_step`, whose
+ * verdict says whether the call runs, fails as if the system had refused it, or is the point the operation
+ * returns from without cleanup, as if the process had been killed there. What one gated call then comes to is
+ * a `bc_file_system_call_outcome`, read from the verdict with `observer_decided` and turned into the error with
+ * `report_outcome`, so every system call in the core is made and reported in one shape. The hook functions have
+ * external linkage, under the library's prefix, so the C-only test in `core/tests` can drive the mechanics
+ * without an operation in between; they are declared only here and are no part of the public header. Private
+ * to `core/src`: C23, never a common subset.
  *
  * THREADS. The public header promises that a live engine is immutable after creation and may be used from any
  * number of threads at once, and that an engine created for tests is used from one thread at a time. The hooks
@@ -15,6 +19,7 @@
  */
 #pragma once
 
+#include <assert.h>
 #include <stdint.h>
 
 #include <bc_file_system/bc_file_system.h>
@@ -52,3 +57,58 @@ void bc_file_system_engine_before_operation(bc_file_system_engine *engine, int32
  * and becomes the verdict. `operation` and `step` are valid enumerators; `verdict` must not be NULL. */
 void bc_file_system_engine_before_step(bc_file_system_engine *engine, int32_t operation, int32_t step,
                                        bc_file_system_step_verdict *verdict);
+
+/* ---- What a gated system call comes to --------------------------------------------------------------------- */
+
+/* The outcome of one gated system call: the call was made and succeeded; or it failed with `code`, real or
+ * scripted; or the observer stopped the operation there. Every loop that makes a call writes the whole struct
+ * where the call ends, so `succeeded` is true only where the call itself answered 0, and an out-parameter the
+ * call fills is read only on that path. */
+typedef struct bc_file_system_call_outcome {
+    bool succeeded;
+    int code;
+    bool stopped;
+} bc_file_system_call_outcome;
+
+/* Asks the observer before one attempt of `step`. The three functions below are `static inline` and unprefixed
+ * because none has external linkage: each unit that includes this header gets its own copy. */
+static inline bc_file_system_step_verdict ask_observer(bc_file_system_engine *engine, int32_t operation, int32_t step) {
+    bc_file_system_step_verdict verdict;
+    bc_file_system_engine_before_step(engine, operation, step, &verdict);
+    return verdict;
+}
+
+/* Every gated call reads the verdict the same way, spelled out in each loop rather than through a helper (the
+ * analyzer loses a postcondition set six calls deep): a scripted `fail` is the call's errno without the call,
+ * reported exactly as a real one and asked again when it is EINTR like a real one; a `stop` ends the attempts.
+ * A step that makes no call (the identity check) reads it here. */
+static inline bool observer_decided(const bc_file_system_step_verdict *verdict, bc_file_system_call_outcome *outcome) {
+    if (verdict->action == bc_file_system_step_action_stop) {
+        *outcome = (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        return true;
+    }
+    if (verdict->action == bc_file_system_step_action_fail) {
+        *outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict->system_code, .stopped = false};
+        return true;
+    }
+    return false;
+}
+
+/* Fills `error` for a step that failed and answers the status every failing path returns. The name stays
+ * empty: what the step acted on is the location itself, whose text the face holds; an operation whose step
+ * acted on an entry inside the location fills the name itself. A stop is answered as `io_failed` with no system
+ * code at the stopped step: a read-only operation holds nothing a killed process would not lose as well, so
+ * returning is the kill; an operation that holds state on disk defines its own stop. */
+static inline int32_t report_outcome(bc_file_system_error *error, int32_t operation, int32_t step,
+                                     const bc_file_system_call_outcome *outcome, int32_t kind) {
+    /* Every kind the mapping answers is a failure, never 0: a caller that reads an out-parameter only when the
+     * answer is 0 relies on it, and the analyzer reads this line to see that. */
+    assert(kind != 0);
+    if (outcome->stopped) {
+        *error =
+            (bc_file_system_error){.kind = bc_file_system_error_kind_io_failed, .operation = operation, .step = step};
+        return bc_file_system_error_kind_io_failed;
+    }
+    *error = (bc_file_system_error){.kind = kind, .operation = operation, .step = step, .system_code = outcome->code};
+    return kind;
+}

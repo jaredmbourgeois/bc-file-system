@@ -107,7 +107,7 @@ struct ContractTests {
 
     /// A read that starts with a buffer too small (the face offers 64 KiB first) is asked again with the size
     /// the core reports.
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func aReadGrowsItsBufferUntilTheFileFits() throws {
         let observed = try observedFileSystem()
         let text = String(repeating: "longer than the first buffer\n", count: 4 * 1024)
@@ -121,7 +121,7 @@ struct ContractTests {
 
     // MARK: - Not found
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func readOfNothingIsNotFound() throws {
         let observed = try observedFileSystem()
         let location = try observed.location("absent.txt")
@@ -135,7 +135,7 @@ struct ContractTests {
         #expect(error?.path == observed.root.absolutePath(of: "absent.txt"))
     }
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func statusOfNothingIsNilNotAnError() throws {
         let observed = try observedFileSystem()
 
@@ -168,7 +168,7 @@ struct ContractTests {
 
     // MARK: - Not a regular file, and a refused symlink
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func readRefusesASymlinkEvenToARegularFile() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("behind the link", to: "target.txt", mode: 0o644)
@@ -182,7 +182,7 @@ struct ContractTests {
         #expect(error?.kind == .symlinkRefused)
     }
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func readRefusesADirectory() throws {
         let observed = try observedFileSystem()
         let root = try rootLocation(of: observed)
@@ -224,7 +224,7 @@ struct ContractTests {
 
     // MARK: - Permission denied
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func readWithoutPermissionIsPermissionDenied() throws {
         let observed = try observedFileSystem()
         guard try observed.root.permissionsAreEnforced() else {
@@ -326,7 +326,7 @@ struct ContractTests {
 
     // MARK: - Status
 
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func statusReportsAFileADirectoryAndASymlink() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("seven b", to: "file", mode: 0o640)
@@ -442,7 +442,7 @@ struct ContractTests {
 
     /// The face grows its buffers itself, so the core is called directly here: a buffer that is too small is
     /// refused, the call reports the length it needs, and nothing is cut short into the buffer.
-    @Test(.disabled("stage 13 status-and-reads"))
+    @Test
     func aBufferTooSmallReportsTheLengthItNeeds() throws {
         let observed = try observedFileSystem()
         try observed.root.rawWrite("eleven byte", to: "file", mode: 0o644)

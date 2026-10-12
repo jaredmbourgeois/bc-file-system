@@ -1,2 +1,2 @@
-gtest 130
-swift 28
+gtest 102
+swift 20

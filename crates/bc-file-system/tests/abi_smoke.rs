@@ -186,37 +186,40 @@ fn every_entry_type_round_trips_through_its_integer() {
     assert_eq!(FinalSymlink::Follow as i32, 2);
 }
 
+// The one location every platform has and the smoke can name without a temporary directory of its own (the
+// typed crate's fixtures arrive at stage `rust-crates`): the root, which is a directory wherever the core runs.
 #[test]
-fn a_status_call_against_the_stub_answers_unsupported_with_the_operation_named() {
+fn a_status_call_answers_the_root_as_a_directory() {
     let engine = Engine::live().expect("a live engine");
 
-    let refused = engine
-        .status_of(b"/etc/config.toml", FinalSymlink::Refuse)
-        .expect_err("the stub answers unsupported until stage 13 builds the operation");
+    let status = engine
+        .status_of(b"/", FinalSymlink::Refuse)
+        .expect("the root is described")
+        .expect("the root is present");
 
-    assert_eq!(refused.kind, ErrorKind::Unsupported);
-    assert_eq!(refused.operation, Operation::Status);
-    assert_eq!(
-        refused.step, None,
-        "a refusal before any system call has no step"
-    );
-    assert_eq!(refused.system_code, 0);
-    assert!(refused.name.is_empty());
-    assert_eq!(refused.unknown_value, None);
-    assert_eq!(refused.to_string(), "status: unsupported");
+    assert_eq!(status.entry_type, EntryType::Directory);
+    assert_eq!(status.size, 0, "a size is a regular file's only");
+    assert!(status.link_count >= 1);
 }
 
 #[test]
-fn a_status_call_through_an_observed_engine_travels_the_same_way() {
+fn a_status_call_through_an_observed_engine_travels_the_same_way_and_is_counted() {
     let mut observed = ObservedEngine::observed_for_tests().expect("an observed engine");
 
-    let refused = observed
+    let status = observed
         .engine()
-        .status_of(b"/etc/config.toml", FinalSymlink::Follow)
-        .expect_err("the stub answers unsupported");
+        .status_of(b"/", FinalSymlink::Follow)
+        .expect("the root is described")
+        .expect("the root is present");
+    let root_opens = observed
+        .step_count(Operation::Status, Step::Open)
+        .expect("the count is read");
 
-    assert_eq!(refused.kind, ErrorKind::Unsupported);
-    assert_eq!(refused.operation, Operation::Status);
+    assert_eq!(status.entry_type, EntryType::Directory);
+    assert_eq!(
+        root_opens, 1,
+        "resolving an absolute path opens the root once"
+    );
 }
 
 #[test]

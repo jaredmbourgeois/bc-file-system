@@ -72,8 +72,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// `InvalidArgument` for text that is no absolute path; `Unsupported` until the operation lands in the core
-    /// (stage `status-and-reads`); afterwards the kinds the header lists for `bc_file_system_status_of`.
+    /// `InvalidArgument` for text that is no absolute path; otherwise the kinds the header lists for
+    /// `bc_file_system_status_of` (a refused symlink on the way, a directory that cannot be entered, a failing
+    /// system call): absence, a missing directory on the way included, is `Ok(None)`, never an error.
     pub fn status_of(
         &self,
         absolute_path: &[u8],

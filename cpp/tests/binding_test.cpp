@@ -31,8 +31,9 @@
 #include "test_paths.hpp"
 
 // The C++ binding suite: the face's contract with the C header, apart from what the operations do to the file
-// system (the contract suite's job). Each operation reaches the core once (the stub's `unsupported` names the
-// operation it reached), the mapping of every enum is total in both directions, each value type makes one
+// system (the contract suite's job). Each operation reaches the core once (a real operation answers from the
+// file system; a stub's `unsupported` names the operation it reached), the mapping of every enum is total in
+// both directions, each value type makes one
 // round trip across the ABI, the error struct is converted and rendered, and the face's own compositions
 // (`read_file_if_present`, the grow loop, `lines_of`) do what the design doc says. The C-level cases prove
 // the header's own promises: zero is never a valid enum, NULL where forbidden is refused, a success zeroes the
@@ -217,13 +218,27 @@ TEST_F(BindingTest, OpenDirectoryReachesC) {
     EXPECT_EQ(*opened_as, path_text_of("folder"));
 }
 
+// The status operation is real: the answer comes back through the face's conversion of the C struct.
 TEST_F(BindingTest, StatusReachesC) {
-    expect_unsupported(files().status(in("file"), FinalSymlink::refuse), Operation::status, path_text_of("file"));
+    bc::file_system_test::write_raw(path_of("file"), "seven b", 0640);
+
+    const auto status = files().status(in("file"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    ASSERT_TRUE(status->has_value());
+    EXPECT_EQ((*status)->entry_type, EntryType::regular_file);
+    EXPECT_EQ((*status)->size, 7);
+    EXPECT_EQ((*status)->mode, 0640U);
 }
 
+// The read operation is real: the bytes come back through the face's buffer protocol.
 TEST_F(BindingTest, ReadFileReachesC) {
-    expect_unsupported(files().read_file(in("file"), kWholeFileRefusingSymlink), Operation::read_file,
-                       path_text_of("file"));
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto bytes = files().read_file(in("file"), kWholeFileRefusingSymlink);
+
+    ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
+    EXPECT_EQ(text_of(*bytes), "content");
 }
 
 TEST_F(BindingTest, WriteFileReachesC) {
@@ -338,13 +353,17 @@ TEST_F(BindingTest, AddFaultClearFaultsAndStepCountReachC) {
 
 // Absence becomes an empty optional; every other error passes through as received.
 TEST_F(BindingTest, ReadFileIfPresentPassesAnErrorOtherThanNotFoundThrough) {
-    const auto bytes = files().read_file_if_present(in("file"), kWholeFileRefusingSymlink);
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
 
-    expect_unsupported(bytes, Operation::read_file, path_text_of("file"));
+    const auto bytes = files().read_file_if_present(in("folder"), kWholeFileRefusingSymlink);
+
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error().kind, ErrorKind::not_regular_file);
+    EXPECT_EQ(bytes.error().operation, Operation::read_file);
+    EXPECT_EQ(bytes.error().path, path_text_of("folder"));
 }
 
-// stage 13 status-and-reads
-TEST_F(BindingTest, DISABLED_ReadFileGrowsItsBufferToAFileLargerThanTheFirstCapacity) {
+TEST_F(BindingTest, ReadFileGrowsItsBufferToAFileLargerThanTheFirstCapacity) {
     // The face offers 64 KiB first; the core names the capacity it needs and the face asks once more.
     const std::string large(100 * 1024, 'g');
     bc::file_system_test::write_raw(path_of("large.bin"), large, 0644);
@@ -908,6 +927,8 @@ TEST_F(CoreBindingTest, ASuccessZeroesTheErrorStruct) {
     EXPECT_TRUE(is_all_zero(c_error));
 }
 
+// A failure of a real system call fills every field: the kind, the operation, the step that failed and its
+// errno; the name stays empty because the step acted on the location itself.
 TEST_F(CoreBindingTest, AFailureFillsTheKindAndTheOperationAndReturnsTheKind) {
     const std::string path = path_text_of("absent");
     const bc_file_system_location location = at(path);
@@ -918,11 +939,11 @@ TEST_F(CoreBindingTest, AFailureFillsTheKindAndTheOperationAndReturnsTheKind) {
     const std::int32_t status =
         bc_file_system_read_file(engine(), &location, &c_options, nullptr, 0, &length, &c_error);
 
-    EXPECT_EQ(status, bc_file_system_error_kind_unsupported);
-    EXPECT_EQ(c_error.kind, bc_file_system_error_kind_unsupported);
+    EXPECT_EQ(status, bc_file_system_error_kind_not_found);
+    EXPECT_EQ(c_error.kind, bc_file_system_error_kind_not_found);
     EXPECT_EQ(c_error.operation, bc_file_system_operation_read_file);
-    EXPECT_EQ(c_error.step, 0);
-    EXPECT_EQ(c_error.system_code, 0);
+    EXPECT_EQ(c_error.step, bc_file_system_step_openat);
+    EXPECT_EQ(c_error.system_code, ENOENT);
     EXPECT_EQ(c_error.name_length, 0U);
     EXPECT_EQ(c_error.name_truncated, 0);
     // The out-parameter is left untouched on failure.
@@ -1055,8 +1076,7 @@ TEST_F(CoreBindingTest, ANullBufferIsLegalOnlyWithZeroCapacity) {
     EXPECT_EQ(lying_about_capacity, bc_file_system_error_kind_invalid_argument);
 }
 
-// stage 13 status-and-reads
-TEST_F(CoreBindingTest, DISABLED_ReadFileIntoABufferTooSmallReportsTheLengthItNeeds) {
+TEST_F(CoreBindingTest, ReadFileIntoABufferTooSmallReportsTheLengthItNeeds) {
     bc::file_system_test::write_raw(path_of("file"), "eleven byte", 0644);
     const std::string path = path_text_of("file");
     const bc_file_system_location location = at(path);
@@ -1081,8 +1101,7 @@ TEST_F(CoreBindingTest, DISABLED_ReadFileIntoABufferTooSmallReportsTheLengthItNe
     EXPECT_EQ(std::string(short_buffer.begin(), short_buffer.end()), "??????????");
 }
 
-// stage 13 status-and-reads
-TEST_F(CoreBindingTest, DISABLED_ReadFileIntoABufferOfTheReportedLengthSucceeds) {
+TEST_F(CoreBindingTest, ReadFileIntoABufferOfTheReportedLengthSucceeds) {
     bc::file_system_test::write_raw(path_of("file"), "eleven byte", 0644);
     const std::string path = path_text_of("file");
     const bc_file_system_location location = at(path);
@@ -1101,8 +1120,7 @@ TEST_F(CoreBindingTest, DISABLED_ReadFileIntoABufferOfTheReportedLengthSucceeds)
     EXPECT_EQ(std::string(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(length)), "eleven byte");
 }
 
-// stage 13 status-and-reads
-TEST_F(CoreBindingTest, DISABLED_AFileThatGrewBetweenTheTwoCallsIsTooSmallAgain) {
+TEST_F(CoreBindingTest, AFileThatGrewBetweenTheTwoCallsIsTooSmallAgain) {
     bc::file_system_test::write_raw(path_of("log"), "short", 0644);
     const std::string path = path_text_of("log");
     const bc_file_system_location location = at(path);
@@ -1122,8 +1140,7 @@ TEST_F(CoreBindingTest, DISABLED_AFileThatGrewBetweenTheTwoCallsIsTooSmallAgain)
     EXPECT_EQ(length, 18U);
 }
 
-// stage 13 status-and-reads
-TEST_F(CoreBindingTest, DISABLED_ReadFileOfAnEmptyFileNeedsNoBuffer) {
+TEST_F(CoreBindingTest, ReadFileOfAnEmptyFileNeedsNoBuffer) {
     bc::file_system_test::write_raw(path_of("empty"), "", 0644);
     const std::string path = path_text_of("empty");
     const bc_file_system_location location = at(path);
@@ -1214,8 +1231,7 @@ TEST_F(CoreBindingTest, DISABLED_ListDirectoryListsOneLevel) {
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(entries[0].name), entries[0].name_length), "sub");
 }
 
-// stage 13 status-and-reads
-TEST_F(CoreBindingTest, DISABLED_StatusOfAnswersPresentForSomethingAndAbsentForNothing) {
+TEST_F(CoreBindingTest, StatusOfAnswersPresentForSomethingAndAbsentForNothing) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0640);
     const std::string file = path_text_of("file");
     const std::string absent = path_text_of("absent");

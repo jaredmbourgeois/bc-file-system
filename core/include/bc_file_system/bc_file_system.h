@@ -295,7 +295,9 @@ typedef enum bc_file_system_library_kind {
 typedef struct bc_file_system_error {
     int32_t kind;           /* a bc_file_system_error_kind; 0 is success */
     int32_t operation;      /* the bc_file_system_operation that failed */
-    int32_t step;           /* the bc_file_system_step that failed, or 0 for a refusal before any system call */
+    int32_t step;           /* the bc_file_system_step that failed, or 0 when no call failed: a refusal before any
+                               system call, or an answer decided from what a call reported (not a regular file,
+                               too large, a buffer too small) */
     int32_t system_code;    /* the errno, copied on the line after the failing call, or 0 */
     uint32_t name_length;   /* how many bytes of `name` are meaningful */
     uint8_t name_truncated; /* 1 when the entry's name did not fit in `name` */

@@ -106,6 +106,7 @@ CONFIGURATION: Final = Configuration(
             "core/src/platform.h",
             "core/src/platform.c",
             "core/src/resolve.c",
+            "core/src/resolve.h",
             "core/tests/resolve_test.c",
             "examples/consumer/main.c",
         ),

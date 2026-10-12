@@ -5,16 +5,20 @@
  * is the common subset, and the platform differences are behind platform.h.
  *
  * Where the library stands: the handles, the platform probes, the observer and the resolution layer are real,
- * and `bc_file_system_directory_open` is the first operation that reaches the file system; every other
- * operation is an honest stub. Each one validates its arguments exactly as the header promises (a contract
- * violation is `invalid_argument` and touches nothing), announces itself to the observer, and then answers
- * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
- * until the stage that builds it. An operation that acts on the file system resolves its location once through
- * resolve.h to (parent descriptor, leaf name) and makes only `*at` calls on that pair from then on; every
- * descriptor it holds is an owned_descriptor under the cleanup idiom of owned.h.
+ * and so are the operations that read, `bc_file_system_directory_open`, `bc_file_system_status_of` and
+ * `bc_file_system_read_file`; every other operation is an honest stub. Each one validates its arguments exactly
+ * as the header promises (a contract violation is `invalid_argument` and touches nothing) and announces itself
+ * to the observer; a stub then answers `unsupported` with the operation named and the step zero, so every
+ * contract case is red for a stated reason until the stage that builds it. A real operation resolves its
+ * location once through resolve.h to (parent descriptor, leaf name) and makes only `*at` calls on that pair
+ * from then on, each behind the observer's `before_step` and asked again on EINTR, with the errno copied on
+ * the line after the call; every descriptor it holds is an owned_descriptor under the cleanup idiom of owned.h.
  */
 #include <bc_file_system/bc_file_system.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <assert.h>
@@ -74,7 +78,17 @@ enum : uint32_t {
     /* How many faults one engine can hold scripted at once: bounded scratch, so a 65th is resource_exhausted. */
     fault_capacity = 64,
     /* The bits chmod sets; a mode with any other bit is a contract violation. */
-    permission_bits = 07777
+    permission_bits = 07777,
+    /* The most one pread asks for: a count past SSIZE_MAX is implementation-defined, and macOS caps a single
+     * transfer at INT_MAX, so a large file is read in bounded pieces. */
+    largest_single_read = UINT32_C(1) << 30
+};
+
+enum : int32_t {
+    /* How a regular file is opened to be read: never for writing, never inherited by a child process, and never
+     * blocking on the open itself, which a FIFO with no writer would do forever; a regular file reads the same
+     * with the flag, and anything that is not one is refused right after the open. */
+    file_read_flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK
 };
 
 /* The last enumerator of each closed enum, so a range check reads `is_in_enum(value, operation_last)`. Every
@@ -467,12 +481,80 @@ void bc_file_system_lock_release(bc_file_system_lock *lock) {
     free(lock);
 }
 
-/* ---- Operations --------------------------------------------------------------------------------------------- */
+/* ---- Status and reads --------------------------------------------------------------------------------------- */
 
-/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
- * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
- * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
- * names. */
+/* The one system call of this unit behind the observer, in the shape of resolve.c's: `pread` of at most
+ * `count` bytes at `offset`, asked again on EINTR, the errno copied on the line after the call. `*read_count`
+ * is written only when the call succeeded; 0 means the file ends at `offset`. */
+static bc_file_system_call_outcome read_at_offset(bc_file_system_engine *engine, int32_t operation, int descriptor,
+                                                  uint8_t *buffer, size_t count, uint64_t offset, size_t *read_count) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_pread);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        /* The offset never passes a regular file's size, which off_t holds (platform.c asserts its width). */
+        const ssize_t answer = pread(descriptor, buffer, count, (off_t)offset);
+        if (answer >= 0) {
+            *read_count = (size_t)answer;
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+static int32_t entry_type_of(mode_t mode) {
+    if (S_ISREG(mode)) {
+        return bc_file_system_entry_type_regular_file;
+    }
+    if (S_ISDIR(mode)) {
+        return bc_file_system_entry_type_directory;
+    }
+    if (S_ISLNK(mode)) {
+        return bc_file_system_entry_type_symlink;
+    }
+    return bc_file_system_entry_type_other;
+}
+
+/* What the header promises a status holds, from what the system recorded: the size is a regular file's only,
+ * the mode is the permission bits without the type bits, the identity fields are copied as bit patterns. */
+static bc_file_system_status status_from_stat(const struct stat *info) {
+    int64_t size = 0;
+    if (S_ISREG(info->st_mode)) {
+        /* off_t is 64 bits wide on every target (platform.c asserts it), so the conversion only changes the type. */
+        size = (int64_t)info->st_size;
+    }
+    return (bc_file_system_status){.entry_type = entry_type_of(info->st_mode),
+                                   .size = size,
+                                   .mode = (uint32_t)info->st_mode & permission_bits,
+                                   .device = (uint64_t)info->st_dev,
+                                   .inode = (uint64_t)info->st_ino,
+                                   .link_count = (uint64_t)info->st_nlink};
+}
+
+/* Nothing is at a location when a component on the way is missing or is not a directory, or when the leaf
+ * itself is missing: the answers lstat would spell ENOENT and ENOTDIR, which the header makes an answer of
+ * `status`, not an error. */
+static bool means_absence(int32_t kind) {
+    if (kind == bc_file_system_error_kind_not_found) {
+        return true;
+    }
+    return kind == bc_file_system_error_kind_not_directory;
+}
+
+/* Whether a file's size is more than this target can address as a count of bytes; `*as_size` is the size as
+ * one when it is not. ckd_add reports whether the sum fits the result's width, which is the check a 32-bit
+ * target (wasm32) needs and a 64-bit one never fails. */
+static bool overflows_size_t(uint64_t size, size_t *as_size) {
+    return ckd_add(as_size, size, (uint64_t)0);
+}
 
 int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_system_location *location,
                                  int32_t final_symlink, int32_t *present, bc_file_system_status *status,
@@ -486,7 +568,124 @@ int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_sy
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (resolution != 0) {
+        if (means_absence(resolution)) {
+            *present = 0;
+            return succeed(error);
+        }
+        return resolution;
+    }
+    /* The leaf is judged as itself under `refuse` and as what it points at under `follow`. The root has no
+     * parent entry to stat: the walk opened the root itself, and that descriptor is what is described. */
+    struct stat info;
+    int32_t step = bc_file_system_step_fstatat;
+    bc_file_system_call_outcome outcome;
+    if (resolved.leaf_length == 0) {
+        step = bc_file_system_step_fstat;
+        outcome = bc_file_system_resolve_fstat(engine, operation, resolved.parent, &info);
+    } else {
+        const int flags = final_symlink == bc_file_system_final_symlink_refuse ? AT_SYMLINK_NOFOLLOW : 0;
+        outcome = bc_file_system_resolve_fstatat(engine, operation, resolved.parent, (const char *)resolved.leaf, flags,
+                                                 &info);
+    }
+    if (!outcome.succeeded) {
+        const int32_t kind = bc_file_system_resolve_kind_of_errno(outcome.code);
+        if (!outcome.stopped && means_absence(kind)) {
+            *present = 0;
+            return succeed(error);
+        }
+        return report_outcome(error, operation, step, &outcome, kind);
+    }
+    *status = status_from_stat(&info);
+    *present = 1;
+    return succeed(error);
+}
+
+/* Reads the whole of an open regular file of `size` bytes into the caller's buffer, which holds at least that
+ * many, and says how many arrived: fewer when the file shrank since it was measured, in which case the bytes
+ * read are the answer. */
+static int32_t read_whole_file(bc_file_system_engine *engine, int32_t operation, int descriptor, uint8_t *buffer,
+                               size_t size, size_t *read_total, bc_file_system_error *error) {
+    size_t total = 0;
+    while (total < size) {
+        const size_t remaining = size - total;
+        const size_t count = remaining < largest_single_read ? remaining : largest_single_read;
+        size_t read_count = 0;
+        const bc_file_system_call_outcome outcome =
+            read_at_offset(engine, operation, descriptor, buffer + total, count, total, &read_count);
+        if (!outcome.succeeded) {
+            return report_outcome(error, operation, bc_file_system_step_pread, &outcome,
+                                  bc_file_system_resolve_kind_of_errno(outcome.code));
+        }
+        if (read_count == 0) {
+            break;
+        }
+        total += read_count;
+    }
+    *read_total = total;
+    return 0;
+}
+
+/* Whether the file holds a byte past `offset`, read into a local so the caller's buffer is never touched past
+ * what was promised: how a file that grew between its measurement and its reading is noticed. */
+static int32_t probe_for_more(bc_file_system_engine *engine, int32_t operation, int descriptor, uint64_t offset,
+                              bool *has_more, bc_file_system_error *error) {
+    uint8_t probe = 0;
+    size_t probed = 0;
+    const bc_file_system_call_outcome outcome =
+        read_at_offset(engine, operation, descriptor, &probe, sizeof probe, offset, &probed);
+    if (!outcome.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_pread, &outcome,
+                              bc_file_system_resolve_kind_of_errno(outcome.code));
+    }
+    *has_more = probed > 0;
+    return 0;
+}
+
+/* The size of the open regular file against the read limit and this target's addressable size: `too_large`
+ * when either refuses it. An outcome decided from what a call reported, not from a call that failed, carries no
+ * step, like a refusal before any call. */
+static int32_t size_within_limits(uint64_t size, const bc_file_system_read_limit *limit, int32_t operation,
+                                  size_t *as_size, bc_file_system_error *error) {
+    if (limit->kind == bc_file_system_read_limit_kind_at_most && size > limit->at_most) {
+        return refuse(error, bc_file_system_error_kind_too_large, operation);
+    }
+    if (overflows_size_t(size, as_size)) {
+        return refuse(error, bc_file_system_error_kind_too_large, operation);
+    }
+    return 0;
+}
+
+/* After a file read whole to its measured size: whether a byte lies past it, which means it grew between its
+ * measurement and its reading, and if so the size it has now, measured again, so the caller can ask for it
+ * again under the buffer protocol rather than answer a prefix. */
+static int32_t measure_growth(bc_file_system_engine *engine, int32_t operation, int descriptor,
+                              const bc_file_system_read_limit *limit, size_t size, bool *grew, size_t *grown,
+                              bc_file_system_error *error) {
+    bool has_more = false;
+    const int32_t probed = probe_for_more(engine, operation, descriptor, size, &has_more, error);
+    if (probed != 0) {
+        return probed;
+    }
+    if (!has_more) {
+        *grew = false;
+        return 0;
+    }
+    struct stat info;
+    const bc_file_system_call_outcome remeasured = bc_file_system_resolve_fstat(engine, operation, descriptor, &info);
+    if (!remeasured.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &remeasured,
+                              bc_file_system_resolve_kind_of_errno(remeasured.code));
+    }
+    const int32_t kind = size_within_limits((uint64_t)info.st_size, limit, operation, grown, error);
+    if (kind != 0) {
+        return kind;
+    }
+    *grew = true;
+    return 0;
 }
 
 int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -501,8 +700,78 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The leaf is opened as a file, never followed under `refuse` (a symlink then answers ELOOP, which the
+     * table reads as `symlink_refused`), and judged by what the descriptor turns out to be, so nothing is
+     * decided from a stat the open could have raced. The root has no leaf: the directory the walk opened is
+     * what the location names, and it is taken over to be judged the same way. */
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor file = {.value = -1};
+    if (resolved.leaf_length == 0) {
+        adopt_descriptor(&file, &resolved.opened);
+    } else {
+        const int flags = options->final_symlink == bc_file_system_final_symlink_refuse ? file_read_flags | O_NOFOLLOW
+                                                                                        : file_read_flags;
+        const bc_file_system_call_outcome opened = bc_file_system_resolve_openat(
+            engine, operation, resolved.parent, (const char *)resolved.leaf, flags, &file.value);
+        if (!opened.succeeded) {
+            return report_outcome(error, operation, bc_file_system_step_openat, &opened,
+                                  bc_file_system_resolve_kind_of_errno(opened.code));
+        }
+    }
+    struct stat info;
+    const bc_file_system_call_outcome measured = bc_file_system_resolve_fstat(engine, operation, file.value, &info);
+    if (!measured.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &measured,
+                              bc_file_system_resolve_kind_of_errno(measured.code));
+    }
+    if (!S_ISREG(info.st_mode)) {
+        return refuse(error, bc_file_system_error_kind_not_regular_file, operation);
+    }
+    /* A regular file's size is never negative, so the conversion only changes the type. */
+    size_t size = 0;
+    kind = size_within_limits((uint64_t)info.st_size, &options->limit, operation, &size, error);
+    if (kind != 0) {
+        return kind;
+    }
+    if (size > capacity) {
+        *length = size;
+        return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+    }
+    size_t read_total = 0;
+    kind = read_whole_file(engine, operation, file.value, buffer, size, &read_total, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* A file that ended early is answered as the bytes it had. One that still has a byte past its measured
+     * size grew in between, and a prefix is never an answer: it is asked for again under the buffer protocol,
+     * which bounds the retries on the caller's side. */
+    if (read_total == size) {
+        bool grew = false;
+        size_t grown = 0;
+        kind = measure_growth(engine, operation, file.value, &options->limit, size, &grew, &grown, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (grew) {
+            *length = grown;
+            return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
+        }
+    }
+    *length = read_total;
+    return succeed(error);
 }
+
+/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+
+/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
+ * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
+ * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
+ * names. */
 
 int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_system_location *location,
                                   const uint8_t *bytes, size_t byte_count, const bc_file_system_write_options *options,

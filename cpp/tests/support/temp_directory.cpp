@@ -117,6 +117,14 @@ auto make_symlink_raw(const std::filesystem::path& target, const std::filesystem
     }
 }
 
+auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> void {
+    if (::mkfifo(path.c_str(), S_IRWXU) != 0) {
+        ADD_FAILURE() << "mkfifo " << path << ": " << std::strerror(errno);
+        return;
+    }
+    set_mode_raw(path, mode);
+}
+
 auto set_mode_raw(const std::filesystem::path& path, std::uint32_t mode) -> void {
     if (::chmod(path.c_str(), static_cast<mode_t>(mode)) != 0) {
         ADD_FAILURE() << "chmod " << path << ": " << std::strerror(errno);

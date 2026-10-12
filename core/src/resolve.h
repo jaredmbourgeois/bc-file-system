@@ -13,10 +13,13 @@
  * An `at` location is resolved by the same walk from the root, following symlinks on the way, because the
  * header promises that the system resolves an absolute path; its walk is bracketed the same way so there is
  * one shape, one mapping and one test. The functions have external linkage under the library's prefix so the
- * C-only test in `core/tests` can drive them; they are declared only here. Private to `core/src`: C23, never a
- * common subset.
+ * C-only test in `core/tests` can drive them; they are declared only here. The errno table and the gated
+ * `fstatat`, `fstat` and `openat` at the bottom are this unit's too, shared with the operations so the core has
+ * one mapping and one loop per system call. Private to `core/src`: C23, never a common subset.
  */
 #pragma once
+
+#include <sys/stat.h>
 
 #include <limits.h>
 #include <stddef.h>
@@ -24,6 +27,7 @@
 
 #include <bc_file_system/bc_file_system.h>
 
+#include "engine.h"
 #include "owned.h"
 
 /* The directory handle the public header keeps opaque: a descriptor, and the text it was opened with so a
@@ -106,3 +110,23 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
                                                        const char *name, int32_t final_symlink,
                                                        const bc_file_system_expected_entry *expected,
                                                        owned_descriptor *opened, bc_file_system_error *error);
+
+/* ---- The errno mapping and the gated system calls shared with the operations ------------------------------- */
+
+/* The kind each errno decides, from the one table of the core: ENOENT `not_found`, ENOTDIR `not_directory`,
+ * ELOOP `symlink_refused`, EACCES, EPERM and EROFS `permission_denied`, ENAMETOOLONG `invalid_argument`, EMFILE,
+ * ENFILE and ENOMEM `resource_exhausted`, and `io_failed` for everything else, with the errno kept beside it.
+ * An open of a directory entry reads ENOTDIR against what its stat had seen before coming here. */
+int32_t bc_file_system_resolve_kind_of_errno(int system_code);
+
+/* One system call each, behind the observer, under `operation`'s name and the step the call is named by:
+ * every attempt asks `before_step` first, a scripted failure is the call's errno without the call, EINTR is
+ * asked again, and the errno is copied on the line after the call. The answer says whether the call succeeded,
+ * failed with which code, or was the point the observer stopped the operation at; the out-parameter is written
+ * only when it succeeded. `name` is one component, NUL-terminated; `parent` and `descriptor` are borrowed. */
+bc_file_system_call_outcome bc_file_system_resolve_fstatat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                           const char *name, int flags, struct stat *info);
+bc_file_system_call_outcome bc_file_system_resolve_fstat(bc_file_system_engine *engine, int32_t operation,
+                                                         int descriptor, struct stat *info);
+bc_file_system_call_outcome bc_file_system_resolve_openat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                          const char *name, int flags, int *descriptor);

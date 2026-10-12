@@ -62,6 +62,9 @@ auto make_directory_raw(const std::filesystem::path& path, std::uint32_t mode) -
 /// Creates the symlink `link` pointing at `target`.
 auto make_symlink_raw(const std::filesystem::path& target, const std::filesystem::path& link) -> void;
 
+/// Creates a FIFO (a named pipe) with exactly `mode`: an entry that is neither a file nor a directory.
+auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> void;
+
 auto set_mode_raw(const std::filesystem::path& path, std::uint32_t mode) -> void;
 
 /// The permission bits of `path` itself (a symlink is not followed).

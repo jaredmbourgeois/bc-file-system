@@ -11,8 +11,9 @@ import Testing
 #endif
 
 /// The Swift binding suite: the face's contract with the C header, apart from what the operations do to the file
-/// system (the contract suite's job). Each operation reaches the core once (the stub's `unsupported` names the
-/// operation it reached), the mapping of every enum is total in both directions, each value type makes one
+/// system (the contract suite's job). Each operation reaches the core once (a real operation answers from the
+/// file system; a stub's `unsupported` names the operation it reached), the mapping of every enum is total in
+/// both directions, each value type makes one
 /// round trip across the ABI, every struct has the layout the core pins, the error struct is converted and
 /// rendered, and the face's own compositions do what the design doc says. Green from this stage: it tests the
 /// face, not the engine.
@@ -59,18 +60,28 @@ struct BindingTests {
         #expect(directory.openedAsText == Array(observed.root.absolutePath(of: "folder").utf8))
     }
 
+    /// The status operation is real: the answer comes back through the face's conversion of the C struct.
     @Test func statusReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.status, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.status(try observed.location("file"), finalSymlink: .refuse)
-        }
+        try observed.root.rawWrite("seven b", to: "file", mode: 0o640)
+
+        let status = try #require(
+            try observed.fileSystem.status(try observed.location("file"), finalSymlink: .refuse))
+
+        #expect(status.entryType == .regularFile)
+        #expect(status.size == 7)
+        #expect(status.mode == 0o640)
     }
 
+    /// The read operation is real: the bytes come back through the face's buffer protocol.
     @Test func readFileReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.readFile, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.readFile(try observed.location("file"), options: Self.wholeFileRefusingSymlink)
-        }
+        try observed.root.rawWrite("content", to: "file", mode: 0o644)
+
+        let bytes = try observed.fileSystem.readFile(
+            try observed.location("file"), options: Self.wholeFileRefusingSymlink)
+
+        #expect(String(decoding: bytes, as: UTF8.self) == "content")
     }
 
     @Test func writeFileReachesC() throws {
@@ -253,10 +264,23 @@ struct BindingTests {
     /// Absence becomes nil; every other error passes through as received.
     @Test func readFileIfPresentPassesAnErrorOtherThanNotFoundThrough() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.readFile, path: observed.root.absolutePath(of: "file")) { () throws(FileSystemError) in
-            try observed.fileSystem.readFileIfPresent(
-                try observed.location("file"), options: Self.wholeFileRefusingSymlink)
+        try observed.root.rawMakeDirectory("folder", mode: 0o755)
+        let folder = try observed.location("folder")
+
+        let absent = try observed.fileSystem.readFileIfPresent(
+            try observed.location("absent"), options: Self.wholeFileRefusingSymlink)
+        var passedThrough: FileSystemError?
+        do {
+            _ = try observed.fileSystem.readFileIfPresent(folder, options: Self.wholeFileRefusingSymlink)
+            Issue.record("expected not_regular_file to pass through")
+        } catch {
+            passedThrough = error
         }
+
+        #expect(absent == nil)
+        #expect(passedThrough?.kind == .notRegularFile)
+        #expect(passedThrough?.operation == .readFile)
+        #expect(passedThrough?.path == observed.root.absolutePath(of: "folder"))
     }
 
     @Test func linesOfSplitsOnNewlineOnlyAndLeavesEveryOtherByteAlone() {

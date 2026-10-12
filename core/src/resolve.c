@@ -4,8 +4,10 @@
  * directory, `fstat` reads what was opened, and the two identities are compared. The walk is that shape in a
  * loop, holding one parent descriptor at a time and closing the previous one as it goes; the fast path is that
  * shape once, with the platform's one-call open in the middle. Every system call is behind the observer's
- * `before_step`, asked again on EINTR, with the errno copied on the line after the call. Nothing here opens a
- * leaf, reads a byte or writes one; nothing allocates.
+ * `before_step`, asked again on EINTR, with the errno copied on the line after the call; the errno table and
+ * the gated `fstatat`, `fstat` and `openat` are shared with the operations through resolve.h, so the core has
+ * one mapping and one loop per system call. Nothing here opens a leaf, reads a byte or writes one; nothing
+ * allocates.
  */
 #include "resolve.h"
 
@@ -14,7 +16,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <assert.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -69,6 +70,10 @@ static int32_t kind_of(int system_code) {
     return bc_file_system_error_kind_io_failed;
 }
 
+int32_t bc_file_system_resolve_kind_of_errno(int system_code) {
+    return kind_of(system_code);
+}
+
 /* The kind an open of a directory entry decides, which the plain table cannot: ENOTDIR from an entry the stat
  * had just seen as a directory or as a symlink means it was swapped or refused, not that a file sits there;
  * ELOOP, and the EXDEV with which openat2 reports an escape from RESOLVE_BENEATH, are containment refusals. */
@@ -104,172 +109,123 @@ static bool means_no_fast_path(int system_code) {
 
 /* ---- The return convention ---------------------------------------------------------------------------------- */
 
-/* What one gated system call came to: the call was made and succeeded; or it failed with `code`, real or
- * scripted; or the observer stopped the operation there. Every failing path below writes the whole struct where
- * it fails, so `succeeded` is true only where the call itself answered 0 and an out-parameter the call fills is
- * read only on that path. */
-typedef struct call_outcome {
-    bool succeeded;
-    int code;
-    bool stopped;
-} call_outcome;
-
-/* Asks the observer before one attempt of `step`. */
-static bc_file_system_step_verdict ask(bc_file_system_engine *engine, int32_t operation, int32_t step) {
-    bc_file_system_step_verdict verdict;
-    bc_file_system_engine_before_step(engine, operation, step, &verdict);
-    return verdict;
-}
-
-/* Every gated call below reads the verdict the same way, spelled out in each loop rather than through a helper:
- * a scripted `fail` is the call's errno without the call, reported exactly as a real one and asked again when it
- * is EINTR like a real one; a `stop` ends the attempts. The identity check, which makes no call, reads it here. */
-static bool observer_decided(const bc_file_system_step_verdict *verdict, call_outcome *outcome) {
-    if (verdict->action == bc_file_system_step_action_stop) {
-        *outcome = (call_outcome){.succeeded = false, .code = 0, .stopped = true};
-        return true;
-    }
-    if (verdict->action == bc_file_system_step_action_fail) {
-        *outcome = (call_outcome){.succeeded = false, .code = verdict->system_code, .stopped = false};
-        return true;
-    }
-    return false;
-}
-
-/* Fills `error` for a failure before any system call and answers the status every failing path returns. */
+/* Fills `error` for a failure before any system call and answers the status every failing path returns. The
+ * outcome of a gated call, the reading of a verdict and `report_outcome` are engine.h's, shared with the operations. */
 static int32_t refuse(bc_file_system_error *error, int32_t kind, int32_t operation) {
     *error = (bc_file_system_error){.kind = kind, .operation = operation};
     return kind;
 }
 
-/* Fills `error` for a step that failed. The name stays empty: what failed to resolve is the location itself,
- * whose text the face holds, and a component's name in `name` would be rendered as an entry inside it. A stop
- * is answered as `io_failed` with no system code at the stopped step: this layer holds nothing but read-only
- * descriptors, which a killed process loses as well, so returning is the kill; an operation that holds state on
- * disk defines its own stop. */
-static int32_t report(bc_file_system_error *error, int32_t operation, int32_t step, const call_outcome *outcome,
-                      int32_t kind) {
-    /* Every kind the mapping answers is a failure, never 0: a caller that reads an out-parameter only when the
-     * answer is 0 relies on it, and the analyzer reads this line to see that. */
-    assert(kind != 0);
-    if (outcome->stopped) {
-        *error =
-            (bc_file_system_error){.kind = bc_file_system_error_kind_io_failed, .operation = operation, .step = step};
-        return bc_file_system_error_kind_io_failed;
-    }
-    *error = (bc_file_system_error){.kind = kind, .operation = operation, .step = step, .system_code = outcome->code};
-    return kind;
-}
-
 /* ---- The system calls, each behind the observer and asked again on EINTR ------------------------------------ */
 
-static call_outcome stat_entry(bc_file_system_engine *engine, int32_t operation, int parent, const char *name,
-                               int flags, struct stat *info) {
-    call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+bc_file_system_call_outcome bc_file_system_resolve_fstatat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                           const char *name, int flags, struct stat *info) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
-        const bc_file_system_step_verdict verdict = ask(engine, operation, bc_file_system_step_fstatat);
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fstatat);
         if (verdict.action == bc_file_system_step_action_stop) {
-            return (call_outcome){.succeeded = false, .code = 0, .stopped = true};
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
         }
         if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
         if (fstatat(parent, name, info, flags) == 0) {
-            return (call_outcome){.succeeded = true, .code = 0, .stopped = false};
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         const int code = errno;
-        outcome = (call_outcome){.succeeded = false, .code = code, .stopped = false};
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;
 }
 
-static call_outcome stat_descriptor(bc_file_system_engine *engine, int32_t operation, int descriptor,
-                                    struct stat *info) {
-    call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+bc_file_system_call_outcome bc_file_system_resolve_fstat(bc_file_system_engine *engine, int32_t operation,
+                                                         int descriptor, struct stat *info) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
-        const bc_file_system_step_verdict verdict = ask(engine, operation, bc_file_system_step_fstat);
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_fstat);
         if (verdict.action == bc_file_system_step_action_stop) {
-            return (call_outcome){.succeeded = false, .code = 0, .stopped = true};
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
         }
         if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
         if (fstat(descriptor, info) == 0) {
-            return (call_outcome){.succeeded = true, .code = 0, .stopped = false};
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         const int code = errno;
-        outcome = (call_outcome){.succeeded = false, .code = code, .stopped = false};
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;
 }
 
-static call_outcome open_entry(bc_file_system_engine *engine, int32_t operation, int parent, const char *name,
-                               int flags, int *descriptor) {
-    call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+bc_file_system_call_outcome bc_file_system_resolve_openat(bc_file_system_engine *engine, int32_t operation, int parent,
+                                                          const char *name, int flags, int *descriptor) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
-        const bc_file_system_step_verdict verdict = ask(engine, operation, bc_file_system_step_openat);
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_openat);
         if (verdict.action == bc_file_system_step_action_stop) {
-            return (call_outcome){.succeeded = false, .code = 0, .stopped = true};
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
         }
         if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
         const int opened = openat(parent, name, flags);
         if (opened >= 0) {
             *descriptor = opened;
-            return (call_outcome){.succeeded = true, .code = 0, .stopped = false};
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         const int code = errno;
-        outcome = (call_outcome){.succeeded = false, .code = code, .stopped = false};
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;
 }
 
 /* The one open by path in the core: the root, where every absolute path starts. */
-static call_outcome open_root(bc_file_system_engine *engine, int32_t operation, int *descriptor) {
-    call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+static bc_file_system_call_outcome open_root(bc_file_system_engine *engine, int32_t operation, int *descriptor) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
-        const bc_file_system_step_verdict verdict = ask(engine, operation, bc_file_system_step_open);
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_open);
         if (verdict.action == bc_file_system_step_action_stop) {
-            return (call_outcome){.succeeded = false, .code = 0, .stopped = true};
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
         }
         if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
         const int opened = open("/", directory_open_flags);
         if (opened >= 0) {
             *descriptor = opened;
-            return (call_outcome){.succeeded = true, .code = 0, .stopped = false};
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         const int code = errno;
-        outcome = (call_outcome){.succeeded = false, .code = code, .stopped = false};
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;
 }
 
 /* The platform's one-call open of a whole relative path beneath `held`, under the step the platform's call
  * is named by. The platform body retries its own EINTR; a scripted one is retried here. */
-static call_outcome open_beneath_in_one_call(bc_file_system_engine *engine, int32_t operation, int32_t step, int held,
-                                             const char *relative, int *descriptor) {
-    call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+static bc_file_system_call_outcome open_beneath_in_one_call(bc_file_system_engine *engine, int32_t operation,
+                                                            int32_t step, int held, const char *relative,
+                                                            int *descriptor) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
     do {
-        const bc_file_system_step_verdict verdict = ask(engine, operation, step);
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, step);
         if (verdict.action == bc_file_system_step_action_stop) {
-            return (call_outcome){.succeeded = false, .code = 0, .stopped = true};
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
         }
         if (verdict.action == bc_file_system_step_action_fail) {
-            outcome = (call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
             continue;
         }
         const int code = bc_file_system_platform_open_beneath(held, relative, directory_open_flags, descriptor);
         if (code == 0) {
-            return (call_outcome){.succeeded = true, .code = 0, .stopped = false};
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
-        outcome = (call_outcome){.succeeded = false, .code = code, .stopped = false};
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
     } while (outcome.code == EINTR);
     return outcome;
 }
@@ -289,19 +245,19 @@ static bool same_identity(const bc_file_system_expected_entry *expected, const s
 static int32_t verify_opened_identity(bc_file_system_engine *engine, int32_t operation, int descriptor,
                                       const bc_file_system_expected_entry *expected, bc_file_system_error *error) {
     struct stat actual;
-    const call_outcome read = stat_descriptor(engine, operation, descriptor, &actual);
+    const bc_file_system_call_outcome read = bc_file_system_resolve_fstat(engine, operation, descriptor, &actual);
     if (!read.succeeded) {
-        return report(error, operation, bc_file_system_step_fstat, &read, kind_of(read.code));
+        return report_outcome(error, operation, bc_file_system_step_fstat, &read, kind_of(read.code));
     }
-    call_outcome compared = {.succeeded = false, .code = 0, .stopped = false};
-    const bc_file_system_step_verdict verdict = ask(engine, operation, bc_file_system_step_identity_check);
+    bc_file_system_call_outcome compared = {.succeeded = false, .code = 0, .stopped = false};
+    const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_identity_check);
     if (observer_decided(&verdict, &compared)) {
-        return report(error, operation, bc_file_system_step_identity_check, &compared,
-                      bc_file_system_error_kind_symlink_refused);
+        return report_outcome(error, operation, bc_file_system_step_identity_check, &compared,
+                              bc_file_system_error_kind_symlink_refused);
     }
     if (!same_identity(expected, &actual)) {
-        return report(error, operation, bc_file_system_step_identity_check, &compared,
-                      bc_file_system_error_kind_symlink_refused);
+        return report_outcome(error, operation, bc_file_system_step_identity_check, &compared,
+                              bc_file_system_error_kind_symlink_refused);
     }
     return 0;
 }
@@ -327,9 +283,10 @@ int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32
     }
     const int flags = final_symlink == bc_file_system_final_symlink_refuse ? AT_SYMLINK_NOFOLLOW : 0;
     struct stat info;
-    const call_outcome outcome = stat_entry(engine, operation, parent, name, flags, &info);
+    const bc_file_system_call_outcome outcome =
+        bc_file_system_resolve_fstatat(engine, operation, parent, name, flags, &info);
     if (!outcome.succeeded) {
-        return report(error, operation, bc_file_system_step_fstatat, &outcome, kind_of(outcome.code));
+        return report_outcome(error, operation, bc_file_system_step_fstatat, &outcome, kind_of(outcome.code));
     }
     /* The identity fields are compared as bit patterns, so the width and sign of dev_t do not matter. */
     *expected = (bc_file_system_expected_entry){.device = (uint64_t)info.st_dev,
@@ -355,10 +312,11 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
     const int flags =
         final_symlink == bc_file_system_final_symlink_refuse ? directory_open_flags | O_NOFOLLOW : directory_open_flags;
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor candidate = {.value = -1};
-    const call_outcome outcome = open_entry(engine, operation, parent, name, flags, &candidate.value);
+    const bc_file_system_call_outcome outcome =
+        bc_file_system_resolve_openat(engine, operation, parent, name, flags, &candidate.value);
     if (!outcome.succeeded) {
-        return report(error, operation, bc_file_system_step_openat, &outcome,
-                      kind_of_open_failure(outcome.code, expected));
+        return report_outcome(error, operation, bc_file_system_step_openat, &outcome,
+                              kind_of_open_failure(outcome.code, expected));
     }
     const int32_t kind = verify_opened_identity(engine, operation, candidate.value, expected, error);
     if (kind != 0) {
@@ -434,14 +392,14 @@ static int32_t open_beneath_fast(bc_file_system_engine *engine, int32_t operatio
         return expected_kind;
     }
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor candidate = {.value = -1};
-    const call_outcome outcome =
+    const bc_file_system_call_outcome outcome =
         open_beneath_in_one_call(engine, operation, step, held, (const char *)relative, &candidate.value);
     if (!outcome.stopped && means_no_fast_path(outcome.code)) {
         *fell_back = true;
         return 0;
     }
     if (!outcome.succeeded) {
-        return report(error, operation, step, &outcome, kind_of_open_failure(outcome.code, &expected));
+        return report_outcome(error, operation, step, &outcome, kind_of_open_failure(outcome.code, &expected));
     }
     const int32_t kind = verify_opened_identity(engine, operation, candidate.value, &expected, error);
     if (kind != 0) {
@@ -501,9 +459,9 @@ static void locate_leaf(const uint8_t *path, size_t length, size_t *leaf_offset,
 
 static int32_t resolve_at(bc_file_system_engine *engine, int32_t operation, const uint8_t *path, size_t parent_length,
                           bc_file_system_resolved *resolved, bc_file_system_error *error) {
-    const call_outcome outcome = open_root(engine, operation, &resolved->opened.value);
+    const bc_file_system_call_outcome outcome = open_root(engine, operation, &resolved->opened.value);
     if (!outcome.succeeded) {
-        return report(error, operation, bc_file_system_step_open, &outcome, kind_of(outcome.code));
+        return report_outcome(error, operation, bc_file_system_step_open, &outcome, kind_of(outcome.code));
     }
     resolved->parent = resolved->opened.value;
     /* The header promises that the system resolves an absolute path, symlinks on the way included. */

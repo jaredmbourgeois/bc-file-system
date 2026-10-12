@@ -249,8 +249,7 @@ TEST_F(ObserverTest, ClearFaultsMakesRoomAgain) {
 }
 
 // The step counts are the engine's lifetime record; forgetting the faults does not reset them.
-// stage 13 status-and-reads
-TEST_F(ObserverTest, DISABLED_ClearFaultsKeepsTheStepCounts) {
+TEST_F(ObserverTest, ClearFaultsKeepsTheStepCounts) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
     const auto status = files().status(in("file"), FinalSymlink::refuse);
     ASSERT_TRUE(status.has_value());
@@ -328,10 +327,11 @@ TEST_F(ObserverTest, DISABLED_AScriptedStepFailsWithItsCodeAndNothingIsWritten) 
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
-// stage 13 status-and-reads
-TEST_F(ObserverTest, DISABLED_OnlyTheNthOccurrenceFails) {
+// The root is opened once per `at` resolution, so its occurrences count the calls (the component opens of the
+// walk would make the second `openat` fall inside the first call).
+TEST_F(ObserverTest, OnlyTheNthOccurrenceFails) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
-    script(fail_step(Operation::read_file, Step::openat, 2, EIO));
+    script(fail_step(Operation::read_file, Step::open, 2, EIO));
 
     const auto first = files().read_file(in("file"), kWholeFileRefusingSymlink);
     const auto second = files().read_file(in("file"), kWholeFileRefusingSymlink);
@@ -346,8 +346,7 @@ TEST_F(ObserverTest, DISABLED_OnlyTheNthOccurrenceFails) {
 
 // A fault names one operation and one step: another operation reaching the same step, and the same operation
 // reaching another step, both run.
-// stage 13 status-and-reads
-TEST_F(ObserverTest, DISABLED_AScriptNamesOneOperationAndOneStep) {
+TEST_F(ObserverTest, AScriptNamesOneOperationAndOneStep) {
     bc::file_system_test::write_raw(path_of("scripted"), "content", 0644);
     script(fail_step(Operation::read_file, Step::openat, 1, EACCES));
 
