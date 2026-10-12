@@ -70,7 +70,8 @@ enum : uint32_t {
     /* How far the descriptor sweep looks; the test holds a handful of descriptors at a time. */
     descriptor_sweep_limit = 4096,
     /* A path buffer for the `at` texts the test builds from the root it was handed. */
-    text_capacity = 4096,
+    /* Holds the deep chain's text: long_component_depth names of NAME_MAX bytes, their slashes and a leaf. */
+    text_capacity = 8192,
     directory_mode = 0700,
     file_mode = 0600,
     no_access_mode = 0000
@@ -80,7 +81,9 @@ enum : int32_t {
     directory_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
     /* The longest component the path module accepts, so five of them exceed PATH_MAX on every platform. */
     long_component_length = NAME_MAX,
-    long_component_depth = 5
+    /* Seventeen components of NAME_MAX bytes: 17 * 256 bytes of parent text, longer than PATH_MAX on every
+     * platform the library ships for (4096 on Linux, 1024 on Apple), so no one-call open can take it. */
+    long_component_depth = 17
 };
 
 static const int32_t operation = bc_file_system_operation_open_directory;
@@ -763,8 +766,9 @@ static void test_a_parent_longer_than_path_max_is_walked(report *tally, const fi
         bc_file_system_engine_release(engine);
         return;
     }
-    /* Five components of NAME_MAX bytes and the leaf: the parent text alone is longer than PATH_MAX on every
-     * platform the library ships for, so no one-call open can take it and the walk must. */
+    /* long_component_depth components of NAME_MAX bytes and the leaf: the parent text alone is longer than
+     * PATH_MAX on every platform the library ships for (the constant's comment), so no one-call open can take it
+     * and the walk must. */
     char text[text_capacity];
     size_t position = 0;
     for (int depth = 0; depth < long_component_depth; ++depth) {
