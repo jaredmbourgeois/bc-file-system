@@ -4,12 +4,14 @@
  * the test observer's slot and every operation. It is C23 in the GNU dialect; the public header it implements
  * is the common subset, and the platform differences are behind platform.h.
  *
- * Where the library stands: the handles, the platform probes and the observer are real, and every operation on
- * the file system is an honest stub. Each one validates its arguments exactly as the header promises (a contract
+ * Where the library stands: the handles, the platform probes, the observer and the resolution layer are real,
+ * and `bc_file_system_directory_open` is the first operation that reaches the file system; every other
+ * operation is an honest stub. Each one validates its arguments exactly as the header promises (a contract
  * violation is `invalid_argument` and touches nothing), announces itself to the observer, and then answers
  * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
- * until the stage that builds it. Nothing here opens a file yet, so the cleanup idiom (`[[gnu::cleanup]]` on an
- * owned descriptor) is not needed yet.
+ * until the stage that builds it. An operation that acts on the file system resolves its location once through
+ * resolve.h to (parent descriptor, leaf name) and makes only `*at` calls on that pair from then on; every
+ * descriptor it holds is an owned_descriptor under the cleanup idiom of owned.h.
  */
 #include <bc_file_system/bc_file_system.h>
 
@@ -17,14 +19,17 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <stdckdint.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "engine.h"
+#include "owned.h"
 #include "path.h"
 #include "platform.h"
+#include "resolve.h"
 
 /* ---- Layout pins -------------------------------------------------------------------------------------------- */
 
@@ -76,7 +81,7 @@ enum : uint32_t {
  * enum in the header runs from 1 to its last value without a gap. */
 enum : int32_t {
     operation_last = bc_file_system_operation_path_library_name,
-    step_last = bc_file_system_step_identity_check,
+    step_last = bc_file_system_step_openat_nofollow_any,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
     read_limit_kind_last = bc_file_system_read_limit_kind_at_most,
@@ -100,11 +105,7 @@ struct bc_file_system_engine {
     uint64_t step_counts[operation_last + 1][step_last + 1];
 };
 
-struct bc_file_system_directory {
-    int descriptor; /* -1 until an open lands */
-    size_t opened_as_length;
-    uint8_t opened_as[]; /* the text it was opened with, not NUL-terminated; sized by the open */
-};
+/* `struct bc_file_system_directory` is resolve.h's: the walk beneath a directory starts from its descriptor. */
 
 struct bc_file_system_lock {
     int descriptor; /* the locked file; closing it releases the advisory lock */
@@ -345,6 +346,39 @@ void bc_file_system_engine_before_step(bc_file_system_engine *engine, int32_t op
 
 /* ---- Directories and locks ----------------------------------------------------------------------------------- */
 
+/* The text a directory remembers: for `at` the path's bytes, for `beneath` the parent's text, a slash and the
+ * relative bytes. The handle and its text are one allocation of bounded scratch, sized here with checked
+ * arithmetic; nothing bounds the text but the caller's own bytes. Answers the handle, or NULL when the size
+ * overflows or the allocation fails, which the caller reports as `resource_exhausted`. */
+static bc_file_system_directory *allocate_directory(const bc_file_system_location *location) {
+    size_t text_length = location->length;
+    if (location->kind == bc_file_system_location_kind_beneath) {
+        if (ckd_add(&text_length, text_length, location->directory->opened_as_length) ||
+            ckd_add(&text_length, text_length, (size_t)1)) {
+            return nullptr;
+        }
+    }
+    size_t allocation = 0;
+    if (ckd_add(&allocation, sizeof(bc_file_system_directory), text_length)) {
+        return nullptr;
+    }
+    bc_file_system_directory *created = malloc(allocation);
+    if (created == nullptr) {
+        return nullptr;
+    }
+    created->descriptor = -1;
+    created->opened_as_length = text_length;
+    size_t position = 0;
+    if (location->kind == bc_file_system_location_kind_beneath) {
+        memcpy(created->opened_as, location->directory->opened_as, location->directory->opened_as_length);
+        position = location->directory->opened_as_length;
+        created->opened_as[position] = '/';
+        position += 1;
+    }
+    memcpy(created->opened_as + position, location->path, location->length);
+    return created;
+}
+
 int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_file_system_location *location,
                                       int32_t final_symlink, bc_file_system_directory **directory,
                                       bc_file_system_error *error) {
@@ -357,7 +391,38 @@ int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_fi
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 13 status-and-reads */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The leaf is opened as a directory with the caller's choice about a final symlink, bracketed by the
+     * identity check like every component before it. The root has no leaf: the parent the walk opened is the
+     * directory itself, and it is taken over rather than opened again. */
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    if (resolved.leaf_length == 0) {
+        opened.value = release_descriptor(&resolved.opened);
+    } else {
+        bc_file_system_expected_entry expected;
+        kind = bc_file_system_resolve_expect_entry(engine, operation, resolved.parent, (const char *)resolved.leaf,
+                                                   final_symlink, &expected, error);
+        if (kind != 0) {
+            return kind;
+        }
+        kind = bc_file_system_resolve_open_expected_directory(
+            engine, operation, resolved.parent, (const char *)resolved.leaf, final_symlink, &expected, &opened, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    bc_file_system_directory *created = allocate_directory(location);
+    if (created == nullptr) {
+        return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
+    }
+    created->descriptor = release_descriptor(&opened);
+    *directory = created;
+    return succeed(error);
 }
 
 int32_t bc_file_system_directory_opened_as(const bc_file_system_directory *directory, uint8_t *buffer, size_t capacity,

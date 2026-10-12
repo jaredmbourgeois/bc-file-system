@@ -1197,6 +1197,288 @@ TEST_P(FileSystemContract, DISABLED_StatusReportsASymlinkAsASymlinkWhateverItPoi
 }
 
 // -------------------------------------------------------------------------------------------------------------
+// open_directory, and beneath (the resolution layer: every operation from here on resolves its location this way)
+// -------------------------------------------------------------------------------------------------------------
+
+// Lays out:  sub/ · sub/deeper/ · file · alias -> sub · outside/ · sub/way-out -> ../outside · dangling -> nowhere
+auto lay_out_directories(const std::filesystem::path& root) -> void {
+    bc::file_system_test::make_directory_raw(root / "sub", 0755);
+    bc::file_system_test::make_directory_raw(root / "sub" / "deeper", 0755);
+    bc::file_system_test::write_raw(root / "file", "not a directory", 0644);
+    bc::file_system_test::make_symlink_raw("sub", root / "alias");
+    bc::file_system_test::make_directory_raw(root / "outside", 0755);
+    bc::file_system_test::make_symlink_raw("../outside", root / "sub" / "way-out");
+    bc::file_system_test::make_symlink_raw("nowhere", root / "dangling");
+}
+
+// A relative path the suite spells as a literal it knows to be valid.
+auto relative(std::string_view text) -> RelativePath {
+    return RelativePath::from(text).value();
+}
+
+// How many components the test's own directory has: the walk from the root opens each of them.
+auto components_of(const std::filesystem::path& path) -> std::uint64_t {
+    std::uint64_t count = 0;
+    for (const std::filesystem::path& part : path) {
+        if (part != "/") {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+TEST_P(FileSystemContract, OpenDirectoryOpensADirectoryAndRemembersItsText) {
+    lay_out_directories(root_path());
+
+    const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    const auto opened_as = directory->opened_as();
+    ASSERT_TRUE(opened_as.has_value());
+    EXPECT_EQ(*opened_as, path_of("sub").string());
+}
+
+TEST_P(FileSystemContract, OpenDirectoryOfTheRootOpens) {
+    const auto directory = files().open_directory(Location::at(std::filesystem::path{"/"}), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    const auto opened_as = directory->opened_as();
+    ASSERT_TRUE(opened_as.has_value());
+    EXPECT_EQ(*opened_as, "/");
+}
+
+TEST_P(FileSystemContract, OpenDirectoryOfNothingIsNotFound) {
+    const auto directory = files().open_directory(in("absent"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(directory.has_value());
+    EXPECT_EQ(directory.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(directory.error().system_code, ENOENT);
+    EXPECT_EQ(directory.error().operation, Operation::open_directory);
+    EXPECT_EQ(directory.error().path, path_of("absent").string());
+    EXPECT_TRUE(directory.error().step.has_value());
+}
+
+TEST_P(FileSystemContract, OpenDirectoryOfAFileAndBelowAFileIsNotDirectory) {
+    lay_out_directories(root_path());
+
+    const auto of_the_file = files().open_directory(in("file"), FinalSymlink::refuse);
+    const auto below_the_file = files().open_directory(in("file/child"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(of_the_file.has_value());
+    EXPECT_EQ(of_the_file.error().kind, ErrorKind::not_directory);
+    EXPECT_EQ(of_the_file.error().system_code, ENOTDIR);
+    ASSERT_FALSE(below_the_file.has_value());
+    EXPECT_EQ(below_the_file.error().kind, ErrorKind::not_directory);
+    EXPECT_EQ(below_the_file.error().path, path_of("file/child").string());
+}
+
+// Under `refuse` a final symlink is refused as what it is; under `follow` the directory behind it opens, and the
+// handle remembers the text it was asked for, the link's.
+TEST_P(FileSystemContract, OpenDirectoryRefusesAFinalSymlinkUnlessToldToFollow) {
+    lay_out_directories(root_path());
+
+    const auto refused = files().open_directory(in("alias"), FinalSymlink::refuse);
+    const auto followed = files().open_directory(in("alias"), FinalSymlink::follow);
+    const auto dangling = files().open_directory(in("dangling"), FinalSymlink::follow);
+
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error().kind, ErrorKind::symlink_refused);
+    ASSERT_TRUE(followed.has_value()) << followed.error().message();
+    EXPECT_EQ(followed->opened_as().value(), path_of("alias").string());
+    const auto behind_the_link =
+        files().open_directory(Location::beneath(*followed, relative("deeper")), FinalSymlink::refuse);
+    EXPECT_TRUE(behind_the_link.has_value()) << behind_the_link.error().message();
+    ASSERT_FALSE(dangling.has_value());
+    EXPECT_EQ(dangling.error().kind, ErrorKind::not_found);
+}
+
+// Under `at` the system resolves the path, symlinks on the way included; only `beneath` refuses them.
+TEST_P(FileSystemContract, OpenDirectoryUnderAtFollowsASymlinkOnTheWay) {
+    lay_out_directories(root_path());
+
+    const auto directory = files().open_directory(in("alias/deeper"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    EXPECT_EQ(directory->opened_as().value(), path_of("alias/deeper").string());
+}
+
+TEST_P(FileSystemContract, BeneathOpensADirectoryAndRemembersTheParentsTextASlashAndTheRelativePath) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto deeper =
+        files().open_directory(Location::beneath(*parent, relative("sub/deeper")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(deeper.has_value()) << deeper.error().message();
+    EXPECT_EQ(deeper->opened_as().value(), path_of("sub/deeper").string());
+}
+
+// Containment: nothing above the held directory is reachable, because no component may be a symlink and `..`
+// cannot be spelled. A symlink on the way and a symlink at the end are both refused, and the error names the
+// text the caller holds, the directory's text, a slash and the relative path.
+TEST_P(FileSystemContract, BeneathRefusesASymlinkOnTheWayAndAtTheEnd) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto on_the_way =
+        files().open_directory(Location::beneath(*parent, relative("alias/deeper")), FinalSymlink::refuse);
+    const auto at_the_end =
+        files().open_directory(Location::beneath(*parent, relative("sub/way-out")), FinalSymlink::refuse);
+
+    ASSERT_FALSE(on_the_way.has_value());
+    EXPECT_EQ(on_the_way.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(on_the_way.error().path, path_of("alias/deeper").string());
+    EXPECT_TRUE(on_the_way.error().step.has_value());
+    ASSERT_FALSE(at_the_end.has_value());
+    EXPECT_EQ(at_the_end.error().kind, ErrorKind::symlink_refused);
+    EXPECT_FALSE(RelativePath::from("../outside").has_value());
+}
+
+TEST_P(FileSystemContract, BeneathOfNothingIsNotFoundAndBelowAFileIsNotDirectory) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto absent =
+        files().open_directory(Location::beneath(*parent, relative("sub/absent")), FinalSymlink::refuse);
+    const auto below_a_file =
+        files().open_directory(Location::beneath(*parent, relative("file/child")), FinalSymlink::refuse);
+
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(absent.error().path, path_of("sub/absent").string());
+    ASSERT_FALSE(below_a_file.has_value());
+    EXPECT_EQ(below_a_file.error().kind, ErrorKind::not_directory);
+}
+
+TEST_P(FileSystemContract, OpenDirectoryWithoutPermissionIsPermissionDenied) {
+    if (!bc::file_system_test::permissions_are_enforced(root_path())) {
+        GTEST_SKIP() << "this process opens what its permission bits forbid";
+    }
+    bc::file_system_test::make_directory_raw(path_of("locked"), 0000);
+
+    const auto itself = files().open_directory(in("locked"), FinalSymlink::refuse);
+    const auto below_it = files().open_directory(in("locked/child"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(itself.has_value());
+    EXPECT_EQ(itself.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(itself.error().system_code, EACCES);
+    ASSERT_FALSE(below_it.has_value());
+    EXPECT_EQ(below_it.error().kind, ErrorKind::permission_denied);
+}
+
+// What resolving an `at` location costs, read from the system calls it made: the root once, then every
+// component of the test's own directory and the leaf, each opened against the one before it, each bracketed
+// by the identity check.
+TEST_F(ObservedContract, OpenDirectoryOpensTheRootThenEveryComponentThenTheLeaf) {
+    lay_out_directories(root_path());
+
+    const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    const std::uint64_t opens = components_of(root_path()) + 1;
+    EXPECT_EQ(count(Operation::open_directory, Step::open), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat), opens);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstatat), opens);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstat), opens);
+    EXPECT_EQ(count(Operation::open_directory, Step::identity_check), opens);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat2), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat_nofollow_any), 0U);
+}
+
+// The fast path, where the platform has one, opens the whole parent in one call under its own step; where it
+// has none, the walk opens each component. Either way the leaf is one more openat.
+TEST_F(ObservedContract, BeneathTakesTheFastPathWhereThePlatformHasOneAndWalksOtherwise) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    const std::uint64_t opens_before = count(Operation::open_directory, Step::openat);
+
+    const auto deeper =
+        files().open_directory(Location::beneath(*parent, relative("sub/deeper")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(deeper.has_value()) << deeper.error().message();
+    const std::uint64_t fast_path_opens =
+        count(Operation::open_directory, Step::openat2) + count(Operation::open_directory, Step::openat_nofollow_any);
+    const std::uint64_t component_opens = count(Operation::open_directory, Step::openat) - opens_before;
+    if (fast_path_opens == 1) {
+        EXPECT_EQ(component_opens, 1U);
+    } else {
+        EXPECT_EQ(fast_path_opens, 0U);
+        EXPECT_EQ(component_opens, 2U);
+    }
+}
+
+// The portable path through the same gate every face can script: a refusal on the fast path's step, with one
+// of the errnos a kernel without the call would answer, makes the engine walk instead. Both steps are scripted;
+// only the platform's own is ever reached.
+TEST_F(ObservedContract, BeneathFallsBackToTheWalkWhenTheFastPathIsRefused) {
+    lay_out_directories(root_path());
+    script(fail_step(Operation::open_directory, Step::openat2, 1, ENOSYS));
+    script(fail_step(Operation::open_directory, Step::openat_nofollow_any, 1, ENOSYS));
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    const std::uint64_t opens_before = count(Operation::open_directory, Step::openat);
+
+    const auto deeper =
+        files().open_directory(Location::beneath(*parent, relative("sub/deeper")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(deeper.has_value()) << deeper.error().message();
+    EXPECT_EQ(deeper->opened_as().value(), path_of("sub/deeper").string());
+    EXPECT_EQ(count(Operation::open_directory, Step::openat) - opens_before, 2U);
+}
+
+// Any other errno on the fast path is the operation's error, never a silent walk.
+TEST_F(ObservedContract, AnyOtherErrnoOnTheFastPathIsTheOperationsError) {
+    lay_out_directories(root_path());
+    script(fail_step(Operation::open_directory, Step::openat2, 1, EIO));
+    script(fail_step(Operation::open_directory, Step::openat_nofollow_any, 1, EIO));
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto deeper =
+        files().open_directory(Location::beneath(*parent, relative("sub/deeper")), FinalSymlink::refuse);
+
+    const std::uint64_t fast_path_opens =
+        count(Operation::open_directory, Step::openat2) + count(Operation::open_directory, Step::openat_nofollow_any);
+    if (fast_path_opens == 0) {
+        EXPECT_TRUE(deeper.has_value()) << "this platform has no fast path; the walk resolved";
+        return;
+    }
+    ASSERT_FALSE(deeper.has_value());
+    EXPECT_EQ(deeper.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(deeper.error().system_code, EIO);
+    EXPECT_TRUE(deeper.error().step == Step::openat2 || deeper.error().step == Step::openat_nofollow_any);
+}
+
+// The identity check is a step of its own, so the directory-swapped-between-stat-and-open race can be scripted
+// without a race: its refusal is `symlink_refused` at that step. The race itself is the C-only test's.
+TEST_F(ObservedContract, ARefusedIdentityCheckIsSymlinkRefused) {
+    lay_out_directories(root_path());
+    script(fail_step(Operation::open_directory, Step::identity_check, 1, EIO));
+
+    const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(directory.has_value());
+    EXPECT_EQ(directory.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(directory.error().step, Step::identity_check);
+    EXPECT_EQ(directory.error().system_code, EIO);
+    EXPECT_EQ(directory.error().path, path_of("sub").string());
+}
+
+TEST_F(ObservedContract, AnInterruptedComponentOpenIsAskedAgain) {
+    lay_out_directories(root_path());
+    script(fail_step(Operation::open_directory, Step::openat, 1, EINTR));
+
+    const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    EXPECT_EQ(count(Operation::open_directory, Step::openat), components_of(root_path()) + 2);
+}
+
+// -------------------------------------------------------------------------------------------------------------
 // create_directories
 // -------------------------------------------------------------------------------------------------------------
 

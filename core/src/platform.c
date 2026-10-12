@@ -57,18 +57,12 @@ static int sync_refusal(int code) {
 
 /* ---- The operations no stage has built yet --------------------------------------------------------------- */
 
-/* Honest refusals: the engine takes its portable path (the copy loop, the component walk) until the stage
- * named at each body gives the fast path a body. Each answers ENOTSUP on every platform. */
+/* Honest refusals: the engine takes its portable path (the copy loop) until the stage named at each body gives
+ * the fast path a body. Each answers ENOTSUP on every platform. */
 
 /* stage 16 moves-and-copies-in-c: clonefileat / fclonefileat on Apple, FICLONE on Linux. */
 int bc_file_system_platform_clone_file([[maybe_unused]] int source, [[maybe_unused]] int destination_directory,
                                        [[maybe_unused]] const char *destination_name, [[maybe_unused]] uint32_t mode) {
-    return ENOTSUP;
-}
-
-/* stage 12 resolution-layer: openat2 with RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS on Linux, O_NOFOLLOW_ANY on Apple. */
-int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unused]] const char *relative,
-                                         [[maybe_unused]] int open_flags, [[maybe_unused]] int *descriptor) {
     return ENOTSUP;
 }
 
@@ -82,16 +76,37 @@ int bc_file_system_platform_copy_range([[maybe_unused]] int source, [[maybe_unus
 
 /* ---- Apple platforms --------------------------------------------------------------------------------------- */
 
-/* The SDK answers every question: no Apple kernel the library ships for lacks renameatx_np, clonefileat or
- * F_FULLFSYNC, and none has openat2 or copy_file_range. */
+/* The SDK answers every question: no Apple kernel the library ships for lacks O_NOFOLLOW_ANY, renameatx_np,
+ * clonefileat or F_FULLFSYNC, and none has openat2 or copy_file_range. */
 bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void) {
     return (bc_file_system_platform_fast_paths){
         .has_openat2 = false,
+        .has_openat_nofollow_any = true,
         .has_rename_no_replace = true,
         .has_clone = true,
         .has_copy_range = false,
         .has_full_fsync = true,
     };
+}
+
+/* A directory descriptor is a kernel object here. */
+bool bc_file_system_platform_enforces_containment(void) {
+    return true;
+}
+
+/* O_NOFOLLOW_ANY makes the kernel refuse a symlink at any depth of `relative` with ELOOP (measured: in the middle
+ * and at the end alike), so one openat relative to the held root resolves the whole path contained. */
+int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor) {
+    int code = 0;
+    do {
+        const int opened = openat(root, relative, open_flags | O_NOFOLLOW_ANY);
+        if (opened >= 0) {
+            *descriptor = opened;
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    return code;
 }
 
 /* fsync on Apple platforms stops at the drive's cache; F_FULLFSYNC asks the drive to flush that cache. */
@@ -127,11 +142,25 @@ int bc_file_system_platform_rename_no_replace(int from_directory, const char *fr
 bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void) {
     return (bc_file_system_platform_fast_paths){
         .has_openat2 = false,
+        .has_openat_nofollow_any = false,
         .has_rename_no_replace = false,
         .has_clone = false,
         .has_copy_range = false,
         .has_full_fsync = false,
     };
+}
+
+/* A directory descriptor is a path string the runtime joins names onto (`stream.path + '/' + name`): a held
+ * directory goes stale on rename, a symlink on the way escapes, and no openat2 exists. Nothing is contained. */
+bool bc_file_system_platform_enforces_containment(void) {
+    return false;
+}
+
+/* No kernel call opens a path contained beneath a descriptor here; the engine never asks, since containment is
+ * absent altogether, but the honest answer stays in place. */
+int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unused]] const char *relative,
+                                         [[maybe_unused]] int open_flags, [[maybe_unused]] int *descriptor) {
+    return ENOTSUP;
 }
 
 /* Both backends' fsync return 0 and do nothing, so the honest answer is "no sync offered": the engine reports
@@ -203,12 +232,49 @@ static bool probe_copy_range(void) {
 bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void) {
     return (bc_file_system_platform_fast_paths){
         .has_openat2 = probe_openat2(),
+        .has_openat_nofollow_any = false,
         .has_rename_no_replace = probe_rename_no_replace(),
         .has_clone = probe_clone(),
         .has_copy_range = probe_copy_range(),
         .has_full_fsync = false,
     };
 }
+
+/* A directory descriptor is a kernel object here. */
+bool bc_file_system_platform_enforces_containment(void) {
+    return true;
+}
+
+#if defined(__ANDROID__) || !__has_include(<linux/openat2.h>)
+/* The engine never calls this where the probe answered no (Android, or headers older than kernel 5.6); the
+ * honest answer stays in place. */
+int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unused]] const char *relative,
+                                         [[maybe_unused]] int open_flags, [[maybe_unused]] int *descriptor) {
+    return ENOTSUP;
+}
+#else
+/* RESOLVE_BENEATH keeps the resolution under `root` (an escape is EXDEV) and RESOLVE_NO_SYMLINKS refuses every
+ * symlink on the way with ELOOP, so one call resolves the whole path contained. The flags travel in the
+ * `open_how` struct as a 64-bit field; the engine's flags are non-negative, so the widening is exact. */
+int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor) {
+    struct open_how how = {.flags = (uint64_t)open_flags, .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS};
+    int code = 0;
+    do {
+        const long opened = syscall(SYS_openat2, root, relative, &how, sizeof how);
+        if (opened >= 0) {
+            /* A descriptor is an int; the kernel answered one. */
+            *descriptor = (int)opened;
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    /* A kernel without the call, which the probe did not see: the engine walks. */
+    if (code == ENOSYS) {
+        return ENOTSUP;
+    }
+    return code;
+}
+#endif
 
 int bc_file_system_platform_sync_descriptor(int descriptor) {
     int code = 0;

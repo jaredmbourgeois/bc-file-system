@@ -180,7 +180,14 @@ typedef enum bc_file_system_step {
     bc_file_system_step_clone_file = 21,
     bc_file_system_step_close = 22,
     /* The st_dev/st_ino comparison that catches a directory swapped in between a stat and an open. */
-    bc_file_system_step_identity_check = 23
+    bc_file_system_step_identity_check = 23,
+    /* The Linux fast path of a `beneath` location: openat2 with RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS over the
+     * whole relative path in one call. A scripted ENOSYS, EINVAL, ENOTSUP or EOPNOTSUPP on this step makes the
+     * engine walk the path one component at a time instead, which is how a test forces the portable path. */
+    bc_file_system_step_openat2 = 24,
+    /* The Apple fast path of a `beneath` location: openat with O_NOFOLLOW_ANY over the whole relative path in
+     * one call. The same scripted errnos make the engine walk instead. */
+    bc_file_system_step_openat_nofollow_any = 25
 } bc_file_system_step;
 
 /* What to do when the last component of a path is a symlink. */
@@ -426,8 +433,11 @@ int32_t bc_file_system_observed_step_count(const bc_file_system_engine *engine, 
 
 /* Opens the directory at `location` and remembers the text it was opened with: for `at`, the path's bytes; for
  * `beneath`, the parent's remembered text, a slash and the relative bytes. Something that is not a directory is
- * `not_directory`; a final symlink is followed or refused per `final_symlink`. Where the platform cannot enforce
- * containment beneath a directory the answer is `unsupported`.
+ * `not_directory`; nothing there is `not_found`; a final symlink is followed or refused per `final_symlink`
+ * (followed wherever it points, under `beneath` too: the choice is the caller's, and containment covers the
+ * path to it). The root, `/`, opens. Where the platform cannot enforce containment beneath a directory
+ * (Emscripten, where a descriptor is a path string) a directory still opens through `at`, and every `beneath`
+ * location resolved against it, this call's included, answers `unsupported` before any system call.
  *
  * `engine`     must not be NULL; must outlive the directory.
  * `location`   must not be NULL.

@@ -114,6 +114,7 @@ static bool is_proceed(bc_file_system_step_verdict verdict) {
 #ifdef __APPLE__
 static void expect_platform_fast_paths(report *tally, const bc_file_system_platform_fast_paths *fast_paths) {
     expect_fast_path(tally, fast_paths->has_openat2, false, "Apple: no openat2");
+    expect_fast_path(tally, fast_paths->has_openat_nofollow_any, true, "Apple: O_NOFOLLOW_ANY by the SDK");
     expect_fast_path(tally, fast_paths->has_rename_no_replace, true, "Apple: renameatx_np(RENAME_EXCL) by the SDK");
     expect_fast_path(tally, fast_paths->has_clone, true, "Apple: clonefileat by the SDK");
     expect_fast_path(tally, fast_paths->has_copy_range, false, "Apple: no copy_file_range");
@@ -122,6 +123,7 @@ static void expect_platform_fast_paths(report *tally, const bc_file_system_platf
 #elifdef __EMSCRIPTEN__
 static void expect_platform_fast_paths(report *tally, const bc_file_system_platform_fast_paths *fast_paths) {
     expect_fast_path(tally, fast_paths->has_openat2, false, "Emscripten: no openat2");
+    expect_fast_path(tally, fast_paths->has_openat_nofollow_any, false, "Emscripten: no O_NOFOLLOW_ANY");
     expect_fast_path(tally, fast_paths->has_rename_no_replace, false, "Emscripten: no no-replace rename");
     expect_fast_path(tally, fast_paths->has_clone, false, "Emscripten: no clone");
     expect_fast_path(tally, fast_paths->has_copy_range, false, "Emscripten: no copy_file_range");
@@ -130,10 +132,12 @@ static void expect_platform_fast_paths(report *tally, const bc_file_system_platf
 #elifdef __ANDROID__
 static void expect_platform_fast_paths(report *tally, const bc_file_system_platform_fast_paths *fast_paths) {
     expect_fast_path(tally, fast_paths->has_openat2, false, "Android: openat2 is never probed");
+    expect_fast_path(tally, fast_paths->has_openat_nofollow_any, false, "Android: no O_NOFOLLOW_ANY");
     expect_fast_path(tally, fast_paths->has_full_fsync, false, "Android: fsync is the durable sync");
 }
 #else
 static void expect_platform_fast_paths(report *tally, const bc_file_system_platform_fast_paths *fast_paths) {
+    expect_fast_path(tally, fast_paths->has_openat_nofollow_any, false, "Linux: no O_NOFOLLOW_ANY");
     expect_fast_path(tally, fast_paths->has_full_fsync, false, "Linux: fsync is the durable sync");
 }
 #endif
@@ -144,10 +148,10 @@ static void test_live_engine_is_created_released_and_probed(report *tally) {
         return;
     }
     const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
-    printf("fast paths: openat2=%s rename_no_replace=%s clone=%s copy_range=%s full_fsync=%s\n",
-           yes_or_no(fast_paths->has_openat2), yes_or_no(fast_paths->has_rename_no_replace),
-           yes_or_no(fast_paths->has_clone), yes_or_no(fast_paths->has_copy_range),
-           yes_or_no(fast_paths->has_full_fsync));
+    printf("fast paths: openat2=%s openat_nofollow_any=%s rename_no_replace=%s clone=%s copy_range=%s full_fsync=%s\n",
+           yes_or_no(fast_paths->has_openat2), yes_or_no(fast_paths->has_openat_nofollow_any),
+           yes_or_no(fast_paths->has_rename_no_replace), yes_or_no(fast_paths->has_clone),
+           yes_or_no(fast_paths->has_copy_range), yes_or_no(fast_paths->has_full_fsync));
     expect_platform_fast_paths(tally, fast_paths);
     bc_file_system_engine_release(engine);
 }
@@ -176,7 +180,7 @@ static void test_observed_engine_probes_the_same_way(report *tally) {
 
 /* ---- The platform operations ---------------------------------------------------------------------------------- */
 
-/* The two operations with bodies, handed an invalid descriptor so nothing is touched: a platform with the call
+/* The operations with bodies, handed an invalid descriptor so nothing is touched: a platform with the call
  * reports the descriptor (never ENOTSUP, never success); Emscripten answers ENOTSUP outright. */
 #ifdef __EMSCRIPTEN__
 static void expect_platform_operations(report *tally) {
@@ -196,14 +200,25 @@ static void expect_platform_operations(report *tally) {
 
 static void test_platform_operations(report *tally) {
     expect_platform_operations(tally);
-    /* The three operations no stage has built answer ENOTSUP on every platform, so the engine takes its
+    /* The two operations no stage has built answer ENOTSUP on every platform, so the engine takes its
      * portable path; each stage that builds one turns its line here into a real case. */
     expect(tally, bc_file_system_platform_clone_file(-1, -1, "copy", 0644) == ENOTSUP,
            "clone_file is unsupported until stage 16", "");
-    int descriptor = -1;
-    expect(tally, bc_file_system_platform_open_beneath(-1, "a/b", 0, &descriptor) == ENOTSUP,
-           "open_beneath is unsupported until stage 12", "");
-    expect(tally, descriptor == -1, "open_beneath stores nothing when unsupported", "");
+    /* open_beneath is real where the platform has a one-call contained open: handed an invalid descriptor it
+     * reports the descriptor (never ENOTSUP, never success); where it has none it answers ENOTSUP outright. */
+    bc_file_system_engine *engine = create_live(tally);
+    if (engine != nullptr) {
+        const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
+        int descriptor = -1;
+        const int open_beneath_code = bc_file_system_platform_open_beneath(-1, "a/b", 0, &descriptor);
+        if (fast_paths->has_openat2 || fast_paths->has_openat_nofollow_any) {
+            expect(tally, open_beneath_code == EBADF, "open_beneath reports an invalid descriptor as EBADF", "");
+        } else {
+            expect(tally, open_beneath_code == ENOTSUP, "open_beneath is not offered on this platform", "");
+        }
+        expect(tally, descriptor == -1, "open_beneath stores nothing on failure", "");
+        bc_file_system_engine_release(engine);
+    }
     size_t copied = 0;
     expect(tally, bc_file_system_platform_copy_range(-1, -1, 16, &copied) == ENOTSUP,
            "copy_range is unsupported until stage 16", "");

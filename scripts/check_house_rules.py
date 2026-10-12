@@ -97,12 +97,16 @@ class Configuration:
 CONFIGURATION: Final = Configuration(
     expected_languages=("c", "cpp", "rust", "swift", "python", "cmake"),
     reach_is_legal_in={
-        # The body of the seam's one live implementation (the engine, its platform header and the platform
-        # bodies), and the one composition root in C (the consumer example's `main`).
+        # The body of the seam's one live implementation (the engine, the resolution layer and the cleanup idiom
+        # it opens descriptors through, its platform header and the platform bodies), the one composition root in
+        # C (the consumer example's `main`), and the C-only test that plants a tree under the root it is handed.
         "c": (
             "core/src/bc_file_system.c",
+            "core/src/owned.h",
             "core/src/platform.h",
             "core/src/platform.c",
+            "core/src/resolve.c",
+            "core/tests/resolve_test.c",
             "examples/consumer/main.c",
         ),
         # The one C++ file that names `bc_file_system_engine_create_live` (the face's live factory), and the tests'

@@ -267,6 +267,52 @@ TEST_F(ObserverTest, DISABLED_ClearFaultsKeepsTheStepCounts) {
 // A fault takes effect at its step
 // -------------------------------------------------------------------------------------------------------------
 
+// The resolution layer is real, so `open_directory` drives the fault mechanics through an operation: a scripted
+// step fails with its code, the error names the step and the location, and nothing is handed out.
+TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeOnOpenDirectory) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    script(fail_step(Operation::open_directory, Step::openat, 1, EACCES));
+
+    const auto directory = files().open_directory(in("folder"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(directory.has_value());
+    EXPECT_EQ(directory.error().kind, ErrorKind::permission_denied);
+    EXPECT_EQ(directory.error().system_code, EACCES);
+    EXPECT_EQ(directory.error().step, Step::openat);
+    EXPECT_EQ(directory.error().operation, Operation::open_directory);
+    EXPECT_EQ(directory.error().path, path_of("folder").string());
+}
+
+// The root is opened once per `at` resolution, so its occurrences count the calls.
+TEST_F(ObserverTest, OnlyTheNthOccurrenceFailsOnOpenDirectory) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    script(fail_step(Operation::open_directory, Step::open, 2, EIO));
+
+    const auto first = files().open_directory(in("folder"), FinalSymlink::refuse);
+    const auto second = files().open_directory(in("folder"), FinalSymlink::refuse);
+    const auto third = files().open_directory(in("folder"), FinalSymlink::refuse);
+
+    EXPECT_TRUE(first.has_value());
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error().kind, ErrorKind::io_failed);
+    EXPECT_EQ(second.error().step, Step::open);
+    EXPECT_TRUE(third.has_value());
+    EXPECT_EQ(count(Operation::open_directory, Step::open), 3U);
+}
+
+// A fault names one operation and one step: a fault on another operation's `open`, and one on a step
+// `open_directory` never makes, leave it untouched.
+TEST_F(ObserverTest, AScriptNamesOneOperationAndOneStepOnOpenDirectory) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    script(fail_step(Operation::status, Step::open, 1, EIO));
+    script(fail_step(Operation::open_directory, Step::fsync, 1, EIO));
+
+    const auto directory = files().open_directory(in("folder"), FinalSymlink::refuse);
+
+    EXPECT_TRUE(directory.has_value()) << directory.error().message();
+    EXPECT_EQ(count(Operation::open_directory, Step::fsync), 0U);
+}
+
 // stage 14 writes-in-c
 TEST_F(ObserverTest, DISABLED_AScriptedStepFailsWithItsCodeAndNothingIsWritten) {
     const auto bytes = bytes_of("content");

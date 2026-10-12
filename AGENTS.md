@@ -25,8 +25,8 @@ wrong even when it compiles and passes.
 | Path | What it is | CMake target | SwiftPM target | Cargo crate |
 |---|---|---|---|---|
 | `core/include/bc_file_system/` | The public C header, included as `<bc_file_system/bc_file_system.h>` | `bc::file_system_core` | `CBCFileSystem` | — |
-| `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier) with its private face `engine.h` (the observer's two hooks and the probed fast paths, for the C-only test), `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` with `platform.c` the only files that name the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | compiled by `bc-file-system`'s `build.rs` |
-| `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach | `bc_file_system_path_test`, `bc_file_system_engine_test` | not built | — |
+| `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier) with its private face `engine.h` (the observer's two hooks and the probed fast paths, for the C-only test), `resolve.c` the resolution layer (a location to a parent descriptor and a leaf name, with containment enforced by the kernel: the walk, the fast paths, the identity check) behind `resolve.h`, `owned.h` the one cleanup idiom (`owned_descriptor`, `owned_directory_stream`, `owned_buffer` under `[[gnu::cleanup]]`), `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` with `platform.c` the only files that name the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | compiled by `bc-file-system`'s `build.rs` |
+| `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach; `resolve_test.c` drives the resolution layer through `resolve.h` over a tree it plants under the root `add_test` hands it | `bc_file_system_path_test`, `bc_file_system_engine_test`, `bc_file_system_resolve_test` | not built | — |
 | `cpp/include/bc_file_system/`, `cpp/src/` | The C++ face, a thin wrapper over the header (`.clang-tidy`: the C++ set) | `bc::file_system` | not built | — |
 | `cpp/tests/` | The contract suite (the specification every face is held to, driving C through the C++ face), the C++ binding suite, the observer and path-value suites, and `support/` (the temporary directory, the descriptor-balance fixture, the generated `test_paths.hpp`) | `bc_file_system_test` | not built | — |
 | `Sources/CBCFileSystem/`, `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module, its test fixtures (the temporary directory and the observed engine), and its binding suite and source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
@@ -68,7 +68,9 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
    and the `main` of `crates/bc-file-system/build.rs`, the build's own root, which reads cargo's environment and
    the directory of C sources it compiles.
 2. **The body of a seam's one live implementation.** In this repository: `core/src/bc_file_system.c`,
-   `core/src/platform.h` and `core/src/platform.c` (the engine, and the platform probes and operations it names);
+   `core/src/resolve.c` and `core/src/owned.h` (the engine, the resolution layer that opens directories on held
+   descriptors for it, and the cleanup idiom they hold descriptors through), `core/src/platform.h` and
+   `core/src/platform.c` (the platform probes and operations the engine names);
    `cpp/src/engine.cpp`, the one C++ file that names `bc_file_system_engine_create_live`; and
    `crates/bc-file-system/src/live.rs`, the Rust face's live-implementation site, the one Rust file that names
    it (`Engine::live`) and the one that calls into the core.
@@ -76,7 +78,9 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
    created. Never another live value, the wall clock, a sleep, the environment, the home directory or the
    network. In this repository: `cpp/tests/support/temp_directory.cpp` (the C++ tests' own directory under the
    root `test_paths.hpp` hands in) and `cpp/tests/support/descriptor_balance.cpp` (the open-descriptor sweep the
-   fixture takes before and after every case); `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
+   fixture takes before and after every case); `core/tests/resolve_test.c` (the C-only test of the resolution
+   layer, which plants its tree with `mkdirat`, `symlinkat` and `openat` on held descriptors under the root
+   `add_test` hands it and removes it when it ends); `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
    one place `swift test` reads where its root is, and the only Swift file that names `FileManager`); and
    `crates/bc-file-system/tests/abi_smoke.rs`, the ABI smoke, which creates a live engine because proving the
    declarations against the real core is the whole of its job.
@@ -336,7 +340,12 @@ comment that explains it. Brevity is never worth obscurity.
   `add_test`, and the C++ suite `cpp/tests/path_test.cpp` runs the same table through the face;
   `core/tests/engine_test.c` drives the observer's two hooks (`engine.h`) with no operation in between (a step
   is counted, a fault fires at its occurrence and once, a stop is a verdict, a live engine neither counts nor
-  fires) and reports the platform probes, asserting only what the platform guarantees. `fuzz/path_fuzz.c` is a
+  fires) and reports the platform probes, asserting only what the platform guarantees; `core/tests/resolve_test.c`
+  plants the S2 spike's tree under the root it is handed and drives the resolution layer over it (every refusal,
+  the `at` walk and the `beneath` walk, the fast path and the walk it falls back to when the fast path's step is
+  scripted to refuse, and the identity check against a directory swapped between the stat and the open, made
+  deterministic by calling the two halves of a checked open one at a time), counting the open descriptors
+  before and after every case. `fuzz/path_fuzz.c` is a
   libFuzzer target over the module, built by the `fuzz` preset (clang with libFuzzer: Homebrew LLVM on a Mac)
   and run for ten seconds per target by the `fuzz-smoke` leg; its invariants are asserted with a trap, never a
   print.

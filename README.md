@@ -47,6 +47,10 @@ Stage 9 of its plan, `salvaged-under-the-new-name`: the public header, an honest
 the binding suites, the Swift skeleton, the guards and CI. Stage 10 `path-module` is in: the path module (`core/src/path.c`), the freestanding tier of the core, compiled
 on every build under `-ffreestanding` and for bare wasm32, proven by a C-only test and fuzzed under the `fuzz`
 preset. Stage 11 `engine-and-errors` is in: the engine probes the platform's fast paths once at creation, the
+Stage 12 `resolution-layer` is in: every location resolves once to a parent descriptor and a leaf name with
+containment enforced by the kernel (the per-component walk with the `st_dev`/`st_ino` identity check, the `openat2`
+and `O_NOFOLLOW_ANY` fast paths and the walk they fall back to), `open_directory` is the first real operation, and
+the C-only resolve test holds the swapped-directory race deterministically.
 observer's mechanics are real (every step counted, a scripted fault firing at its occurrence, a stop as a
 verdict), the platform layer has its durable sync and no-replace rename, and the Rust crate's ABI smoke proves
 the hand-written declarations against the core. The remaining operations land in C group by group over the next

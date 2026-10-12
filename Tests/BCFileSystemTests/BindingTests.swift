@@ -50,12 +50,13 @@ struct BindingTests {
 
     // MARK: - Every operation reaches C
 
+    /// The one operation that is real: the handle comes back with the text it was opened with.
     @Test func openDirectoryReachesC() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.openDirectory, path: observed.root.absolutePath(of: "folder")) {
-            () throws(FileSystemError) in
-            try observed.fileSystem.openDirectory(try observed.location("folder"), finalSymlink: .refuse)
-        }
+        try observed.root.rawMakeDirectory("folder", mode: 0o755)
+        let directory = try observed.fileSystem.openDirectory(
+            try observed.location("folder"), finalSymlink: .refuse)
+        #expect(directory.openedAsText == Array(observed.root.absolutePath(of: "folder").utf8))
     }
 
     @Test func statusReachesC() throws {
@@ -376,14 +377,16 @@ struct BindingTests {
             (bc_file_system_step_clone_file, .cloneFile),
             (bc_file_system_step_close, .close),
             (bc_file_system_step_identity_check, .identityCheck),
+            (bc_file_system_step_openat2, .openat2),
+            (bc_file_system_step_openat_nofollow_any, .openatNofollowAny),
         ]
         for (core, step) in pairs {
             #expect(Step(rawValue: Int32(core.rawValue)) == step)
         }
         #expect(Step.allCases.count == pairs.count)
-        #expect(Step.allCases.count == Int(bc_file_system_step_identity_check.rawValue))
+        #expect(Step.allCases.count == Int(bc_file_system_step_openat_nofollow_any.rawValue))
         #expect(Step(rawValue: 0) == nil)
-        #expect(Step(rawValue: 24) == nil)
+        #expect(Step(rawValue: 26) == nil)
     }
 
     @Test func everySmallEnumIsPinnedToTheHeader() {
@@ -627,8 +630,7 @@ struct BindingTests {
         #expect(location.text == Array("/etc/config.toml".utf8))
     }
 
-    // A `beneath` location needs an open Directory, which nothing creates until stage 13; its round trip is the
-    // contract suite's openDirectory cases'.
+    // A `beneath` location's round trip through the core is the contract suite's openDirectory cases'.
 
     // MARK: - The layout every struct is pinned to
 

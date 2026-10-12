@@ -164,6 +164,11 @@ enum class Step : std::int32_t {
     clone_file = 21,
     close = 22,
     identity_check = 23,
+    /// The Linux fast path of a `beneath` location: openat2 over the whole relative path in one call. A
+    /// scripted ENOSYS, EINVAL, ENOTSUP or EOPNOTSUPP on this step makes the engine walk the path instead.
+    openat2 = 24,
+    /// The Apple fast path of a `beneath` location: openat with O_NOFOLLOW_ANY over the whole relative path.
+    openat_nofollow_any = 25,
 };
 
 static_assert(static_cast<std::int32_t>(Step::open) == bc_file_system_step_open);
@@ -189,6 +194,8 @@ static_assert(static_cast<std::int32_t>(Step::copy_range) == bc_file_system_step
 static_assert(static_cast<std::int32_t>(Step::clone_file) == bc_file_system_step_clone_file);
 static_assert(static_cast<std::int32_t>(Step::close) == bc_file_system_step_close);
 static_assert(static_cast<std::int32_t>(Step::identity_check) == bc_file_system_step_identity_check);
+static_assert(static_cast<std::int32_t>(Step::openat2) == bc_file_system_step_openat2);
+static_assert(static_cast<std::int32_t>(Step::openat_nofollow_any) == bc_file_system_step_openat_nofollow_any);
 
 /// Why an operation failed. A plain value: no inheritance, and no source location, because a library does not
 /// decide its caller's diagnostics. The core reports enums and integers; the face composes `path` from the

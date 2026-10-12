@@ -98,6 +98,11 @@ public enum Step: Int32, CaseIterable, Sendable {
     case close = 22
     /// The st_dev/st_ino comparison that catches a directory swapped in between a stat and an open.
     case identityCheck = 23
+    /// The Linux fast path of a `beneath` location: openat2 over the whole relative path in one call. A scripted
+    /// ENOSYS, EINVAL, ENOTSUP or EOPNOTSUPP on this step makes the engine walk the path instead.
+    case openat2 = 24
+    /// The Apple fast path of a `beneath` location: openat with O_NOFOLLOW_ANY over the whole relative path.
+    case openatNofollowAny = 25
 }
 
 /// Why an operation failed. A plain value: the core reports enums and integers; the face composes `path` from

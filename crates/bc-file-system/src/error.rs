@@ -269,11 +269,16 @@ pub enum Step {
     Close = 22,
     /// The `st_dev`/`st_ino` comparison that catches a directory swapped in between a stat and an open.
     IdentityCheck = 23,
+    /// The Linux fast path of a `beneath` location: `openat2` over the whole relative path in one call. A
+    /// scripted `ENOSYS`, `EINVAL`, `ENOTSUP` or `EOPNOTSUPP` on this step makes the engine walk the path instead.
+    Openat2 = 24,
+    /// The Apple fast path of a `beneath` location: `openat` with `O_NOFOLLOW_ANY` over the whole relative path.
+    OpenatNofollowAny = 25,
 }
 
 impl Step {
     /// Every step, in the header's order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Open,
         Self::Openat,
         Self::Fstat,
@@ -297,6 +302,8 @@ impl Step {
         Self::CloneFile,
         Self::Close,
         Self::IdentityCheck,
+        Self::Openat2,
+        Self::OpenatNofollowAny,
     ];
 
     /// The step's name as the header spells it.
@@ -326,6 +333,8 @@ impl Step {
             Self::CloneFile => "clone_file",
             Self::Close => "close",
             Self::IdentityCheck => "identity_check",
+            Self::Openat2 => "openat2",
+            Self::OpenatNofollowAny => "openat_nofollow_any",
         }
     }
 }

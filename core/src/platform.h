@@ -29,6 +29,8 @@
 typedef struct bc_file_system_platform_fast_paths {
     /* openat2 with RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS: Linux kernel 5.6 and later, never Android. */
     bool has_openat2;
+    /* openat with O_NOFOLLOW_ANY, which refuses a symlink at any depth of the path: Apple platforms, by the SDK. */
+    bool has_openat_nofollow_any;
     /* renameatx_np(RENAME_EXCL) on Apple platforms; renameat2(RENAME_NOREPLACE) on Linux. */
     bool has_rename_no_replace;
     /* clonefileat and fclonefileat on Apple platforms; FICLONE on Linux, where the answer is per volume: the ioctl
@@ -44,13 +46,20 @@ typedef struct bc_file_system_platform_fast_paths {
 /* Probes every fast path once. Touches no file; may not fail. */
 bc_file_system_platform_fast_paths bc_file_system_platform_probe_fast_paths(void);
 
+/* Whether a held directory descriptor is a kernel object, so that a component opened against it with
+ * `O_DIRECTORY | O_NOFOLLOW` is contained beneath it: true on Apple platforms and Linux; false on Emscripten,
+ * where a descriptor is a path string the runtime joins names onto, so a held directory goes stale on rename
+ * and a symlink on the way escapes, and the resolution layer answers `unsupported` for every `beneath`
+ * location rather than weaken the guarantee. A fact of the platform, not a probe. */
+bool bc_file_system_platform_enforces_containment(void);
+
 /* ---- The five operations ------------------------------------------------------------------------------------- */
 
 /* Each operation returns 0 or the errno it failed with, so a call reads `const int code = sync_descriptor(…)`.
  * A name is NUL-terminated text, one component, as the system call takes it: the resolver NUL-terminates each
  * component into its own bounded buffer before calling here. A descriptor is borrowed; nothing here closes one
- * it was given. `sync_descriptor` and `rename_no_replace` are real; the other three answer ENOTSUP until the
- * stage that first needs them (the resolution layer, moves and copies) lands, and say so in `platform.c`. */
+ * it was given. `sync_descriptor`, `rename_no_replace` and `open_beneath` are real; the other two answer ENOTSUP
+ * until the stage that first needs them (moves and copies) lands, and say so in `platform.c`. */
 
 /* Pushes one open file or directory to stable storage: fcntl(F_FULLFSYNC) on Apple platforms, where fsync stops
  * at the drive's cache, fsync elsewhere. A volume that offers no sync (EINVAL, ENOTSUP, ENOTTY; every Emscripten
@@ -73,10 +82,15 @@ int bc_file_system_platform_rename_no_replace(int from_directory, const char *fr
                                               const char *to_name);
 
 /* Opens `relative` beneath `root` in one call with containment enforced by the kernel: openat2 with
- * RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS on Linux when the engine's probe found it (never on Android, where
- * seccomp kills the process), O_NOFOLLOW_ANY on Apple. ENOTSUP where there is no such call, so the engine walks
- * the path one component at a time instead. `relative` is the whole relative path, NUL-terminated. Stores the
- * descriptor on success. */
+ * RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS on Linux (the engine calls this only where its probe found openat2,
+ * never on Android, where seccomp kills the process; a kernel answering ENOSYS anyway is ENOTSUP), openat with
+ * O_NOFOLLOW_ANY on Apple, where the flag refuses a symlink at any depth of the path. A symlink on the way is
+ * ELOOP on both; ENOTSUP where there is no such call (Emscripten), so the engine walks the path one component at
+ * a time instead, and the engine also walks on EOPNOTSUPP, ENOSYS and EINVAL, which is how a test forces the
+ * walk by scripting one of them on the fast path's step. `relative` is the whole relative path, NUL-terminated,
+ * never absolute: O_NOFOLLOW_ANY refuses an absolute path at the first system symlink (`/var` on macOS), and
+ * RESOLVE_BENEATH refuses it outright. `open_flags` are the engine's directory flags. Stores the descriptor on
+ * success. Retries on EINTR. */
 int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor);
 
 /* Copies up to `count` bytes from the current offset of `source` to the current offset of `destination` inside

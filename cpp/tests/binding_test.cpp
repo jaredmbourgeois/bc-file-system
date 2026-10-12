@@ -204,9 +204,17 @@ private:
     std::optional<FileSystem> files_;
 };
 
+// The one operation that is real: the handle comes back, and `Directory::opened_as` reads the text the core
+// remembers, which is the binding of `bc_file_system_directory_opened_as`.
 TEST_F(BindingTest, OpenDirectoryReachesC) {
-    expect_unsupported(files().open_directory(in("folder"), FinalSymlink::refuse), Operation::open_directory,
-                       path_text_of("folder"));
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+
+    const Result<Directory> directory = files().open_directory(in("folder"), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    const Result<std::string> opened_as = directory->opened_as();
+    ASSERT_TRUE(opened_as.has_value()) << opened_as.error().message();
+    EXPECT_EQ(*opened_as, path_text_of("folder"));
 }
 
 TEST_F(BindingTest, StatusReachesC) {
@@ -321,8 +329,8 @@ TEST_F(BindingTest, AddFaultClearFaultsAndStepCountReachC) {
     EXPECT_EQ(*counted, 0U);
 }
 
-// `Directory::opened_as` is the one call this stage cannot make: nothing creates a Directory until
-// `open_directory` lands at stage 13, so its binding case lives in the contract suite's open_directory cases.
+// `Directory::opened_as` is bound by `OpenDirectoryReachesC` above; the `beneath` composition of the remembered
+// text is the contract suite's.
 
 // -------------------------------------------------------------------------------------------------------------
 // The face's compositions
@@ -486,7 +494,7 @@ TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
 }
 
 TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
-    const std::array<std::string_view, 23> names = {"open",
+    const std::array<std::string_view, 25> names = {"open",
                                                     "openat",
                                                     "fstat",
                                                     "fstatat",
@@ -508,7 +516,9 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
                                                     "copy_range",
                                                     "clone_file",
                                                     "close",
-                                                    "identity_check"};
+                                                    "identity_check",
+                                                    "openat2",
+                                                    "openat_nofollow_any"};
 
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto value = static_cast<std::int32_t>(index + 1);
@@ -518,7 +528,7 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
         EXPECT_EQ(name_of(*step), names[index]);
     }
     EXPECT_FALSE(bc::file_system::step_from(0).has_value());
-    EXPECT_FALSE(bc::file_system::step_from(24).has_value());
+    EXPECT_FALSE(bc::file_system::step_from(26).has_value());
 }
 
 // The small enums, each enumerator against the header's constant.
@@ -789,8 +799,7 @@ TEST(AbiRoundTripTest, ALocationCrossesAsItsKindAndItsBorrowedBytes) {
     EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(c_location.path), c_location.length), "/etc/config.toml");
 }
 
-// A `beneath` location needs an open Directory, which nothing creates until stage 13; its round trip is the
-// contract suite's open_directory cases'.
+// A `beneath` location's round trip through the core is the contract suite's open_directory cases'.
 
 // -------------------------------------------------------------------------------------------------------------
 // Result, the face's outcome type
