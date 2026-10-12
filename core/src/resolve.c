@@ -219,6 +219,23 @@ int32_t bc_file_system_resolve_expect_entry(bc_file_system_engine *engine, int32
     return 0;
 }
 
+/* The search permission a platform's search-only open did not check: `faccessat(opened, ".", X_OK)` as its own
+ * step, so a directory the process may not search answers permission_denied on every platform at the same point,
+ * the open. A platform whose open checks it makes no call. */
+static int32_t verify_search_permission(bc_file_system_engine *engine, int32_t operation, int opened,
+                                        bc_file_system_error *error) {
+    if (bc_file_system_platform_search_open_checks_permission()) {
+        return 0;
+    }
+    const bc_file_system_call_outcome outcome = bc_file_system_call_faccessat(
+        engine, operation, opened, ".", X_OK, bc_file_system_platform_access_check_flags());
+    if (outcome.succeeded) {
+        return 0;
+    }
+    return report_outcome(error, operation, bc_file_system_step_faccessat, &outcome,
+                          bc_file_system_call_kind_of_errno(outcome.code));
+}
+
 int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *engine, int32_t operation, int parent,
                                                        const char *name, int32_t final_symlink, int32_t access,
                                                        const bc_file_system_expected_entry *expected,
@@ -244,6 +261,12 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
     const int32_t kind = verify_opened_identity(engine, operation, candidate.value, expected, error);
     if (kind != 0) {
         return kind;
+    }
+    if (access == bc_file_system_directory_access_search) {
+        const int32_t permission = verify_search_permission(engine, operation, candidate.value, error);
+        if (permission != 0) {
+            return permission;
+        }
     }
     opened->value = release_descriptor(&candidate);
     return 0;

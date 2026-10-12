@@ -190,7 +190,10 @@ typedef enum bc_file_system_step {
     bc_file_system_step_openat_nofollow_any = 25,
     /* fchmodat: the mode set by name under a held directory (with AT_SYMLINK_NOFOLLOW where the entry itself,
      * never what a symlink points at, is meant), as opposed to `fchmod` on an open descriptor. */
-    bc_file_system_step_fchmodat = 26
+    bc_file_system_step_fchmodat = 26,
+    /* faccessat(X_OK) on a directory the platform's search-only open did not check (Linux's O_PATH skips the
+     * permission check): the step that answers permission_denied where Apple's O_SEARCH open answers it itself. */
+    bc_file_system_step_faccessat = 27
 } bc_file_system_step;
 
 /* What to do when the last component of a path is a symlink. */

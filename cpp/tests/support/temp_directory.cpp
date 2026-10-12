@@ -125,6 +125,20 @@ auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> voi
     set_mode_raw(path, mode);
 }
 
+auto make_hard_link_raw(const std::filesystem::path& existing, const std::filesystem::path& link) -> void {
+    if (::link(existing.c_str(), link.c_str()) != 0) {
+        ADD_FAILURE() << "link " << link << " = " << existing << ": " << std::strerror(errno);
+    }
+}
+
+auto is_symlink_raw(const std::filesystem::path& path) -> bool {
+    struct stat info{};
+    if (::lstat(path.c_str(), &info) != 0) {
+        return false;
+    }
+    return S_ISLNK(info.st_mode);
+}
+
 auto make_deep_chain_raw(const std::filesystem::path& root, std::uint32_t depth, std::string_view name) -> void {
     const std::string component(name);
     // One descriptor rolls down the chain: each level is made and opened beneath the one above, and the one

@@ -360,8 +360,7 @@ TEST_F(ObserverTest, AScriptNamesOneOperationAndOneStep) {
 
 // The scenario the observer exists for: code that stages a file and renames it into place is shown a rename
 // that fails after the staged file was written, and the test reads what that code left behind.
-// stage 16 moves-and-copies-in-c
-TEST_F(ObserverTest, DISABLED_ARenameCanFailAfterTheStagedFileWasWritten) {
+TEST_F(ObserverTest, ARenameCanFailAfterTheStagedFileWasWritten) {
     bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
     const auto bytes = bytes_of("the new content");
     script(fail_step(Operation::rename, Step::renameat, 1, EIO));
@@ -376,8 +375,7 @@ TEST_F(ObserverTest, DISABLED_ARenameCanFailAfterTheStagedFileWasWritten) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("staged")), "the new content");
 }
 
-// stage 16 moves-and-copies-in-c
-TEST_F(ObserverTest, DISABLED_RenameAndCopyErrorsNameTheirDestination) {
+TEST_F(ObserverTest, RenameAndCopyErrorsNameTheirDestination) {
     bc::file_system_test::write_raw(path_of("source"), "content", 0644);
     script(fail_step(Operation::copy_file, Step::openat, 1, ENOSPC));
     script(fail_step(Operation::rename, Step::renameat, 1, EACCES));
@@ -396,8 +394,7 @@ TEST_F(ObserverTest, DISABLED_RenameAndCopyErrorsNameTheirDestination) {
 
 // Every step is counted across the engine's lifetime, whether the operation succeeded, failed for real or
 // failed by script.
-// stage 16 moves-and-copies-in-c
-TEST_F(ObserverTest, DISABLED_EveryStepIsCountedAcrossTheEnginesLifetime) {
+TEST_F(ObserverTest, EveryStepIsCountedAcrossTheEnginesLifetime) {
     const auto bytes = bytes_of("content");
     script(fail_step(Operation::remove_file, Step::unlinkat, 1, EACCES));
 

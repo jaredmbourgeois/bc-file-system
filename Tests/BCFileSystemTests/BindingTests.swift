@@ -188,21 +188,50 @@ struct BindingTests {
         #expect(try observed.root.rawMode(of: "parent/" + String(decoding: name, as: UTF8.self)) == 0o700)
     }
 
-    /// A rename's error names the destination (the face's convention for the two-location operations).
-    @Test func renameReachesCAndNamesTheDestination() throws {
+    /// A rename is real, and the error of a two-location operation names the destination (the face's convention
+    /// for both of them, whichever end the failing step acted on).
+    @Test func renameReachesCAndItsErrorNamesTheDestination() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.rename, path: observed.root.absolutePath(of: "to")) { () throws(FileSystemError) in
-            try observed.fileSystem.rename(
+        try observed.root.rawWrite("content", to: "from", mode: 0o644)
+
+        let achieved = try observed.fileSystem.rename(
+            from: try observed.location("from"), to: try observed.location("to"), existingDestination: .replace,
+            durability: .written)
+
+        #expect(achieved == .written)
+        #expect(try observed.root.rawRead("to") == "content")
+        #expect(observed.root.rawExists("from") == false)
+        do {
+            _ = try observed.fileSystem.rename(
                 from: try observed.location("from"), to: try observed.location("to"), existingDestination: .replace,
                 durability: .written)
+            Issue.record("expected not_found from a rename of nothing")
+        } catch {
+            #expect(error.kind == .notFound)
+            #expect(error.operation == .rename)
+            #expect(error.path == observed.root.absolutePath(of: "to"))
         }
     }
 
-    @Test func copyFileReachesCAndNamesTheDestination() throws {
+    @Test func copyFileReachesCAndItsErrorNamesTheDestination() throws {
         let observed = try observedFileSystem()
-        expectUnsupported(.copyFile, path: observed.root.absolutePath(of: "to")) { () throws(FileSystemError) in
-            try observed.fileSystem.copyFile(
-                from: try observed.location("from"), to: try observed.location("to"), options: Self.writtenExactly0644)
+        try observed.root.rawWrite("content", to: "from", mode: 0o644)
+
+        let achieved = try observed.fileSystem.copyFile(
+            from: try observed.location("from"), to: try observed.location("to"), options: Self.writtenExactly0644)
+
+        #expect(achieved == .written)
+        #expect(try observed.root.rawRead("to") == "content")
+        #expect(try observed.root.rawRead("from") == "content")
+        do {
+            _ = try observed.fileSystem.copyFile(
+                from: try observed.location("absent"), to: try observed.location("to"),
+                options: Self.writtenExactly0644)
+            Issue.record("expected not_found from a copy of nothing")
+        } catch {
+            #expect(error.kind == .notFound)
+            #expect(error.operation == .copyFile)
+            #expect(error.path == observed.root.absolutePath(of: "to"))
         }
     }
 
@@ -430,14 +459,15 @@ struct BindingTests {
             (bc_file_system_step_openat2, .openat2),
             (bc_file_system_step_openat_nofollow_any, .openatNofollowAny),
             (bc_file_system_step_fchmodat, .fchmodat),
+            (bc_file_system_step_faccessat, .faccessat),
         ]
         for (core, step) in pairs {
             #expect(Step(rawValue: Int32(core.rawValue)) == step)
         }
         #expect(Step.allCases.count == pairs.count)
-        #expect(Step.allCases.count == Int(bc_file_system_step_fchmodat.rawValue))
+        #expect(Step.allCases.count == Int(bc_file_system_step_faccessat.rawValue))
         #expect(Step(rawValue: 0) == nil)
-        #expect(Step(rawValue: 27) == nil)
+        #expect(Step(rawValue: 28) == nil)
     }
 
     @Test func everySmallEnumIsPinnedToTheHeader() {

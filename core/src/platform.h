@@ -64,23 +64,35 @@ bool bc_file_system_platform_enforces_containment(void);
  * a probe. */
 int bc_file_system_platform_directory_search_open_flags(void);
 
+/* Whether the search-only open above refuses a directory the process may not search (Apple's O_SEARCH and a
+ * read-only open do; Linux's O_PATH checks nothing), so the resolver knows whether to ask `faccessat(X_OK)` as a
+ * step of its own after the open. A fact of the platform. */
+bool bc_file_system_platform_search_open_checks_permission(void);
+
+/* The flags `faccessat` takes to judge by the effective ids: AT_EACCESS, or 0 on bionic, which refuses the flag. */
+int bc_file_system_platform_access_check_flags(void);
+
 /* ---- The five operations ------------------------------------------------------------------------------------- */
 
 /* Each operation returns 0 or the errno it failed with, so a call reads `const int code = sync_descriptor(…)`.
  * A name is NUL-terminated text, one component, as the system call takes it: the resolver NUL-terminates each
  * component into its own bounded buffer before calling here. A descriptor is borrowed; nothing here closes one
- * it was given. `sync_descriptor`, `rename_no_replace` and `open_beneath` are real; the other two answer ENOTSUP
- * until the stage that first needs them (moves and copies) lands, and say so in `platform.c`. */
+ * it was given. All five are real; where a platform has no body for one, that body answers ENOTSUP and says so
+ * in `platform.c`. */
 
 /* Pushes one open file or directory to stable storage: fcntl(F_FULLFSYNC) on Apple platforms, where fsync stops
  * at the drive's cache, fsync elsewhere. A volume that offers no sync (EINVAL, ENOTSUP, ENOTTY; every Emscripten
  * backend) answers ENOTSUP so the engine reports `written`. Retries on EINTR. */
 int bc_file_system_platform_sync_descriptor(int descriptor);
 
-/* Makes `destination_name` under `destination_directory` a clone of the open `source` with `mode`, where the
- * platform clones (clonefileat and fclonefileat on Apple, FICLONE on Linux): never replaces an existing entry
- * (EEXIST), answers EXDEV across volumes and ENOTSUP where there is no clone, so the engine falls to the copy
- * loop in both cases. */
+/* Makes `destination_name` under `destination_directory` a clone of the open regular file `source`, in one step
+ * that either creates the whole file or creates nothing: fclonefileat on Apple platforms, which creates the file
+ * itself with the source's permission bits (`mode` is not read there); FICLONE on Linux, which takes an open
+ * destination, so the body creates it exclusively with `mode` as the umask leaves it and takes it back when the
+ * ioctl refuses. The engine sets the mode exactly afterwards either way. Never replaces an existing entry
+ * (EEXIST, so the engine tries another name); answers EXDEV across volumes and ENOTSUP, EOPNOTSUPP or ENOTTY
+ * where the volume or the platform has no clone (Emscripten; a non-APFS volume; an ext4 without reflinks), on
+ * which the engine falls to the copy loop. */
 int bc_file_system_platform_clone_file(int source, int destination_directory, const char *destination_name,
                                        uint32_t mode);
 
@@ -105,6 +117,9 @@ int bc_file_system_platform_rename_no_replace(int from_directory, const char *fr
 int bc_file_system_platform_open_beneath(int root, const char *relative, int open_flags, int *descriptor);
 
 /* Copies up to `count` bytes from the current offset of `source` to the current offset of `destination` inside
- * the kernel (copy_file_range) where the platform offers it; ENOTSUP otherwise, so the engine runs the read-and-
- * write loop. Stores how many bytes were copied, which may be fewer than `count`. */
+ * the kernel, advancing both offsets (the copy_file_range system call on Linux, through syscall(2) so one body
+ * serves glibc, musl and bionic); ENOTSUP where the platform has no such call (Apple platforms, Emscripten, a
+ * Linux kernel answering ENOSYS) and EXDEV or EINVAL where the kernel refuses these two files, on all of which
+ * the engine runs the read-and-write loop from the offset reached. Stores how many bytes were copied, which may
+ * be fewer than `count`; 0 means the source ended. Retries on EINTR. */
 int bc_file_system_platform_copy_range(int source, int destination, size_t count, size_t *copied);

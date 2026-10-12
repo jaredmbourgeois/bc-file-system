@@ -276,11 +276,13 @@ pub enum Step {
     OpenatNofollowAny = 25,
     /// `fchmodat`: the mode set by name under a held directory (`AT_SYMLINK_NOFOLLOW` for the entry itself).
     Fchmodat = 26,
+    /// `faccessat(X_OK)`: the search-permission check after a search-only open that checked nothing (Linux's `O_PATH`).
+    Faccessat = 27,
 }
 
 impl Step {
     /// Every step, in the header's order.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Open,
         Self::Openat,
         Self::Fstat,
@@ -307,6 +309,7 @@ impl Step {
         Self::Openat2,
         Self::OpenatNofollowAny,
         Self::Fchmodat,
+        Self::Faccessat,
     ];
 
     /// The step's name as the header spells it.
@@ -339,6 +342,7 @@ impl Step {
             Self::Openat2 => "openat2",
             Self::OpenatNofollowAny => "openat_nofollow_any",
             Self::Fchmodat => "fchmodat",
+            Self::Faccessat => "faccessat",
         }
     }
 }

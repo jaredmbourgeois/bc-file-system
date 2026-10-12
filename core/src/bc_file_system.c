@@ -7,9 +7,11 @@
  * Where the library stands: the handles, the platform probes, the observer and the resolution layer are real,
  * and so are the operations that read (`bc_file_system_directory_open`, `bc_file_system_status_of`,
  * `bc_file_system_read_file`), the ones that write (`bc_file_system_write_file`, staged and renamed into
- * place; `bc_file_system_append`; `bc_file_system_sync`) and the ones on directories (`create_directory`,
+ * place; `bc_file_system_append`; `bc_file_system_sync`), the ones on directories (`create_directory`,
  * `create_directories`, `list_directory`, `remove_file`, `remove_directory`, `remove_tree` on held descriptors
- * with a bounded window, `create_temporary_directory`, `set_permissions`); every other operation is an honest
+ * with a bounded window, `create_temporary_directory`, `set_permissions`) and the ones that move and copy
+ * (`bc_file_system_rename` in one step, `bc_file_system_copy_file` staged like a write, by the platform's clone
+ * or in-kernel copy where it has one and the read-and-write loop otherwise); every other operation is an honest
  * stub. Each one validates its arguments exactly as the header promises (a contract violation is
  * `invalid_argument` and touches nothing) and announces itself to the observer; a stub then answers
  * `unsupported` with the operation named and the step zero, so every contract case is red for a stated reason
@@ -91,6 +93,11 @@ enum : uint32_t {
     /* The most one pread or write asks for: a count past SSIZE_MAX is implementation-defined, and macOS caps a
      * single transfer at INT_MAX, so a large file is read or written in bounded pieces. */
     largest_single_transfer = UINT32_C(1) << 30,
+    /* The scratch a copy that neither clones nor copies in the kernel moves the bytes through: one bounded
+     * allocation of 1 MiB per copy, so each piece is at most this much, under the largest single transfer, and
+     * the stack carries none of it (Emscripten's is 64 KiB). The size is a trade between system calls per file
+     * and memory per copy; nothing observable depends on it. */
+    copy_piece_capacity = UINT32_C(1) << 20,
     /* How many names a staged write tries before giving up: a name is taken only by a leftover of a process
      * that died with the same id, so the next token almost always frees it, and the bound keeps a directory
      * full of leftovers from becoming an endless loop. */
@@ -128,6 +135,9 @@ enum : int32_t {
     file_read_flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK,
     /* How a staged file is created: new, or the name is taken (O_EXCL); never through a symlink. */
     staged_create_flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+    /* How a staged file the platform's clone created is opened to be given its mode, synced and closed like one
+     * the engine created itself: for writing, never through a symlink. */
+    staged_reopen_flags = O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
     /* How an append creates a file, and how it opens one that exists: at the end, never through a symlink (a
      * link answers ELOOP), and never blocking on the open, which a FIFO with no reader would do forever. */
     append_create_flags = O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
@@ -143,7 +153,7 @@ enum : int32_t {
  * enum in the header runs from 1 to its last value without a gap. */
 enum : int32_t {
     operation_last = bc_file_system_operation_path_library_name,
-    step_last = bc_file_system_step_fchmodat,
+    step_last = bc_file_system_step_faccessat,
     final_symlink_last = bc_file_system_final_symlink_follow,
     existing_destination_last = bc_file_system_existing_destination_refuse,
     read_limit_kind_last = bc_file_system_read_limit_kind_at_most,
@@ -983,10 +993,13 @@ static int32_t sync_directory_after_change(bc_file_system_engine *engine, int32_
 
 /* ---- write_file ---------------------------------------------------------------------------------------------- */
 
-/* What the write found at its destination before staging anything: nothing, or a regular file with its mode. */
+/* What a staged write found at its destination before staging anything: nothing, or a regular file with its
+ * mode and its identity (which a copy holds against its source's). */
 typedef struct destination_entry {
     bool present;
     uint32_t mode;
+    uint64_t device; /* st_dev, as a bit pattern */
+    uint64_t inode;  /* st_ino */
 } destination_entry;
 
 /* The absolute text of `location`, as the face composes it: the path for `at`; the held directory's remembered
@@ -1101,14 +1114,17 @@ static int32_t judge_destination(bc_file_system_engine *engine, int32_t operatio
             engine, operation, resolved->parent, (const char *)resolved->leaf, AT_SYMLINK_NOFOLLOW, &info);
         if (!outcome.succeeded) {
             if (!outcome.stopped && outcome.code == ENOENT) {
-                *existing = (destination_entry){.present = false, .mode = 0};
+                *existing = (destination_entry){.present = false, .mode = 0, .device = 0, .inode = 0};
                 return 0;
             }
             return report_outcome(error, operation, bc_file_system_step_fstatat, &outcome,
                                   bc_file_system_call_kind_of_errno(outcome.code));
         }
         if (S_ISREG(info.st_mode)) {
-            *existing = (destination_entry){.present = true, .mode = (uint32_t)info.st_mode & permission_bits};
+            *existing = (destination_entry){.present = true,
+                                            .mode = (uint32_t)info.st_mode & permission_bits,
+                                            .device = (uint64_t)info.st_dev,
+                                            .inode = (uint64_t)info.st_ino};
             return 0;
         }
         if (!S_ISLNK(info.st_mode)) {
@@ -1174,6 +1190,38 @@ static int32_t rename_into_place(bc_file_system_engine *engine, int32_t operatio
     return 0;
 }
 
+/* The end of every staged write, once the bytes are in the staged file: its mode set exactly (whatever the
+ * umask or a clone left on it), then, when durable, its sync and its close as reported steps, then the rename
+ * into place under the caller's choice about an existing destination, then the directory's sync, which lowers the
+ * answer and never fails it. `*achieved` starts as the durability asked for and is lowered where a sync is not
+ * offered or fails after the change. */
+static int32_t place_staged_file(bc_file_system_engine *engine, int32_t operation, staged_file *staged,
+                                 const uint8_t *leaf, uint32_t mode, const bc_file_system_write_options *options,
+                                 int32_t *achieved, bc_file_system_error *error) {
+    const bc_file_system_call_outcome mode_set =
+        bc_file_system_call_fchmod(engine, operation, staged->descriptor.value, mode);
+    if (!mode_set.succeeded) {
+        return report_staged_outcome(staged, error, operation, bc_file_system_step_fchmod, &mode_set,
+                                     bc_file_system_call_kind_of_errno(mode_set.code));
+    }
+    int32_t kind = 0;
+    if (*achieved == bc_file_system_durability_durable) {
+        kind = settle_staged_file(engine, operation, staged, achieved, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    kind = rename_into_place(engine, operation, staged, leaf, options->existing_destination, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The directory's sync makes the new name itself durable; the staged file's parent is the directory. */
+    if (*achieved == bc_file_system_durability_durable) {
+        return sync_directory_after_change(engine, operation, staged->parent, achieved, error);
+    }
+    return 0;
+}
+
 int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_system_location *location,
                                   const uint8_t *bytes, size_t byte_count, const bc_file_system_write_options *options,
                                   int32_t *durability_achieved, bc_file_system_error *error) {
@@ -1214,30 +1262,10 @@ int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_s
     if (kind != 0) {
         return kind;
     }
-    /* The mode is set exactly, whatever the umask left on the staged file. */
-    const bc_file_system_call_outcome mode_set =
-        bc_file_system_call_fchmod(engine, operation, staged.descriptor.value, mode);
-    if (!mode_set.succeeded) {
-        return report_staged_outcome(&staged, error, operation, bc_file_system_step_fchmod, &mode_set,
-                                     bc_file_system_call_kind_of_errno(mode_set.code));
-    }
     int32_t achieved = options->durability;
-    if (achieved == bc_file_system_durability_durable) {
-        kind = settle_staged_file(engine, operation, &staged, &achieved, error);
-        if (kind != 0) {
-            return kind;
-        }
-    }
-    kind = rename_into_place(engine, operation, &staged, resolved.leaf, options->existing_destination, error);
+    kind = place_staged_file(engine, operation, &staged, resolved.leaf, mode, options, &achieved, error);
     if (kind != 0) {
         return kind;
-    }
-    /* The directory's sync makes the new name itself durable; the parent the walk holds is the directory. */
-    if (achieved == bc_file_system_durability_durable) {
-        kind = sync_directory_after_change(engine, operation, resolved.parent, &achieved, error);
-        if (kind != 0) {
-            return kind;
-        }
     }
     *durability_achieved = achieved;
     return succeed(error);
@@ -2570,12 +2598,95 @@ int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_f
     return succeed(error);
 }
 
-/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+/* ---- Moves and copies ---------------------------------------------------------------------------------------- */
 
-/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
- * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
- * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
- * names. */
+/* The two operations below take two locations. Their error names no entry, and the faces compose its path from
+ * the destination, the location every two-location operation of the faces reports against (the C++ and Swift
+ * binding suites pin it); the kind and the step say what happened, and a missing source is `not_found` at the
+ * source's own stat, before any other call. Which of the two locations a failure belongs to has no field in the
+ * error struct, and a convention smuggled through `name` would mislead a C consumer reading the header's words
+ * for it, so the destination stays the one answer until the header gains a field for the other. */
+
+/* ---- rename -------------------------------------------------------------------------------------------------- */
+
+/* The kind a refused rename decides, beyond the one table. Under `replace`: a directory destination that is not
+ * empty is `directory_not_empty` (ENOTEMPTY, or EEXIST where the system spells it so), and EINVAL, which renameat
+ * answers only for a source that is an ancestor of its destination, is `invalid_argument` with the code kept,
+ * since the arguments themselves are refused and nothing was touched. Under `refuse`: EEXIST is the table's
+ * `already_exists` with the destination untouched, and EINVAL is `unsupported` with the code kept, because a
+ * Linux file system without RENAME_NOREPLACE and the ancestor case answer the same EINVAL, which cannot be told
+ * apart without a second call, and refusing is the honest answer for the one the library cannot rule out. */
+static int32_t kind_of_rename_failure(int code, int32_t existing_destination) {
+    if (existing_destination == bc_file_system_existing_destination_replace) {
+        if (code == ENOTEMPTY) {
+            return bc_file_system_error_kind_directory_not_empty;
+        }
+        if (code == EEXIST) {
+            return bc_file_system_error_kind_directory_not_empty;
+        }
+        if (code == EINVAL) {
+            return bc_file_system_error_kind_invalid_argument;
+        }
+        return bc_file_system_call_kind_of_errno(code);
+    }
+    if (code == EINVAL) {
+        return bc_file_system_error_kind_unsupported;
+    }
+    return bc_file_system_call_kind_of_errno(code);
+}
+
+/* Whether two open directories are one directory, by identity (`st_dev` and `st_ino`, read with fstat on each
+ * unless they are one descriptor already): how a durable rename knows whether its two parents take one sync or
+ * two. Asked before the rename, so a failure is an error with nothing changed. */
+static int32_t same_directory(bc_file_system_engine *engine, int32_t operation, int first, int second, bool *same,
+                              bc_file_system_error *error) {
+    if (first == second) {
+        *same = true;
+        return 0;
+    }
+    struct stat first_info;
+    const bc_file_system_call_outcome first_read = bc_file_system_call_fstat(engine, operation, first, &first_info);
+    if (!first_read.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &first_read,
+                              bc_file_system_call_kind_of_errno(first_read.code));
+    }
+    struct stat second_info;
+    const bc_file_system_call_outcome second_read = bc_file_system_call_fstat(engine, operation, second, &second_info);
+    if (!second_read.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &second_read,
+                              bc_file_system_call_kind_of_errno(second_read.code));
+    }
+    if ((uint64_t)first_info.st_dev != (uint64_t)second_info.st_dev) {
+        *same = false;
+        return 0;
+    }
+    *same = (uint64_t)first_info.st_ino == (uint64_t)second_info.st_ino;
+    return 0;
+}
+
+/* The one step that moves the entry: renameat under `replace` (a file replaces a file, a directory an empty
+ * directory), the platform's no-replace rename under `refuse`. EXDEV is the table's `cross_device`: the header
+ * promises one step, so a rename across devices is refused, never copied and deleted. */
+static int32_t move_entry(bc_file_system_engine *engine, int32_t operation, const bc_file_system_resolved *source,
+                          const bc_file_system_resolved *destination, int32_t existing_destination,
+                          bc_file_system_error *error) {
+    const char *from = (const char *)source->leaf;
+    const char *to = (const char *)destination->leaf;
+    int32_t step = bc_file_system_step_renameat;
+    bc_file_system_call_outcome outcome;
+    if (existing_destination == bc_file_system_existing_destination_replace) {
+        outcome = bc_file_system_call_renameat(engine, operation, source->parent, from, destination->parent, to);
+    } else {
+        step = bc_file_system_step_rename_no_replace;
+        outcome =
+            bc_file_system_call_rename_no_replace(engine, operation, source->parent, from, destination->parent, to);
+    }
+    if (!outcome.succeeded) {
+        return report_outcome(error, operation, step, &outcome,
+                              kind_of_rename_failure(outcome.code, existing_destination));
+    }
+    return 0;
+}
 
 int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_system_location *source,
                               const bc_file_system_location *destination, int32_t existing_destination,
@@ -2590,7 +2701,246 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 16 moves-and-copies-in-c */
+
+    /* Both locations resolve first, the source then the destination, so both parents are held before anything
+     * moves. The root of the file system is neither moved nor replaced. */
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
+    if (kind != 0) {
+        return kind;
+    }
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved to = bc_file_system_resolved_empty();
+    kind = bc_file_system_resolve(engine, operation, destination, &to, error);
+    if (kind != 0) {
+        return kind;
+    }
+    if (from.leaf_length == 0 || to.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    /* The source is looked at first, never followed (a symlink is moved as itself): a source that is not there
+     * is `not_found` at its own stat, with nothing else asked. The look decides nothing about what is moved; the
+     * rename is the one step, and a source that vanished in between is the same `not_found` from it. */
+    struct stat source_info;
+    const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
+        engine, operation, from.parent, (const char *)from.leaf, AT_SYMLINK_NOFOLLOW, &source_info);
+    if (!looked.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
+                              bc_file_system_call_kind_of_errno(looked.code));
+    }
+    bool one_directory = true;
+    if (durability == bc_file_system_durability_durable) {
+        kind = same_directory(engine, operation, to.parent, from.parent, &one_directory, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    kind = move_entry(engine, operation, &from, &to, existing_destination, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The name has moved: from here every failure lowers the answer. The destination's directory holds the new
+     * name and is synced first; the source's held the old one and is synced too when it is another directory,
+     * unless the first sync already lowered the answer, which decides it. */
+    int32_t achieved = durability;
+    if (achieved == bc_file_system_durability_durable) {
+        kind = sync_directory_after_change(engine, operation, to.parent, &achieved, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    if (achieved == bc_file_system_durability_durable && !one_directory) {
+        kind = sync_directory_after_change(engine, operation, from.parent, &achieved, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    *durability_achieved = achieved;
+    return succeed(error);
+}
+
+/* ---- copy_file ----------------------------------------------------------------------------------------------- */
+
+/* The errnos with which a fast copy path (the platform's clone, its in-kernel copy) says "not these two files,
+ * not on this volume, not here": the platform's own ENOTSUP, the kernel's EOPNOTSUPP or ENOTTY for a volume
+ * without reflinks, EXDEV across volumes, EINVAL for a file the call will not take, and ENOSYS where a script
+ * spells a missing call. Each makes the operation move the bytes the next way down. An if-chain because ENOTSUP
+ * and EOPNOTSUPP are one number on Linux. */
+static bool means_no_fast_copy(int code) {
+    if (code == ENOTSUP) {
+        return true;
+    }
+    if (code == EOPNOTSUPP) {
+        return true;
+    }
+    if (code == ENOTTY) {
+        return true;
+    }
+    if (code == ENOSYS) {
+        return true;
+    }
+    if (code == EXDEV) {
+        return true;
+    }
+    return code == EINVAL;
+}
+
+/* Opens the source to be read and judges it by its descriptor, as a read does: never followed under `refuse` (a
+ * symlink answers ELOOP, the table's `symlink_refused`), followed to the file it names under `follow`; anything
+ * that is not a regular file is `not_regular_file` with no step, the root included, since it has no leaf. */
+static int32_t open_source_file(bc_file_system_engine *engine, int32_t operation, const bc_file_system_resolved *source,
+                                int32_t final_symlink, owned_descriptor *file, struct stat *info,
+                                bc_file_system_error *error) {
+    if (source->leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_not_regular_file, operation);
+    }
+    const int flags =
+        final_symlink == bc_file_system_final_symlink_refuse ? file_read_flags | O_NOFOLLOW : file_read_flags;
+    const bc_file_system_call_outcome opened =
+        bc_file_system_call_openat(engine, operation, source->parent, (const char *)source->leaf, flags, &file->value);
+    if (!opened.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_openat, &opened,
+                              bc_file_system_call_kind_of_errno(opened.code));
+    }
+    const bc_file_system_call_outcome measured = bc_file_system_call_fstat(engine, operation, file->value, info);
+    if (!measured.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_fstat, &measured,
+                              bc_file_system_call_kind_of_errno(measured.code));
+    }
+    if (!S_ISREG(info->st_mode)) {
+        return refuse(error, bc_file_system_error_kind_not_regular_file, operation);
+    }
+    return 0;
+}
+
+/* The platform's clone makes the staged file whole in one step, under a name of this process's own like a
+ * staged write's; the clone, not an exclusive create, is what claims the name, so a name that is taken (EEXIST)
+ * is tried again with the next token, a bounded number of times. A platform or volume that will not clone these
+ * two answers that nothing was made (`*cloned` false), and the operation copies the bytes itself. */
+static int32_t stage_copy_by_clone(bc_file_system_engine *engine, int32_t operation, staged_file *staged, int source,
+                                   const uint8_t *leaf, size_t leaf_length, bool *cloned, bc_file_system_error *error) {
+    for (uint32_t attempt = 0; attempt < staging_attempts; ++attempt) {
+        const uint64_t token =
+            atomic_fetch_add_explicit(&engine->staging_counter, (uint64_t)1, memory_order_relaxed) + 1;
+        spell_staged_name(staged->name, leaf, leaf_length, engine->process_id, token);
+        const bc_file_system_call_outcome outcome = bc_file_system_call_clone_file(
+            engine, operation, source, staged->parent, (const char *)staged->name, staged_file_mode);
+        if (outcome.succeeded) {
+            staged->created = true;
+            *cloned = true;
+            return 0;
+        }
+        if (!outcome.stopped && outcome.code == EEXIST) {
+            continue;
+        }
+        if (!outcome.stopped && means_no_fast_copy(outcome.code)) {
+            *cloned = false;
+            return 0;
+        }
+        return report_staged_outcome(staged, error, operation, bc_file_system_step_clone_file, &outcome,
+                                     bc_file_system_call_kind_of_errno(outcome.code));
+    }
+    /* Every name tried was taken: the system's refusal, not the destination's existence. */
+    const bc_file_system_call_outcome taken = {.succeeded = false, .code = EEXIST, .stopped = false};
+    return report_outcome(error, operation, bc_file_system_step_clone_file, &taken,
+                          bc_file_system_error_kind_io_failed);
+}
+
+/* The kernel's own copy, in pieces, until the source ends (`*complete`), or until the kernel answers that it
+ * will not copy these two, in which case `*copied` is how far it got and the read-and-write loop continues from
+ * there: both descriptors' offsets moved with the bytes, so nothing is copied twice or skipped. */
+static int32_t copy_by_copy_range(bc_file_system_engine *engine, int32_t operation, staged_file *staged, int source,
+                                  uint64_t *copied, bool *complete, bc_file_system_error *error) {
+    *copied = 0;
+    for (;;) {
+        size_t piece = 0;
+        const bc_file_system_call_outcome outcome = bc_file_system_call_copy_range(
+            engine, operation, source, staged->descriptor.value, largest_single_transfer, &piece);
+        if (!outcome.succeeded) {
+            if (!outcome.stopped && means_no_fast_copy(outcome.code)) {
+                *complete = false;
+                return 0;
+            }
+            return report_staged_outcome(staged, error, operation, bc_file_system_step_copy_range, &outcome,
+                                         bc_file_system_call_kind_of_errno(outcome.code));
+        }
+        if (piece == 0) {
+            *complete = true;
+            return 0;
+        }
+        *copied += piece;
+    }
+}
+
+/* The portable copy: the source read at the running offset into one bounded scratch buffer and written to the
+ * staged file, whose own offset stands at `offset` already, until the source answers no more bytes. The source's
+ * size is never consulted, so the copy is of the source as it is read, to its end. */
+static int32_t copy_by_loop(bc_file_system_engine *engine, int32_t operation, staged_file *staged, int source,
+                            uint64_t offset, bc_file_system_error *error) {
+    [[gnu::cleanup(free_owned_buffer)]] owned_buffer scratch = {.value = malloc(copy_piece_capacity)};
+    if (scratch.value == nullptr) {
+        return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
+    }
+    uint8_t *bytes = scratch.value;
+    for (;;) {
+        size_t read_count = 0;
+        const bc_file_system_call_outcome read =
+            bc_file_system_call_pread(engine, operation, source, bytes, copy_piece_capacity, offset, &read_count);
+        if (!read.succeeded) {
+            return report_staged_outcome(staged, error, operation, bc_file_system_step_pread, &read,
+                                         bc_file_system_call_kind_of_errno(read.code));
+        }
+        if (read_count == 0) {
+            return 0;
+        }
+        const int32_t written = write_every_byte(engine, operation, staged, bytes, read_count, error);
+        if (written != 0) {
+            return written;
+        }
+        offset += read_count;
+    }
+}
+
+/* Puts the source's bytes into a staged file beside the destination, the fastest way the platform offers for
+ * these two files and the next way down where it refuses: the clone first (one step that makes the whole file,
+ * then opened to be settled like any staged file), else an exclusive create and the kernel's copy, else the same
+ * create and the read-and-write loop. Every way ends with the staged file open on `staged->descriptor`, holding
+ * every byte, and the same steps follow. */
+static int32_t stage_copied_bytes(bc_file_system_engine *engine, int32_t operation, staged_file *staged, int source,
+                                  const uint8_t *leaf, size_t leaf_length, bc_file_system_error *error) {
+    const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
+    if (fast_paths->has_clone) {
+        bool cloned = false;
+        const int32_t kind = stage_copy_by_clone(engine, operation, staged, source, leaf, leaf_length, &cloned, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (cloned) {
+            const bc_file_system_call_outcome opened =
+                bc_file_system_call_openat(engine, operation, staged->parent, (const char *)staged->name,
+                                           staged_reopen_flags, &staged->descriptor.value);
+            if (!opened.succeeded) {
+                return report_staged_outcome(staged, error, operation, bc_file_system_step_openat, &opened,
+                                             bc_file_system_call_kind_of_errno(opened.code));
+            }
+            return 0;
+        }
+    }
+    const int32_t created = create_staged_file(engine, operation, staged, leaf, leaf_length, error);
+    if (created != 0) {
+        return created;
+    }
+    uint64_t copied = 0;
+    if (fast_paths->has_copy_range) {
+        bool complete = false;
+        const int32_t kind = copy_by_copy_range(engine, operation, staged, source, &copied, &complete, error);
+        if (kind != 0) {
+            return kind;
+        }
+        if (complete) {
+            return 0;
+        }
+    }
+    return copy_by_loop(engine, operation, staged, source, copied, error);
 }
 
 int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_system_location *source,
@@ -2606,8 +2956,63 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
-    return refuse(error, bc_file_system_error_kind_unsupported, operation); /* stage 16 moves-and-copies-in-c */
+
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
+    int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
+    if (kind != 0) {
+        return kind;
+    }
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved to = bc_file_system_resolved_empty();
+    kind = bc_file_system_resolve(engine, operation, destination, &to, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The source is open and known to be a regular file before the destination is judged, so a copy of nothing
+     * or of a directory touches nothing at the destination. */
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor file = {.value = -1};
+    struct stat source_info;
+    kind = open_source_file(engine, operation, &from, options->final_symlink, &file, &source_info, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The destination follows every rule of a staged write: a regular file is replaced (its mode kept under
+     * `preserve_or`; the source's mode plays no part), a symlink refused or followed, anything else refused. */
+    destination_entry existing;
+    kind = judge_destination(engine, operation, destination, options->final_symlink, &to, &existing, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* A destination that is the source itself, under either name of the same file (a hard link included), is
+     * refused before anything is staged: there is nothing to copy, and staging would only replace the file with
+     * itself. */
+    if (existing.present && existing.device == (uint64_t)source_info.st_dev &&
+        existing.inode == (uint64_t)source_info.st_ino) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    uint32_t mode = options->permissions.mode;
+    if (options->permissions.policy == bc_file_system_permissions_policy_preserve_or && existing.present) {
+        mode = existing.mode;
+    }
+    [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(to.parent);
+    kind = stage_copied_bytes(engine, operation, &staged, file.value, to.leaf, to.leaf_length, error);
+    if (kind != 0) {
+        return kind;
+    }
+    int32_t achieved = options->durability;
+    kind = place_staged_file(engine, operation, &staged, to.leaf, mode, options, &achieved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    *durability_achieved = achieved;
+    return succeed(error);
 }
+
+/* ---- Operations not built yet ------------------------------------------------------------------------------- */
+
+/* Every operation below checks its contract, announces itself to the observer (the shape every real operation
+ * keeps: validate, `before_operation`, then every system call behind `before_step`) and then answers
+ * `unsupported` with its operation named: the honest stub, replaced group by group by the stage each comment
+ * names. */
 
 int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,
                                       const bc_file_system_location *location, bc_file_system_error *error) {

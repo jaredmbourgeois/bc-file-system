@@ -171,6 +171,8 @@ enum class Step : std::int32_t {
     openat_nofollow_any = 25,
     /// fchmodat: the mode set by name under a held directory (AT_SYMLINK_NOFOLLOW for the entry itself).
     fchmodat = 26,
+    /// faccessat(X_OK): the search-permission check after a search-only open that checked nothing (Linux's O_PATH).
+    faccessat = 27,
 };
 
 static_assert(static_cast<std::int32_t>(Step::open) == bc_file_system_step_open);
@@ -199,6 +201,7 @@ static_assert(static_cast<std::int32_t>(Step::identity_check) == bc_file_system_
 static_assert(static_cast<std::int32_t>(Step::openat2) == bc_file_system_step_openat2);
 static_assert(static_cast<std::int32_t>(Step::openat_nofollow_any) == bc_file_system_step_openat_nofollow_any);
 static_assert(static_cast<std::int32_t>(Step::fchmodat) == bc_file_system_step_fchmodat);
+static_assert(static_cast<std::int32_t>(Step::faccessat) == bc_file_system_step_faccessat);
 
 /// Why an operation failed. A plain value: no inheritance, and no source location, because a library does not
 /// decide its caller's diagnostics. The core reports enums and integers; the face composes `path` from the

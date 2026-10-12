@@ -65,6 +65,12 @@ auto make_symlink_raw(const std::filesystem::path& target, const std::filesystem
 /// Creates a FIFO (a named pipe) with exactly `mode`: an entry that is neither a file nor a directory.
 auto make_fifo_raw(const std::filesystem::path& path, std::uint32_t mode) -> void;
 
+/// Creates `link` as a second name of the file at `existing` (a hard link: one file, two names).
+auto make_hard_link_raw(const std::filesystem::path& existing, const std::filesystem::path& link) -> void;
+
+/// Whether `path` itself is a symlink, whatever it points at.
+[[nodiscard]] auto is_symlink_raw(const std::filesystem::path& path) -> bool;
+
 /// Plants a chain of `depth` directories under `root`, each named `name` inside the one above, with a file
 /// named `name` at the bottom, on held descriptors and never through a path longer than one component: the
 /// chain may be deeper than any path the system takes could spell.

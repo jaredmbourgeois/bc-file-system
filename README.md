@@ -68,5 +68,10 @@ before stored, so an array too small stores nothing), `remove_file`, `remove_dir
 refused by spelling and by identity, a mount point inside the tree refused as `cross_device`),
 `create_temporary_directory` and `set_permissions` are real on every face; and the walk opens every component
 for search only (`O_SEARCH` on Apple platforms, `O_PATH` on Linux), so a directory the process may enter but
-not read is a parent like any other. The remaining operations land in C group by group over the next stages
-(moves and copies, locks and links); `0.1.0` is tagged when every face is green on every platform.
+not read is a parent like any other. Stage 16 `moves-and-copies-in-c` is in: `rename` (one step, `renameat` under
+`replace` and the platform's no-replace rename under `refuse`, both parents held, `cross_device` never a copy and a
+delete, a durable rename syncing both directories) and `copy_file` (staged like a write and atomic at the
+destination; the bytes by the platform's clone where it has one, the kernel's `copy_file_range` next, the
+read-and-write loop otherwise, with the kill-point table holding the destination whole or replaced at every step)
+are real on every face. The remaining operations land in C in the next stage (locks and links); `0.1.0` is tagged
+when every face is green on every platform.

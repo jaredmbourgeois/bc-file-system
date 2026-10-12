@@ -169,10 +169,10 @@ fn every_step_round_trips_through_its_integer() {
     for step in Step::ALL {
         assert_eq!(Step::try_from(step as i32), Ok(step), "{}", step.name());
     }
-    assert_eq!(Step::ALL.len(), 26);
-    assert_eq!(Step::Fchmodat as i32, 26);
+    assert_eq!(Step::ALL.len(), 27);
+    assert_eq!(Step::Faccessat as i32, 27);
     assert!(Step::try_from(0).is_err());
-    assert!(Step::try_from(27).is_err());
+    assert!(Step::try_from(28).is_err());
 }
 
 #[test]

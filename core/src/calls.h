@@ -102,6 +102,11 @@ bc_file_system_call_outcome bc_file_system_call_unlinkat(bc_file_system_engine *
 bc_file_system_call_outcome bc_file_system_call_fchmodat(bc_file_system_engine *engine, int32_t operation, int parent,
                                                          const char *name, uint32_t mode, int flags);
 
+/* `faccessat` of `name` under `directory` for `mode` (X_OK for search), with the platform's effective-id flags:
+ * the search-permission check a platform's search-only open does not make itself. */
+bc_file_system_call_outcome bc_file_system_call_faccessat(bc_file_system_engine *engine, int32_t operation,
+                                                          int directory, const char *name, int mode, int flags);
+
 /* ---- Directories --------------------------------------------------------------------------------------------- */
 
 /* `mkdirat` with `mode` as the umask leaves it, which is why every operation that creates a directory sets the
@@ -117,3 +122,19 @@ bc_file_system_call_outcome bc_file_system_call_fdopendir(bc_file_system_engine 
  * only until the next call on it, so the caller copies `d_name` before asking again. */
 bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *engine, int32_t operation, DIR *stream,
                                                         struct dirent **entry);
+
+/* ---- Copying ------------------------------------------------------------------------------------------------ */
+
+/* The platform's clone (`bc_file_system_platform_clone_file`, step `clone_file`): one step that makes the whole
+ * of `destination_name` under `destination_directory` from the open `source`, or makes nothing. EEXIST means the
+ * name is taken; EXDEV, ENOTSUP, EOPNOTSUPP and ENOTTY mean this volume or platform does not clone these two, and
+ * the operation copies the bytes itself instead. */
+bc_file_system_call_outcome bc_file_system_call_clone_file(bc_file_system_engine *engine, int32_t operation, int source,
+                                                           int destination_directory, const char *destination_name,
+                                                           uint32_t mode);
+/* The platform's in-kernel copy (`bc_file_system_platform_copy_range`, step `copy_range`) of at most `count`
+ * bytes from `source`'s offset to `destination`'s, both advanced; `*copied` 0 means the source ended. ENOTSUP,
+ * EXDEV and EINVAL mean the kernel will not copy these two, and the operation reads and writes from the offset
+ * reached. */
+bc_file_system_call_outcome bc_file_system_call_copy_range(bc_file_system_engine *engine, int32_t operation, int source,
+                                                           int destination, size_t count, size_t *copied);

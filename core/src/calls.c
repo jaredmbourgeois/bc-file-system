@@ -386,6 +386,27 @@ bc_file_system_call_outcome bc_file_system_call_fchmodat(bc_file_system_engine *
     return outcome;
 }
 
+bc_file_system_call_outcome bc_file_system_call_faccessat(bc_file_system_engine *engine, int32_t operation,
+                                                          int directory, const char *name, int mode, int flags) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_faccessat);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        if (faccessat(directory, name, mode, flags) == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        const int code = errno;
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
 /* ---- Directories --------------------------------------------------------------------------------------------- */
 
 bc_file_system_call_outcome bc_file_system_call_mkdirat(bc_file_system_engine *engine, int32_t operation, int parent,
@@ -452,6 +473,52 @@ bc_file_system_call_outcome bc_file_system_call_readdir(bc_file_system_engine *e
         const int code = errno;
         if (read != nullptr || code == 0) {
             *entry = read;
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+/* ---- Copying ------------------------------------------------------------------------------------------------ */
+
+/* The platform body makes its own retries; a scripted EINTR is retried here, like every other call's. */
+bc_file_system_call_outcome bc_file_system_call_clone_file(bc_file_system_engine *engine, int32_t operation, int source,
+                                                           int destination_directory, const char *destination_name,
+                                                           uint32_t mode) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_clone_file);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        const int code = bc_file_system_platform_clone_file(source, destination_directory, destination_name, mode);
+        if (code == 0) {
+            return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
+        }
+        outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};
+    } while (outcome.code == EINTR);
+    return outcome;
+}
+
+bc_file_system_call_outcome bc_file_system_call_copy_range(bc_file_system_engine *engine, int32_t operation, int source,
+                                                           int destination, size_t count, size_t *copied) {
+    bc_file_system_call_outcome outcome = {.succeeded = false, .code = 0, .stopped = false};
+    do {
+        const bc_file_system_step_verdict verdict = ask_observer(engine, operation, bc_file_system_step_copy_range);
+        if (verdict.action == bc_file_system_step_action_stop) {
+            return (bc_file_system_call_outcome){.succeeded = false, .code = 0, .stopped = true};
+        }
+        if (verdict.action == bc_file_system_step_action_fail) {
+            outcome = (bc_file_system_call_outcome){.succeeded = false, .code = verdict.system_code, .stopped = false};
+            continue;
+        }
+        const int code = bc_file_system_platform_copy_range(source, destination, count, copied);
+        if (code == 0) {
             return (bc_file_system_call_outcome){.succeeded = true, .code = 0, .stopped = false};
         }
         outcome = (bc_file_system_call_outcome){.succeeded = false, .code = code, .stopped = false};

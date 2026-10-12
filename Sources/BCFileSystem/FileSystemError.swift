@@ -105,6 +105,8 @@ public enum Step: Int32, CaseIterable, Sendable {
     case openatNofollowAny = 25
     /// fchmodat: the mode set by name under a held directory (AT_SYMLINK_NOFOLLOW for the entry itself).
     case fchmodat = 26
+    /// faccessat(X_OK): the search-permission check after a search-only open that checked nothing (Linux's O_PATH).
+    case faccessat = 27
 }
 
 /// Why an operation failed. A plain value: the core reports enums and integers; the face composes `path` from

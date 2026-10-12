@@ -342,15 +342,38 @@ TEST_F(BindingTest, CreateTemporaryDirectoryReachesC) {
     EXPECT_EQ(bc::file_system_test::mode_raw(path_of("parent") / *name), 0700U);
 }
 
-// A rename's error names the destination (the face's convention for the two-location operations).
-TEST_F(BindingTest, RenameReachesCAndNamesTheDestination) {
-    expect_unsupported(files().rename(in("from"), in("to"), ExistingDestination::replace, Durability::written),
-                       Operation::rename, path_text_of("to"));
+// A rename is real, and the error of a two-location operation names the destination (the face's convention for
+// both of them, whichever end the failing step acted on).
+TEST_F(BindingTest, RenameReachesCAndItsErrorNamesTheDestination) {
+    bc::file_system_test::write_raw(path_of("from"), "content", 0644);
+
+    const auto moved = files().rename(in("from"), in("to"), ExistingDestination::replace, Durability::written);
+    const auto of_nothing = files().rename(in("from"), in("to"), ExistingDestination::replace, Durability::written);
+
+    ASSERT_TRUE(moved.has_value()) << moved.error().message();
+    EXPECT_EQ(*moved, Durability::written);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("to")), "content");
+    EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("from")));
+    ASSERT_FALSE(of_nothing.has_value());
+    EXPECT_EQ(of_nothing.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(of_nothing.error().operation, Operation::rename);
+    EXPECT_EQ(of_nothing.error().path, path_text_of("to"));
 }
 
-TEST_F(BindingTest, CopyFileReachesCAndNamesTheDestination) {
-    expect_unsupported(files().copy_file(in("from"), in("to"), kWrittenExactly0644), Operation::copy_file,
-                       path_text_of("to"));
+TEST_F(BindingTest, CopyFileReachesCAndItsErrorNamesTheDestination) {
+    bc::file_system_test::write_raw(path_of("from"), "content", 0644);
+
+    const auto copied = files().copy_file(in("from"), in("to"), kWrittenExactly0644);
+    const auto of_nothing = files().copy_file(in("absent"), in("to"), kWrittenExactly0644);
+
+    ASSERT_TRUE(copied.has_value()) << copied.error().message();
+    EXPECT_EQ(*copied, Durability::written);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("to")), "content");
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("from")), "content");
+    ASSERT_FALSE(of_nothing.has_value());
+    EXPECT_EQ(of_nothing.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(of_nothing.error().operation, Operation::copy_file);
+    EXPECT_EQ(of_nothing.error().path, path_text_of("to"));
 }
 
 TEST_F(BindingTest, SetPermissionsReachesC) {
@@ -569,7 +592,7 @@ TEST(ErrorMappingTest, EveryOperationHasItsNameAndItsCValue) {
 }
 
 TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
-    const std::array<std::string_view, 26> names = {"open",
+    const std::array<std::string_view, 27> names = {"open",
                                                     "openat",
                                                     "fstat",
                                                     "fstatat",
@@ -594,7 +617,8 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
                                                     "identity_check",
                                                     "openat2",
                                                     "openat_nofollow_any",
-                                                    "fchmodat"};
+                                                    "fchmodat",
+                                                    "faccessat"};
 
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto value = static_cast<std::int32_t>(index + 1);
@@ -604,7 +628,7 @@ TEST(ErrorMappingTest, EveryStepHasItsNameAndItsCValue) {
         EXPECT_EQ(name_of(*step), names[index]);
     }
     EXPECT_FALSE(bc::file_system::step_from(0).has_value());
-    EXPECT_FALSE(bc::file_system::step_from(27).has_value());
+    EXPECT_FALSE(bc::file_system::step_from(28).has_value());
 }
 
 // The small enums, each enumerator against the header's constant.
@@ -1252,7 +1276,8 @@ TEST_F(CoreBindingTest, ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray)
     // One entry too few is still too small, and nothing is stored into the array: the entries are counted
     // before any is stored.
     constexpr std::int32_t untouched = 99;
-    std::vector<bc_file_system_entry> entries(count, bc_file_system_entry{.entry_type = untouched});
+    std::vector<bc_file_system_entry> entries(
+        count, bc_file_system_entry{.entry_type = untouched, .name_length = 0, .name = {}});
     const std::int32_t one_short = bc_file_system_list_directory(
         engine(), &location, bc_file_system_final_symlink_refuse, entries.data(), entries.size() - 1, &count, &c_error);
     EXPECT_EQ(one_short, bc_file_system_error_kind_buffer_too_small);
@@ -1396,8 +1421,7 @@ TEST_F(CoreBindingTest, AppendAddsToTheEnd) {
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("log")), "one\ntwo\n");
 }
 
-// stage 16 moves-and-copies-in-c
-TEST_F(CoreBindingTest, DISABLED_CreateDirectoriesRenameCopyAndTheTwoRemovals) {
+TEST_F(CoreBindingTest, CreateDirectoriesRenameCopyAndTheTwoRemovals) {
     const std::string tree = path_text_of("a/b");
     const std::string source = path_text_of("a/b/source");
     const std::string copy = path_text_of("a/b/copy");

@@ -200,29 +200,39 @@ static void expect_platform_operations(report *tally) {
 
 static void test_platform_operations(report *tally) {
     expect_platform_operations(tally);
-    /* The two operations no stage has built answer ENOTSUP on every platform, so the engine takes its
-     * portable path; each stage that builds one turns its line here into a real case. */
-    expect(tally, bc_file_system_platform_clone_file(-1, -1, "copy", 0644) == ENOTSUP,
-           "clone_file is unsupported until stage 16", "");
-    /* open_beneath is real where the platform has a one-call contained open: handed an invalid descriptor it
-     * reports the descriptor (never ENOTSUP, never success); where it has none it answers ENOTSUP outright. */
+    /* The three operations with a fast path are real where the probe says the platform has one: handed an
+     * invalid descriptor each reports the descriptor (never ENOTSUP, never success, nothing stored); where the
+     * platform has none, each answers ENOTSUP outright. */
     bc_file_system_engine *engine = create_live(tally);
-    if (engine != nullptr) {
-        const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
-        int descriptor = -1;
-        const int open_beneath_code = bc_file_system_platform_open_beneath(-1, "a/b", 0, &descriptor);
-        if (fast_paths->has_openat2 || fast_paths->has_openat_nofollow_any) {
-            expect(tally, open_beneath_code == EBADF, "open_beneath reports an invalid descriptor as EBADF", "");
-        } else {
-            expect(tally, open_beneath_code == ENOTSUP, "open_beneath is not offered on this platform", "");
-        }
-        expect(tally, descriptor == -1, "open_beneath stores nothing on failure", "");
-        bc_file_system_engine_release(engine);
+    if (engine == nullptr) {
+        return;
+    }
+    const bc_file_system_platform_fast_paths *fast_paths = bc_file_system_engine_fast_paths(engine);
+    int descriptor = -1;
+    const int open_beneath_code = bc_file_system_platform_open_beneath(-1, "a/b", 0, &descriptor);
+    if (fast_paths->has_openat2 || fast_paths->has_openat_nofollow_any) {
+        expect(tally, open_beneath_code == EBADF, "open_beneath reports an invalid descriptor as EBADF", "");
+    } else {
+        expect(tally, open_beneath_code == ENOTSUP, "open_beneath is not offered on this platform", "");
+    }
+    expect(tally, descriptor == -1, "open_beneath stores nothing on failure", "");
+    /* The clone is asked to make "copy" under an invalid directory from an invalid source: the first call either
+     * body makes (fclonefileat; the exclusive create before FICLONE) refuses the directory. */
+    const int clone_code = bc_file_system_platform_clone_file(-1, -1, "copy", 0644);
+    if (fast_paths->has_clone) {
+        expect(tally, clone_code == EBADF, "clone_file reports an invalid descriptor as EBADF", "");
+    } else {
+        expect(tally, clone_code == ENOTSUP, "clone_file is not offered on this platform", "");
     }
     size_t copied = 0;
-    expect(tally, bc_file_system_platform_copy_range(-1, -1, 16, &copied) == ENOTSUP,
-           "copy_range is unsupported until stage 16", "");
-    expect(tally, copied == 0, "copy_range stores nothing when unsupported", "");
+    const int copy_range_code = bc_file_system_platform_copy_range(-1, -1, 16, &copied);
+    if (fast_paths->has_copy_range) {
+        expect(tally, copy_range_code == EBADF, "copy_range reports an invalid descriptor as EBADF", "");
+    } else {
+        expect(tally, copy_range_code == ENOTSUP, "copy_range is not offered on this platform", "");
+    }
+    expect(tally, copied == 0, "copy_range stores nothing on failure", "");
+    bc_file_system_engine_release(engine);
 }
 
 /* ---- The observer's mechanics --------------------------------------------------------------------------------- */

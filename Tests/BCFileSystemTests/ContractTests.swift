@@ -474,6 +474,47 @@ struct ContractTests {
         #expect(try observed.root.rawNames() == [firstName, secondName].sorted())
     }
 
+    // MARK: - Moving and copying
+
+    @Test
+    func renameMovesAFileAndUnderRefuseLeavesAnExistingDestination() throws {
+        let observed = try observedFileSystem()
+        try observed.root.rawWrite("the new content", to: "staged", mode: 0o644)
+        try observed.root.rawWrite("the old content", to: "current", mode: 0o644)
+        let staged = try observed.location("staged")
+        let current = try observed.location("current")
+
+        let refused = errorThrown { () throws(FileSystemError) in
+            try observed.fileSystem.rename(from: staged, to: current, existingDestination: .refuse, durability: .written)
+        }
+        let achieved = try observed.fileSystem.rename(
+            from: staged, to: current, existingDestination: .replace, durability: .durable)
+
+        #expect(refused?.kind == .alreadyExists)
+        #expect(achieved == .durable)
+        #expect(try observed.root.rawRead("current") == "the new content")
+        #expect(try observed.root.rawNames() == ["current"])
+    }
+
+    @Test
+    func copyWritesTheSourcesBytesWithTheStatedModeAndLeavesTheSource() throws {
+        let observed = try observedFileSystem()
+        let bytes = [UInt8](repeating: 0xA5, count: 3 * 1024 * 1024)
+        let source = try observed.location("source")
+        _ = try observed.fileSystem.writeFile(source, bytes: bytes, options: Self.writtenExactly0644)
+
+        let achieved = try observed.fileSystem.copyFile(
+            from: source, to: try observed.location("copy"), options: Self.writtenExactly0600)
+
+        #expect(achieved == .written)
+        #expect(
+            try observed.fileSystem.readFile(try observed.location("copy"), options: Self.wholeFileRefusingSymlink)
+                == bytes)
+        #expect(try observed.root.rawMode(of: "copy") == 0o600)
+        #expect(try observed.root.rawMode(of: "source") == 0o644)
+        #expect(try observed.root.rawNames() == ["copy", "source"])
+    }
+
     // MARK: - The core's buffer protocol
 
     /// The face grows its buffers itself, so the core is called directly here: a buffer that is too small is

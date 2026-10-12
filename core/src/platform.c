@@ -20,6 +20,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <sys/clonefile.h>
+#endif
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -55,23 +58,6 @@ static int sync_refusal(int code) {
     return code;
 }
 
-/* ---- The operations no stage has built yet --------------------------------------------------------------- */
-
-/* Honest refusals: the engine takes its portable path (the copy loop) until the stage named at each body gives
- * the fast path a body. Each answers ENOTSUP on every platform. */
-
-/* stage 16 moves-and-copies-in-c: clonefileat / fclonefileat on Apple, FICLONE on Linux. */
-int bc_file_system_platform_clone_file([[maybe_unused]] int source, [[maybe_unused]] int destination_directory,
-                                       [[maybe_unused]] const char *destination_name, [[maybe_unused]] uint32_t mode) {
-    return ENOTSUP;
-}
-
-/* stage 16 moves-and-copies-in-c: copy_file_range on Linux. */
-int bc_file_system_platform_copy_range([[maybe_unused]] int source, [[maybe_unused]] int destination,
-                                       [[maybe_unused]] size_t count, [[maybe_unused]] size_t *copied) {
-    return ENOTSUP;
-}
-
 #ifdef __APPLE__
 
 /* ---- Apple platforms --------------------------------------------------------------------------------------- */
@@ -98,6 +84,15 @@ bool bc_file_system_platform_enforces_containment(void) {
  * (measured: a 0300 directory opens, takes a created file, and answers EBADF to fdopendir). */
 int bc_file_system_platform_directory_search_open_flags(void) {
     return O_SEARCH | O_DIRECTORY | O_CLOEXEC;
+}
+
+/* O_SEARCH refuses a directory the process may not search with EACCES at the open. */
+bool bc_file_system_platform_search_open_checks_permission(void) {
+    return true;
+}
+
+int bc_file_system_platform_access_check_flags(void) {
+    return AT_EACCESS;
 }
 
 /* O_NOFOLLOW_ANY makes the kernel refuse a symlink at any depth of `relative` with ELOOP (measured: in the middle
@@ -139,6 +134,30 @@ int bc_file_system_platform_rename_no_replace(int from_directory, const char *fr
     return code;
 }
 
+/* fclonefileat creates the destination itself, as a clone of the open source, with the source's attributes
+ * (measured: 64 MiB in under a millisecond on APFS; EEXIST when the name is taken; EXDEV across volumes; ENOTSUP
+ * on a volume that cannot clone); `mode` is not read, since the engine sets the mode exactly afterwards.
+ * CLONE_NOFOLLOW is what the design names for a refusing copy; the source here is an open descriptor, which the
+ * engine opened without following where it was told to, so the flag changes nothing and costs nothing. Never
+ * copyfile(COPYFILE_CLONE), which falls back to a data copy silently. */
+int bc_file_system_platform_clone_file(int source, int destination_directory, const char *destination_name,
+                                       [[maybe_unused]] uint32_t mode) {
+    int code = 0;
+    do {
+        if (fclonefileat(source, destination_directory, destination_name, CLONE_NOFOLLOW) == 0) {
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    return code;
+}
+
+/* No Apple kernel offers copy_file_range: the engine clones, or runs the copy loop. */
+int bc_file_system_platform_copy_range([[maybe_unused]] int source, [[maybe_unused]] int destination,
+                                       [[maybe_unused]] size_t count, [[maybe_unused]] size_t *copied) {
+    return ENOTSUP;
+}
+
 #elifdef __EMSCRIPTEN__
 
 /* ---- Emscripten -------------------------------------------------------------------------------------------- */
@@ -167,6 +186,15 @@ int bc_file_system_platform_directory_search_open_flags(void) {
     return O_RDONLY | O_DIRECTORY | O_CLOEXEC;
 }
 
+/* A read-only open checks the read permission, which covers the search permission here. */
+bool bc_file_system_platform_search_open_checks_permission(void) {
+    return true;
+}
+
+int bc_file_system_platform_access_check_flags(void) {
+    return AT_EACCESS;
+}
+
 /* No kernel call opens a path contained beneath a descriptor here; the engine never asks, since containment is
  * absent altogether, but the honest answer stays in place. */
 int bc_file_system_platform_open_beneath([[maybe_unused]] int root, [[maybe_unused]] const char *relative,
@@ -180,10 +208,23 @@ int bc_file_system_platform_sync_descriptor([[maybe_unused]] int descriptor) {
     return ENOTSUP;
 }
 
-/* renameat2 declares but does not link, and renameat replaces; the NODERAWFS link-then-unlink path is stage 16's. */
+/* renameat2 declares but does not link, and renameat replaces: a no-replace rename is `unsupported` here. The
+ * NODERAWFS link-then-unlink shape the design records stays unbuilt until a consumer measures a site for it, since
+ * MEMFS has no hard links at all and a two-name window is not the one step the header promises. */
 int bc_file_system_platform_rename_no_replace([[maybe_unused]] int from_directory,
                                               [[maybe_unused]] const char *from_name, [[maybe_unused]] int to_directory,
                                               [[maybe_unused]] const char *to_name) {
+    return ENOTSUP;
+}
+
+/* Neither backend clones or copies inside the kernel: the engine runs the copy loop. */
+int bc_file_system_platform_clone_file([[maybe_unused]] int source, [[maybe_unused]] int destination_directory,
+                                       [[maybe_unused]] const char *destination_name, [[maybe_unused]] uint32_t mode) {
+    return ENOTSUP;
+}
+
+int bc_file_system_platform_copy_range([[maybe_unused]] int source, [[maybe_unused]] int destination,
+                                       [[maybe_unused]] size_t count, [[maybe_unused]] size_t *copied) {
     return ENOTSUP;
 }
 
@@ -263,6 +304,22 @@ int bc_file_system_platform_directory_search_open_flags(void) {
     return O_PATH | O_DIRECTORY | O_CLOEXEC;
 }
 
+/* O_PATH checks no permission on the directory it opens, so the resolver asks faccessat(X_OK) as a step. */
+bool bc_file_system_platform_search_open_checks_permission(void) {
+    return false;
+}
+
+#ifdef __ANDROID__
+/* bionic refuses AT_EACCESS with EINVAL; the real ids are the effective ids in an app process. */
+int bc_file_system_platform_access_check_flags(void) {
+    return 0;
+}
+#else
+int bc_file_system_platform_access_check_flags(void) {
+    return AT_EACCESS;
+}
+#endif
+
 #if defined(__ANDROID__) || !__has_include(<linux/openat2.h>)
 /* The engine never calls this where the probe answered no (Android, or headers older than kernel 5.6); the
  * honest answer stays in place. */
@@ -332,6 +389,68 @@ int bc_file_system_platform_rename_no_replace([[maybe_unused]] int from_director
     return ENOTSUP;
 }
 #endif
+
+#if __has_include(<linux/fs.h>)
+/* FICLONE takes an open destination, so the body creates the file exclusively with `mode` (as the umask leaves
+ * it; the engine sets the mode exactly afterwards), asks the kernel to share the source's extents into it, and
+ * takes the file back when the kernel refuses, so the engine sees one step that made the whole file or nothing.
+ * The ioctl goes through syscall(2) because the request parameter is `unsigned long` on glibc and `int` on musl,
+ * and FICLONE's value is neither without a cast; the kernel reads it as the 32-bit request it is. Whether a volume
+ * clones is known only here (btrfs and XFS with reflinks do; ext4 and tmpfs answer EOPNOTSUPP or ENOTTY). */
+int bc_file_system_platform_clone_file(int source, int destination_directory, const char *destination_name,
+                                       uint32_t mode) {
+    int destination = -1;
+    int code = 0;
+    do {
+        /* A mode is at most 07777, which mode_t holds; the cast only changes the type. */
+        destination = openat(destination_directory, destination_name,
+                             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, (mode_t)mode);
+        if (destination >= 0) {
+            break;
+        }
+        code = errno;
+    } while (code == EINTR);
+    if (destination < 0) {
+        return code;
+    }
+    do {
+        if (syscall(SYS_ioctl, destination, FICLONE, source) == 0) {
+            (void)close(destination); /* discard-ok: nothing was written through it; the engine opens the clone again */
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    (void)close(destination);                                   /* discard-ok: the file is taken back next */
+    (void)unlinkat(destination_directory, destination_name, 0); /* discard-ok: best effort after the refusal */
+    return code;
+}
+#else
+int bc_file_system_platform_clone_file([[maybe_unused]] int source, [[maybe_unused]] int destination_directory,
+                                       [[maybe_unused]] const char *destination_name, [[maybe_unused]] uint32_t mode) {
+    return ENOTSUP;
+}
+#endif
+
+/* copy_file_range with no offsets of its own moves both descriptors' offsets by what it copied, which is what lets
+ * the engine's read-and-write loop continue from the same place when the kernel refuses part-way (EXDEV between
+ * two file systems that cannot share, EINVAL for a file it will not copy); a kernel without the call (ENOSYS) is
+ * ENOTSUP, the one answer the engine reads as "run the loop". Through syscall(2) for the three libcs. */
+int bc_file_system_platform_copy_range(int source, int destination, size_t count, size_t *copied) {
+    int code = 0;
+    do {
+        const long answer = syscall(SYS_copy_file_range, source, nullptr, destination, nullptr, count, 0);
+        if (answer >= 0) {
+            /* A non-negative answer is a count of bytes, never above `count`. */
+            *copied = (size_t)answer;
+            return 0;
+        }
+        code = errno;
+    } while (code == EINTR);
+    if (code == ENOSYS) {
+        return ENOTSUP;
+    }
+    return code;
+}
 
 #else
 #error                                                                                                                 \
