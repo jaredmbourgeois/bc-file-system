@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::buffer::{
-    FIRST_ENTRY_CAPACITY, FIRST_TEXT_CAPACITY, first_read_capacity, grown_answer, measured_answer,
+    FIRST_ENTRY_CAPACITY, FIRST_TEXT_CAPACITY, first_read_capacity, grown_answer, grown_in_place,
+    measured_answer,
 };
 use crate::error::{Error, Operation, Step, UnknownValue, path_of_bytes};
 use crate::ffi;
@@ -122,11 +123,13 @@ fn create(
 }
 
 impl Engine {
-    /// The live engine of a composition root, with the platform's fast paths probed once.
+    /// The live engine of a composition root, with the platform's fast paths probed once and the identity of the
+    /// root of the file system read once (what [`Engine::remove_tree`] refuses by identity).
     ///
     /// # Errors
     ///
-    /// `ResourceExhausted` when the engine cannot be allocated; the probes themselves cannot fail.
+    /// `ResourceExhausted` when the engine cannot be allocated; the probes themselves cannot fail, and should the
+    /// stat of `/` fail, its errno's kind at step `Fstatat`.
     pub fn live() -> Result<Self, Error> {
         let handle = create(
             ffi::bc_file_system_engine_create_live,
@@ -243,26 +246,46 @@ impl Engine {
         let c_location = location.to_c();
         let c_options = options.to_c();
         let call = self.one_call();
-        grown_answer(
+        let mut bytes = grown_in_place(
             first_read_capacity(options.limit),
-            0_u8,
-            |buffer: &mut [u8], length: &mut usize, c_error: &mut ffi::bc_file_system_error| {
-                // SAFETY: the module's contract: `buffer` is `buffer.len()` writable bytes the loop owns;
+            |answer: &mut Vec<u8>,
+             capacity: usize,
+             length: &mut usize,
+             c_error: &mut ffi::bc_file_system_error| {
+                // SAFETY: the module's contract: `answer` is an empty vector the loop owns with room for at
+                // least `capacity` bytes, so its spare room is `capacity` writable bytes, never read here;
                 // `length` is written on success and on `BufferTooSmall`, `c_error` on failure.
-                unsafe {
+                let status = unsafe {
                     ffi::bc_file_system_read_file(
                         call.handle,
                         &raw const c_location,
                         &raw const c_options,
-                        buffer.as_mut_ptr(),
-                        buffer.len(),
+                        answer.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                        capacity,
                         length,
                         c_error,
                     )
+                };
+                if status == 0 {
+                    // On success the core stored `*length` bytes at the start of the room it was offered and
+                    // never more than that room (the header's ANSWERS OF VARIABLE LENGTH); the bound is held
+                    // here too, so the length below can never cover a byte past the room.
+                    let stored = (*length).min(capacity);
+                    // SAFETY: the vector's first `stored` bytes are bytes the core wrote just now, and `stored`
+                    // is within the capacity the vector was made with; no byte the core did not write is ever
+                    // covered, so a short file's answer holds its own bytes and nothing of the room behind them.
+                    unsafe { answer.set_len(stored) };
                 }
+                status
             },
         )
-        .map_err(|c_error| failure(&c_error, Operation::ReadFile, location))
+        .map_err(|c_error| failure(&c_error, Operation::ReadFile, location))?;
+        // An answer filling less than half its storage is moved into storage of its own size, so a small file read
+        // through the 1 MiB first offer holds no more than it needs.
+        if bytes.capacity() / 2 > bytes.len() {
+            bytes.shrink_to_fit();
+        }
+        Ok(bytes)
     }
 
     /// Replaces or creates the regular file at `location` with `bytes`, atomically: a reader sees the old
@@ -435,25 +458,38 @@ impl Engine {
     ) -> Result<Vec<Entry>, Error> {
         let c_location = location.to_c();
         let call = self.one_call();
-        let c_entries = grown_answer(
+        let c_entries = grown_in_place(
             FIRST_ENTRY_CAPACITY,
-            ffi::bc_file_system_entry::zeroed(),
-            |entries: &mut [ffi::bc_file_system_entry],
+            |entries: &mut Vec<ffi::bc_file_system_entry>,
+             capacity: usize,
              count: &mut usize,
              c_error: &mut ffi::bc_file_system_error| {
-                // SAFETY: the module's contract: `entries` is `entries.len()` writable entries the loop owns;
+                // SAFETY: the module's contract: `entries` is an empty vector the loop owns with room for at
+                // least `capacity` entries, so its spare room is `capacity` writable entries, never read here;
                 // `count` is written on success and on `BufferTooSmall`, `c_error` on failure.
-                unsafe {
+                let status = unsafe {
                     ffi::bc_file_system_list_directory(
                         call.handle,
                         &raw const c_location,
                         final_symlink as i32,
-                        entries.as_mut_ptr(),
-                        entries.len(),
+                        entries
+                            .spare_capacity_mut()
+                            .as_mut_ptr()
+                            .cast::<ffi::bc_file_system_entry>(),
+                        capacity,
                         count,
                         c_error,
                     )
+                };
+                if status == 0 {
+                    // As for a read: the core stored `*count` entries at the start of the room, never more
+                    // than the room, and the bound is held here too.
+                    let stored = (*count).min(capacity);
+                    // SAFETY: the vector's first `stored` entries are entries the core wrote just now, within
+                    // the capacity the vector was made with; no entry the core did not write is ever covered.
+                    unsafe { entries.set_len(stored) };
                 }
+                status
             },
         )
         .map_err(|c_error| failure(&c_error, Operation::ListDirectory, location))?;

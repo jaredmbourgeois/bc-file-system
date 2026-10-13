@@ -7,6 +7,7 @@
 #include <optional>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // The timing and the table of the benchmark. Nothing here reaches: the clock and the stream are handed in by
@@ -14,38 +15,53 @@
 
 namespace bc::file_system::benchmark {
 
-auto measure(Now now, const Repetitions& repetitions, const Action& prepare, const Action& action)
-    -> std::optional<Summary> {
-    for (int run = 0; run < repetitions.warm_up; ++run) {
-        if (!prepare() || !action()) {
-            return std::nullopt;
-        }
-    }
-    std::vector<std::int64_t> samples;
-    samples.reserve(static_cast<std::size_t>(repetitions.timed));
-    for (int run = 0; run < repetitions.timed; ++run) {
-        if (!prepare()) {
-            return std::nullopt;
-        }
-        const std::chrono::steady_clock::time_point started = now();
-        const bool succeeded = action();
-        const std::chrono::steady_clock::time_point finished = now();
-        if (!succeeded) {
-            return std::nullopt;
-        }
-        samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
-    }
-    if (samples.empty()) {
-        return std::nullopt;
-    }
+namespace {
+
+// The summary of one form's timed samples, which are never empty (every run took one). Both answers are samples
+// that were taken, never interpolated: the median is the middle one (the upper of the two middle ones for an even
+// count), and the 90th percentile is the nearest rank, the sample at or below which nine tenths of them fall:
+// rank ceil(0.9 × count), counted from 1.
+auto summary_of(std::vector<std::int64_t> samples) -> Summary {
     std::ranges::sort(samples);
-    // Both answers are samples that were taken, never interpolated: the median is the middle one (the upper of
-    // the two middle ones for an even count), and the 90th percentile is the nearest rank, the sample at or
-    // below which nine tenths of them fall: rank ceil(0.9 × count), counted from 1.
     const std::size_t count = samples.size();
     const std::size_t median_index = count / 2;
     const std::size_t p90_rank = ((count * 9) + 9) / 10;
     return Summary{.median_nanoseconds = samples[median_index], .p90_nanoseconds = samples[p90_rank - 1]};
+}
+
+} // namespace
+
+auto measure_interleaved(Now now, const Repetitions& repetitions, const std::vector<Timed>& forms) -> GroupMeasurement {
+    for (int run = 0; run < repetitions.warm_up; ++run) {
+        for (std::size_t form = 0; form < forms.size(); ++form) {
+            if (!forms[form].prepare() || !forms[form].action()) {
+                return GroupMeasurement{.summaries = {}, .failed_form = form};
+            }
+        }
+    }
+    std::vector<std::vector<std::int64_t>> samples(forms.size());
+    for (std::vector<std::int64_t>& form_samples : samples) {
+        form_samples.reserve(static_cast<std::size_t>(repetitions.timed));
+    }
+    for (int run = 0; run < repetitions.timed; ++run) {
+        for (std::size_t form = 0; form < forms.size(); ++form) {
+            if (!forms[form].prepare()) {
+                return GroupMeasurement{.summaries = {}, .failed_form = form};
+            }
+            const std::chrono::steady_clock::time_point started = now();
+            const bool succeeded = forms[form].action();
+            const std::chrono::steady_clock::time_point finished = now();
+            if (!succeeded) {
+                return GroupMeasurement{.summaries = {}, .failed_form = form};
+            }
+            samples[form].push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count());
+        }
+    }
+    GroupMeasurement measured{.summaries = {}, .failed_form = std::nullopt};
+    for (std::vector<std::int64_t>& form_samples : samples) {
+        measured.summaries.push_back(summary_of(std::move(form_samples)));
+    }
+    return measured;
 }
 
 namespace {

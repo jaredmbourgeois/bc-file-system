@@ -165,4 +165,10 @@ walk, the read-and-write copy loop, fsync and the `unsupported` answer of every 
 no-replace rename are proven on every platform. Stage 27 `at-one-open` is in: an `at` location's parent is
 opened by path in one call (in pieces past `PATH_MAX`), the system resolving it, so `status` through `at` is one
 open and one stat at any depth where it had been three calls a component; containment and its identity check
-stay `beneath`'s. `0.1.0` is tagged when every face is green on every platform.
+stay `beneath`'s. Stage 28 `face-first-offers` is in: `list_directory` reads its directory once, storing entries
+as it counts them; every face first offers 1,024 entries and 1 MiB of a file and never zero-fills what the core is
+about to write (the C++ `read_file` answers `Bytes`, a `std::vector<std::byte>` with a default-initialising
+allocator); the engine reads the root's identity once at creation; and an `at` location's leaf opened as a
+directory, like a directory `create_directories` has just made, is opened with nothing checked around the open,
+containment and its identity check staying `beneath`'s. `0.1.0` is tagged when every face is green on every
+platform.

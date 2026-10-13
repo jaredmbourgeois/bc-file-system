@@ -484,8 +484,8 @@ TEST_F(BindingTest, ReadFileIfPresentPassesAnErrorOtherThanNotFoundThrough) {
 }
 
 TEST_F(BindingTest, ReadFileGrowsItsBufferToAFileLargerThanTheFirstCapacity) {
-    // The face offers 64 KiB first; the core names the capacity it needs and the face asks once more.
-    const std::string large(100 * 1024, 'g');
+    // The face offers 1 MiB first; the core names the capacity it needs and the face asks once more.
+    const std::string large((std::size_t{1} << 20) + (std::size_t{100} * 1024), 'g');
     bc::file_system_test::write_raw(path_of("large.bin"), large, 0644);
 
     const auto bytes = files().read_file(in("large.bin"), kWholeFileRefusingSymlink);
@@ -494,10 +494,39 @@ TEST_F(BindingTest, ReadFileGrowsItsBufferToAFileLargerThanTheFirstCapacity) {
     EXPECT_EQ(text_of(*bytes), large);
 }
 
+// The face's buffer is never zero-filled, so an answer shorter than the buffer it was read into must hold the
+// file's own bytes and nothing of what the buffer held before: a large read first leaves its bytes where the
+// allocator may hand the next buffer out again, and the short file read next is answered as exactly its bytes,
+// its size its own, under either limit.
+TEST_F(BindingTest, ReadFileOfAFileShorterThanTheFirstOfferAnswersOnlyItsOwnBytes) {
+    const std::string large(std::size_t{900} * 1024, 'L');
+    bc::file_system_test::write_raw(path_of("large.bin"), large, 0644);
+    bc::file_system_test::write_raw(path_of("short.txt"), "seven b", 0644);
+    const ReadOptions at_most_a_mebibyte{.limit = ReadLimit::at_most(std::uint64_t{1} << 20),
+                                         .final_symlink = FinalSymlink::refuse};
+
+    const auto first = files().read_file(in("large.bin"), kWholeFileRefusingSymlink);
+    const auto whole = files().read_file(in("short.txt"), kWholeFileRefusingSymlink);
+    const auto again = files().read_file(in("large.bin"), kWholeFileRefusingSymlink);
+    const auto bounded = files().read_file(in("short.txt"), at_most_a_mebibyte);
+
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->size(), large.size());
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_EQ(whole->size(), 7U);
+    EXPECT_EQ(text_of(*whole), "seven b");
+    EXPECT_LT(whole->capacity(), 1024U) << "an answer filling less than half its storage is moved into its own size";
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(text_of(*again), large);
+    ASSERT_TRUE(bounded.has_value());
+    EXPECT_EQ(bounded->size(), 7U);
+    EXPECT_EQ(text_of(*bounded), "seven b");
+}
+
 TEST_F(BindingTest, ListDirectoryGrowsItsArrayPastTheFirstCapacity) {
-    // The face offers room for 64 entries first.
+    // The face offers room for 1,024 entries first.
     std::vector<std::string> expected;
-    for (int number = 100; number < 200; ++number) {
+    for (int number = 1000; number < 2100; ++number) {
         const std::string name = "entry-" + std::to_string(number);
         bc::file_system_test::write_raw(path_of(name), "", 0644);
         expected.push_back(name);
@@ -1356,8 +1385,9 @@ TEST_F(CoreBindingTest, ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray)
     EXPECT_EQ(with_no_array, bc_file_system_error_kind_buffer_too_small);
     EXPECT_EQ(count, 3U);
 
-    // One entry too few is still too small, and nothing is stored into the array: the entries are counted
-    // before any is stored.
+    // One entry too few is still too small, in the same one pass: the two entries that fit are stored as they are
+    // read (left in the array, not an answer) and the third is counted, and nothing is written past the capacity
+    // offered.
     constexpr std::int32_t untouched = 99;
     std::vector<bc_file_system_entry> entries(
         count, bc_file_system_entry{.entry_type = untouched, .name_length = 0, .name = {}});
@@ -1365,15 +1395,21 @@ TEST_F(CoreBindingTest, ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray)
         engine(), &location, bc_file_system_final_symlink_refuse, entries.data(), entries.size() - 1, &count, &c_error);
     EXPECT_EQ(one_short, bc_file_system_error_kind_buffer_too_small);
     EXPECT_EQ(count, 3U);
-    for (const bc_file_system_entry& entry : entries) {
-        EXPECT_EQ(entry.entry_type, untouched);
-    }
+    EXPECT_NE(entries[0].entry_type, untouched);
+    EXPECT_NE(entries[1].entry_type, untouched);
+    EXPECT_EQ(entries[2].entry_type, untouched);
 
     const std::int32_t status = bc_file_system_list_directory(engine(), &location, bc_file_system_final_symlink_refuse,
                                                               entries.data(), entries.size(), &count, &c_error);
 
     ASSERT_EQ(status, 0);
     ASSERT_EQ(count, 3U);
+    // Each of the three calls read the directory once: three entries, `.`, `..` and the end of the stream.
+    std::uint64_t reads = 0;
+    ASSERT_EQ(bc_file_system_observed_step_count(engine(), bc_file_system_operation_list_directory,
+                                                 bc_file_system_step_readdir, &reads, &c_error),
+              0);
+    EXPECT_EQ(reads, 3U * 6U);
     std::vector<std::string> listed;
     for (const bc_file_system_entry& entry : entries) {
         listed.emplace_back(reinterpret_cast<const char*>(entry.name), entry.name_length);
@@ -1382,6 +1418,41 @@ TEST_F(CoreBindingTest, ListDirectoryReportsTheCapacityItNeedsThenFillsTheArray)
     EXPECT_EQ(entries[0].entry_type, bc_file_system_entry_type_regular_file);
     EXPECT_EQ(entries[1].entry_type, bc_file_system_entry_type_symlink);
     EXPECT_EQ(entries[2].entry_type, bc_file_system_entry_type_directory);
+}
+
+// A directory that grows between the call that overflowed and the next answers the next call's own count, from a
+// pass of its own: never the first count, and never a prefix of the listing. The grow loop's bound is the only
+// retry.
+TEST_F(CoreBindingTest, ListDirectoryOfADirectoryThatGrewBetweenTwoCallsAnswersTheSecondCallsOwnCount) {
+    bc::file_system_test::write_raw(path_of("a.txt"), "alpha", 0640);
+    bc::file_system_test::write_raw(path_of("b.txt"), "beta", 0640);
+    bc::file_system_test::write_raw(path_of("c.txt"), "gamma", 0640);
+    const std::string path = root_text();
+    const bc_file_system_location location = at(path);
+    bc_file_system_error c_error{};
+    std::size_t count = 0;
+    std::vector<bc_file_system_entry> entries(4);
+
+    const std::int32_t first = bc_file_system_list_directory(engine(), &location, bc_file_system_final_symlink_refuse,
+                                                             entries.data(), 1, &count, &c_error);
+    ASSERT_EQ(first, bc_file_system_error_kind_buffer_too_small);
+    ASSERT_EQ(count, 3U);
+    bc::file_system_test::write_raw(path_of("d.txt"), "delta", 0640);
+    const std::int32_t second = bc_file_system_list_directory(engine(), &location, bc_file_system_final_symlink_refuse,
+                                                              entries.data(), 3, &count, &c_error);
+    ASSERT_EQ(second, bc_file_system_error_kind_buffer_too_small);
+    ASSERT_EQ(count, 4U);
+    const std::int32_t third = bc_file_system_list_directory(engine(), &location, bc_file_system_final_symlink_refuse,
+                                                             entries.data(), entries.size(), &count, &c_error);
+
+    ASSERT_EQ(third, 0);
+    ASSERT_EQ(count, 4U);
+    std::vector<std::string> listed;
+    listed.reserve(entries.size());
+    for (const bc_file_system_entry& entry : entries) {
+        listed.emplace_back(reinterpret_cast<const char*>(entry.name), entry.name_length);
+    }
+    EXPECT_THAT(listed, ElementsAre("a.txt", "b.txt", "c.txt", "d.txt"));
 }
 
 TEST_F(CoreBindingTest, ListDirectoryListsOneLevel) {

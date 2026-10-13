@@ -184,6 +184,11 @@ struct bc_file_system_engine {
      * staging at once draw different tokens, and nothing orders on it, so the relaxed order is enough. */
     uint64_t process_id;
     _Atomic uint64_t staging_counter;
+    /* The identity of the root of the file system, read once by the factory, against which `remove_tree`
+     * refuses the root by identity: a comparison, so the refusal costs an operation no call of its own. The root
+     * is the process's root at the engine's creation. */
+    uint64_t root_device;
+    uint64_t root_inode;
     uint32_t fault_count;
     bc_file_system_fault faults[fault_capacity];
     /* How many times each operation has reached each step. Row 0 is unused because 0 is no operation; column 0
@@ -318,6 +323,28 @@ static bc_file_system_platform_fast_paths no_fast_paths(void) {
     };
 }
 
+/* The identity of `/`, read once by the factory. Creation is no operation, so the read is not gated: no observer
+ * counts it or scripts a fault into it, and it holds no descriptor (an absolute path makes fstatat ignore its
+ * directory argument), so no descriptor count and no kill point of any operation sees it. Answers 0, or the
+ * errno the system answered. */
+static int read_root_identity(uint64_t *device, uint64_t *inode) {
+    struct stat info;
+    int code = 0;
+    do {
+        code = 0;
+        if (fstatat(AT_FDCWD, "/", &info, 0) != 0) { /* reach-ok: the factory is the one live site of the engine */
+            code = errno;
+        }
+    } while (code == EINTR);
+    if (code != 0) {
+        return code;
+    }
+    /* The identity fields are compared as bit patterns, so the width and sign of dev_t do not matter. */
+    *device = (uint64_t)info.st_dev;
+    *inode = (uint64_t)info.st_ino;
+    return 0;
+}
+
 /* The one body of the three factories. The fast paths are a parameter, never something the engine looks up:
  * the live and the observed factory hand in what the platform's probe found, the portable-only factory hands
  * in none. */
@@ -328,6 +355,16 @@ static int32_t create_engine(observer_choice observer, bc_file_system_platform_f
     }
     if (engine == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    uint64_t root_device = 0;
+    uint64_t root_inode = 0;
+    const int root_code = read_root_identity(&root_device, &root_inode);
+    if (root_code != 0) {
+        *error = (bc_file_system_error){.kind = bc_file_system_call_kind_of_errno(root_code),
+                                        .operation = operation,
+                                        .step = bc_file_system_step_fstatat,
+                                        .system_code = root_code};
+        return error->kind;
     }
     /* calloc zeroes the fault slot and every counter in one step. */
     bc_file_system_engine *created = calloc(1, sizeof *created);
@@ -340,6 +377,8 @@ static int32_t create_engine(observer_choice observer, bc_file_system_platform_f
      * operation asks for it. A pid is never negative, so the cast only changes the type. */
     created->process_id = (uint64_t)getpid(); /* reach-ok: the factory is the one live site of the engine */
     atomic_init(&created->staging_counter, 0);
+    created->root_device = root_device;
+    created->root_inode = root_inode;
     *engine = created;
     return succeed(error);
 }
@@ -498,6 +537,31 @@ static bc_file_system_directory *allocate_directory(const bc_file_system_locatio
     return created;
 }
 
+/* Opens the directory a resolved location names, for `access`: the leaf under the caller's choice about a final
+ * symlink, or, for the root, `.` beneath the descriptor the resolution opened (which is open for search, and a
+ * listing needs more). Under `beneath` the open is bracketed by the identity check like every component before
+ * it: that is the containment the header promises there. Under `at` the header promises the system's resolution,
+ * so nothing is checked around the open: a directory swapped in for the leaf is one the system's own open of the
+ * path would open too, O_NOFOLLOW alone refuses a final symlink under `refuse`, and the open's errno is the
+ * answer (resolve.h, `bc_file_system_resolve_open_directory`). */
+static int32_t open_resolved_directory(bc_file_system_engine *engine, int32_t operation, int32_t location_kind,
+                                       const bc_file_system_resolved *resolved, int32_t final_symlink, int32_t access,
+                                       owned_descriptor *opened, bc_file_system_error *error) {
+    const char *name = resolved->leaf_length == 0 ? "." : (const char *)resolved->leaf;
+    if (location_kind == bc_file_system_location_kind_at) {
+        return bc_file_system_resolve_open_directory(engine, operation, resolved->parent, name, final_symlink, access,
+                                                     opened, error);
+    }
+    bc_file_system_expected_entry expected;
+    const int32_t kind =
+        bc_file_system_resolve_expect_entry(engine, operation, resolved->parent, name, final_symlink, &expected, error);
+    if (kind != 0) {
+        return kind;
+    }
+    return bc_file_system_resolve_open_expected_directory(engine, operation, resolved->parent, name, final_symlink,
+                                                          access, &expected, opened, error);
+}
+
 int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_file_system_location *location,
                                       int32_t final_symlink, bc_file_system_directory **directory,
                                       bc_file_system_error *error) {
@@ -516,22 +580,16 @@ int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_fi
     if (kind != 0) {
         return kind;
     }
-    /* The leaf is opened as a directory with the caller's choice about a final symlink, bracketed by the
-     * identity check like every component before it. The root has no leaf: the parent the walk opened is the
-     * directory itself, and it is taken over rather than opened again. */
+    /* The leaf is opened as a directory, for search, with the caller's choice about a final symlink: bracketed by
+     * the identity check under `beneath`, like every component before it, and with nothing around the open under
+     * `at` (`open_resolved_directory`). The root has no leaf: the parent the resolution opened is the directory
+     * itself, and it is taken over rather than opened again. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
     if (resolved.leaf_length == 0) {
         opened.value = release_descriptor(&resolved.opened);
     } else {
-        bc_file_system_expected_entry expected;
-        kind = bc_file_system_resolve_expect_entry(engine, operation, resolved.parent, (const char *)resolved.leaf,
-                                                   final_symlink, &expected, error);
-        if (kind != 0) {
-            return kind;
-        }
-        kind = bc_file_system_resolve_open_expected_directory(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, final_symlink,
-            bc_file_system_directory_access_search, &expected, &opened, error);
+        kind = open_resolved_directory(engine, operation, location->kind, &resolved, final_symlink,
+                                       bc_file_system_directory_access_search, &opened, error);
         if (kind != 0) {
             return kind;
         }
@@ -1609,23 +1667,6 @@ static int32_t make_directory_with_mode(bc_file_system_engine *engine, int32_t o
     return 0;
 }
 
-/* Opens the directory a resolved location names, for `access`, bracketed by the identity check like every
- * component before it: the leaf under the caller's choice about a final symlink, or, for the root, `.` beneath
- * the descriptor the walk opened (which is open for search, and a listing needs more). */
-static int32_t open_resolved_directory(bc_file_system_engine *engine, int32_t operation,
-                                       const bc_file_system_resolved *resolved, int32_t final_symlink, int32_t access,
-                                       bc_file_system_expected_entry *expected, owned_descriptor *opened,
-                                       bc_file_system_error *error) {
-    const char *name = resolved->leaf_length == 0 ? "." : (const char *)resolved->leaf;
-    const int32_t kind =
-        bc_file_system_resolve_expect_entry(engine, operation, resolved->parent, name, final_symlink, expected, error);
-    if (kind != 0) {
-        return kind;
-    }
-    return bc_file_system_resolve_open_expected_directory(engine, operation, resolved->parent, name, final_symlink,
-                                                          access, expected, opened, error);
-}
-
 /* The choice a location makes about a symlink on its way: an `at` path is the system's to resolve, a
  * `beneath` path may hold no symlink at all. What an operation without a `final_symlink` of its own applies to
  * the directory it was handed. */
@@ -1683,7 +1724,16 @@ static bool name_was_taken(int32_t kind, const bc_file_system_error *error) {
 
 /* One component of the chain: opened as a directory when it is there (bracketed like a walk's component, the
  * system resolving a symlink under `at` and `beneath` refusing one), made with the mode and then opened when
- * it is not. `*child` receives the opened directory. */
+ * it is not. `*child` receives the opened directory.
+ *
+ * A directory this call has just made is opened with nothing checked around the open: no stat before it and no
+ * identity check after it. What the header promises here is the location kind's promise, and the open keeps
+ * it alone: under `beneath`, that nothing outside the held directory is reached and no symlink on the way is
+ * followed, which O_NOFOLLOW on this open keeps (a symlink swapped in answers `symlink_refused`); under `at`,
+ * the system's resolution. A directory swapped in for the one just made, between the mkdirat and this open, is
+ * opened and the chain goes on inside it, as the system's own `mkdir -p` goes on inside it (which follows a
+ * symlink there too). The bracket never closed that window: its stat came after the mkdirat, so it recorded
+ * whatever stood there by then, and the identity check proved only that the open found the same. */
 static int32_t open_or_create_component(bc_file_system_engine *engine, int32_t operation, int parent,
                                         const uint8_t *name, int32_t final_symlink, uint32_t mode,
                                         owned_descriptor *child, bc_file_system_error *error) {
@@ -1693,9 +1743,13 @@ static int32_t open_or_create_component(bc_file_system_engine *engine, int32_t o
     if (kind == bc_file_system_error_kind_not_found) {
         [[gnu::cleanup(discard_created_directory)]] created_directory created = created_directory_in(parent, name);
         kind = make_directory_with_mode(engine, operation, &created, mode, error);
+        if (kind == 0) {
+            return bc_file_system_resolve_open_directory(engine, operation, parent, (const char *)name, final_symlink,
+                                                         bc_file_system_directory_access_search, child, error);
+        }
         /* A name taken since the stat (this chain being made twice at once) is one that is there now, and what
          * is there is judged below like anything else; every other failure is the operation's. */
-        if (kind != 0 && !name_was_taken(kind, error)) {
+        if (!name_was_taken(kind, error)) {
             return kind;
         }
         kind = bc_file_system_resolve_expect_entry(engine, operation, parent, (const char *)name, final_symlink,
@@ -1858,28 +1912,9 @@ static int compare_entry_names(const void *left, const void *right) {
     return 0;
 }
 
-/* Counts the entries of the stream, from its start to its end. */
-static int32_t count_entries(bc_file_system_engine *engine, int32_t operation, DIR *stream, size_t *total,
-                             bc_file_system_error *error) {
-    *total = 0;
-    for (;;) {
-        uint8_t name[NAME_MAX + 1];
-        size_t name_length = 0;
-        unsigned char d_type = DT_UNKNOWN;
-        bool found = false;
-        const int32_t kind = next_entry_name(engine, operation, stream, name, &name_length, &d_type, &found, error);
-        if (kind != 0) {
-            return kind;
-        }
-        if (!found) {
-            return 0;
-        }
-        *total += 1;
-    }
-}
-
-/* Stores the entries of the stream into the caller's array, at most `capacity` of them, and counts every one:
- * `*seen` above `capacity` means the directory grew since it was counted. */
+/* Reads the stream once, from its start to its end: each entry is stored into the caller's array as it is read
+ * while the array has room, and once it is full the rest are counted without being stored (no name copied, no
+ * type asked for). `*seen` is how many were stored, or, above `capacity`, how many the listing needs. */
 static int32_t store_entries(bc_file_system_engine *engine, int32_t operation, DIR *stream,
                              bc_file_system_entry *entries, size_t capacity, size_t *seen,
                              bc_file_system_error *error) {
@@ -1935,12 +1970,11 @@ int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_fi
     if (kind != 0) {
         return kind;
     }
-    /* The directory is opened read-only, which a listing needs and the walk's search-only open does not give,
-     * bracketed like every component before it; the stream then owns the descriptor. */
-    bc_file_system_expected_entry expected;
+    /* The directory is opened read-only, which a listing needs and the walk's search-only open does not give;
+     * the stream then owns the descriptor. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    kind = open_resolved_directory(engine, operation, &resolved, final_symlink, bc_file_system_directory_access_read,
-                                   &expected, &opened, error);
+    kind = open_resolved_directory(engine, operation, location->kind, &resolved, final_symlink,
+                                   bc_file_system_directory_access_read, &opened, error);
     if (kind != 0) {
         return kind;
     }
@@ -1952,21 +1986,12 @@ int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_fi
                               bc_file_system_call_kind_of_errno(streamed.code));
     }
     (void)release_descriptor(&opened);
-    /* The entries are counted first, so a listing the caller's array cannot hold stores nothing and answers
-     * the count it needs; then the stream is read again from its start and the entries stored. A directory
-     * that grew in between is answered `buffer_too_small` again, with its new count, so the face's bounded
-     * grow loop is the only retry. A listing is complete or it is an error: nothing stored on the way is an
-     * answer. */
-    size_t total = 0;
-    kind = count_entries(engine, operation, stream.value, &total, error);
-    if (kind != 0) {
-        return kind;
-    }
-    if (total > capacity) {
-        *count = total;
-        return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
-    }
-    rewinddir(stream.value);
+    /* One pass: the entries are stored as they are read while the caller's array has room, and counted once it
+     * is full, so a listing that fits is one read of the directory. One that does not fit answers
+     * `buffer_too_small` with the count the pass reached, and the caller's next call is a pass of its own: a
+     * directory that grew in between answers that call's own count, `buffer_too_small` again, so the face's
+     * bounded grow loop is the only retry. A listing is complete or it is an error: what a failing pass stored
+     * in the array is never an answer. */
     size_t seen = 0;
     kind = store_entries(engine, operation, stream.value, entries, capacity, &seen, error);
     if (kind != 0) {
@@ -2403,29 +2428,14 @@ static bool spells_the_root(const bc_file_system_location *location) {
     return normalized_length == 1;
 }
 
-/* Whether the directory `expected` describes is the root of the file system, by identity: the root is opened
- * (the one open by path in the core) and described, and the two identities compared. */
-static int32_t is_the_root_by_identity(bc_file_system_engine *engine, int32_t operation,
-                                       const bc_file_system_expected_entry *expected, bool *is_root,
-                                       bc_file_system_error *error) {
-    const bc_file_system_location root_location = bc_file_system_location_at((const uint8_t *)"/", 1);
-    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved root = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, &root_location, &root, error);
-    if (kind != 0) {
-        return kind;
+/* Whether the directory `expected` describes is the root of the file system, by identity: compared with the
+ * root's identity the engine read when it was created, so the refusal asks the system nothing. */
+static bool is_the_root_by_identity(const bc_file_system_engine *engine,
+                                    const bc_file_system_expected_entry *expected) {
+    if (expected->device != engine->root_device) {
+        return false;
     }
-    struct stat info;
-    const bc_file_system_call_outcome described = bc_file_system_call_fstat(engine, operation, root.parent, &info);
-    if (!described.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_fstat, &described,
-                              bc_file_system_call_kind_of_errno(described.code));
-    }
-    if (expected->device != (uint64_t)info.st_dev) {
-        *is_root = false;
-        return 0;
-    }
-    *is_root = expected->inode == (uint64_t)info.st_ino;
-    return 0;
+    return expected->inode == engine->root_inode;
 }
 
 int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -2438,7 +2448,8 @@ int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     /* The root of the file system is refused by spelling before any system call, and by identity below before
-     * any removal: the one argument this operation will not take. */
+     * any removal (against the identity the engine read at its creation): the one argument this operation will
+     * not take. */
     if (spells_the_root(location)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
@@ -2457,7 +2468,7 @@ int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     /* What the leaf is, never followed: nothing is absence; anything but a directory is unlinked as it is, a
-     * symlink included; a directory is opened read-only, bracketed, and emptied. */
+     * symlink included; a directory that is not the root is opened read-only and emptied. */
     bc_file_system_expected_entry expected;
     int32_t kind = bc_file_system_resolve_expect_entry(engine, operation, resolved.parent, (const char *)resolved.leaf,
                                                        bc_file_system_final_symlink_refuse, &expected, error);
@@ -2482,18 +2493,22 @@ int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_
         *existed = 1;
         return succeed(error);
     }
-    bool is_root = false;
-    kind = is_the_root_by_identity(engine, operation, &expected, &is_root, error);
-    if (kind != 0) {
-        return kind;
-    }
-    if (is_root) {
+    if (is_the_root_by_identity(engine, &expected)) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
+    /* The top is opened read-only and never through a symlink. Under `beneath` the open is bracketed against
+     * the stat above, the containment the header promises there; under `at` the system's resolution is the
+     * promise, so the stat above decides what the leaf is and nothing is checked around the open. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    kind = bc_file_system_resolve_open_expected_directory(
-        engine, operation, resolved.parent, (const char *)resolved.leaf, bc_file_system_final_symlink_refuse,
-        bc_file_system_directory_access_read, &expected, &opened, error);
+    if (location->kind == bc_file_system_location_kind_at) {
+        kind = bc_file_system_resolve_open_directory(engine, operation, resolved.parent, (const char *)resolved.leaf,
+                                                     bc_file_system_final_symlink_refuse,
+                                                     bc_file_system_directory_access_read, &opened, error);
+    } else {
+        kind = bc_file_system_resolve_open_expected_directory(
+            engine, operation, resolved.parent, (const char *)resolved.leaf, bc_file_system_final_symlink_refuse,
+            bc_file_system_directory_access_read, &expected, &opened, error);
+    }
     if (kind != 0) {
         return kind;
     }
@@ -2547,15 +2562,14 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
     if (kind != 0) {
         return kind;
     }
-    /* The directory the name goes into is opened for search, bracketed; a final symlink is the system's to
-     * resolve under `at` and refused under `beneath`, as for any component. The root is the descriptor the
-     * resolution opened. */
+    /* The directory the name goes into is opened for search (bracketed under `beneath`); a final symlink is the
+     * system's to resolve under `at` and refused under `beneath`, as for any component. The root is the
+     * descriptor the resolution opened. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
     int directory = resolved.parent;
     if (resolved.leaf_length > 0) {
-        bc_file_system_expected_entry expected;
-        kind = open_resolved_directory(engine, operation, &resolved, symlink_choice_of(parent),
-                                       bc_file_system_directory_access_search, &expected, &opened, error);
+        kind = open_resolved_directory(engine, operation, parent->kind, &resolved, symlink_choice_of(parent),
+                                       bc_file_system_directory_access_search, &opened, error);
         if (kind != 0) {
             return kind;
         }
@@ -3477,13 +3491,12 @@ int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_
     if (kind != 0) {
         return kind;
     }
-    /* The directory is opened read-only, bracketed, and read through a stream whose descriptor serves every
-     * removal inside it: a final symlink is the system's to resolve under `at` and refused under `beneath`, as
-     * for any component. */
-    bc_file_system_expected_entry expected;
+    /* The directory is opened read-only (bracketed under `beneath`) and read through a stream whose descriptor
+     * serves every removal inside it: a final symlink is the system's to resolve under `at` and refused under
+     * `beneath`, as for any component. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    kind = open_resolved_directory(engine, operation, &resolved, symlink_choice_of(parent),
-                                   bc_file_system_directory_access_read, &expected, &opened, error);
+    kind = open_resolved_directory(engine, operation, parent->kind, &resolved, symlink_choice_of(parent),
+                                   bc_file_system_directory_access_read, &opened, error);
     if (kind != 0) {
         return kind;
     }

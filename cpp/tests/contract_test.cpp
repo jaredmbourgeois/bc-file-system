@@ -360,7 +360,7 @@ TEST_P(FileSystemContract, ReadFileOfAnEmptyFileIsEmpty) {
 }
 
 TEST_P(FileSystemContract, ReadFileReturnsAFileLargerThanAnyInternalBuffer) {
-    const std::string large(300 * 1024, 'x');
+    const std::string large((std::size_t{1} << 20) + (std::size_t{300} * 1024), 'x');
     bc::file_system_test::write_raw(path_of("large.bin"), large, 0644);
 
     const auto bytes = files().read_file(in("large.bin"), kWholeFileRefusingSymlink);
@@ -1428,11 +1428,11 @@ TEST_P(FileSystemContract, ListOfADirectoryThatCannotBeReadFailsWhileItsParentLi
     EXPECT_EQ(locked.error().path, path_of("locked").string());
 }
 
-// More entries than the face's first array holds, so the listing is asked for a second time with the capacity
-// the core named.
+// More entries than the face's first array holds (1,024), so the listing is asked for a second time with the
+// capacity the core named.
 TEST_P(FileSystemContract, ListReturnsMoreEntriesThanTheFirstArrayHolds) {
     std::vector<std::string> expected;
-    for (int number = 100; number < 400; ++number) {
+    for (int number = 1000; number < 2100; ++number) {
         const std::string name = "entry-with-a-reasonably-long-name-" + std::to_string(number) + ".txt";
         bc::file_system_test::write_raw(path_of(name), "", 0644);
         expected.push_back(name);
@@ -1458,10 +1458,10 @@ TEST_P(FileSystemContract, ListOfTheRootOfTheFileSystemIsNotEmpty) {
 // against the rule rather than faked; the types a listing reports are held by the sorted-listing case above
 // whichever way they came.
 
-// What a listing costs: the leaf opened once, read-only, one fdopendir, and every entry read twice, since the
-// entries are counted before any is stored (so an array too small stores nothing) and then stored; `.`, `..`
-// and the end of the stream are read each time too.
-TEST_F(ObservedContract, ListCountsTheEntriesThenStoresThemAndReadsEveryEntryTwice) {
+// What a listing costs: the leaf opened once, read-only, with nothing checked around the open under `at`, one
+// fdopendir, and every entry read once, since an entry is stored as it is read while the array has room (the
+// face's first offer holds 1,024); `.`, `..` and the end of the stream are read too.
+TEST_F(ObservedContract, ListOpensTheLeafOnceAndReadsEveryEntryOnce) {
     lay_out_a_small_tree(root_path());
 
     const auto entries = files().list_directory(root(), FinalSymlink::refuse);
@@ -1471,9 +1471,12 @@ TEST_F(ObservedContract, ListCountsTheEntriesThenStoresThemAndReadsEveryEntryTwi
     // The listed directory's parent by path, and the listed directory itself.
     EXPECT_EQ(count(Operation::list_directory, Step::open), 1U);
     EXPECT_EQ(count(Operation::list_directory, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::list_directory, Step::fstatat), 0U);
+    EXPECT_EQ(count(Operation::list_directory, Step::fstat), 0U);
+    EXPECT_EQ(count(Operation::list_directory, Step::identity_check), 0U);
     EXPECT_EQ(count(Operation::list_directory, Step::fdopendir), 1U);
-    // Three entries, `.` and `..`, and the end of the stream: six reads, twice.
-    EXPECT_EQ(count(Operation::list_directory, Step::readdir), 12U);
+    // Three entries, `.` and `..`, and the end of the stream: six reads, once.
+    EXPECT_EQ(count(Operation::list_directory, Step::readdir), 6U);
 }
 
 // A read of the stream that fails discards everything read before it: a listing is complete or an error.
@@ -1761,7 +1764,8 @@ TEST_P(FileSystemContract, OpenDirectoryWithoutPermissionIsPermissionDenied) {
 
 // What resolving an `at` location costs, read from the system calls it made: the parent, the test's own
 // directory, opened by path in one call with nothing around it, as the system resolves a path; then the leaf,
-// the operation's own, opened against it and bracketed by the identity check.
+// the operation's own, opened against it with nothing around that open either, since the header promises the
+// system's resolution under `at` (the bracket is `beneath`'s, below).
 TEST_F(ObservedContract, OpenDirectoryOpensTheParentByPathThenTheLeaf) {
     lay_out_directories(root_path());
 
@@ -1770,11 +1774,53 @@ TEST_F(ObservedContract, OpenDirectoryOpensTheParentByPathThenTheLeaf) {
     ASSERT_TRUE(directory.has_value()) << directory.error().message();
     EXPECT_EQ(count(Operation::open_directory, Step::open), 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::openat), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstatat), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstat), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::identity_check), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat2), 0U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat_nofollow_any), 0U);
+}
+
+// Under `beneath` the leaf is bracketed like every component before it: a stat before its open, the opened
+// descriptor's identity after it, and the two compared. The leaf sits directly in the held directory, so the
+// resolution opens nothing and the four steps are the leaf's alone.
+TEST_F(ObservedContract, BeneathTheLeafOpenIsBracketedByTheIdentityCheck) {
+    lay_out_directories(root_path());
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    const std::uint64_t opens_before = count(Operation::open_directory, Step::openat);
+
+    const auto directory = files().open_directory(Location::beneath(*parent, relative("sub")), FinalSymlink::refuse);
+
+    ASSERT_TRUE(directory.has_value()) << directory.error().message();
+    EXPECT_EQ(count(Operation::open_directory, Step::openat) - opens_before, 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::fstatat), 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::fstat), 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::identity_check), 1U);
-    EXPECT_EQ(count(Operation::open_directory, Step::openat2), 0U);
-    EXPECT_EQ(count(Operation::open_directory, Step::openat_nofollow_any), 0U);
+}
+
+// Under `at` and `refuse` the leaf's open carries O_NOFOLLOW, which with O_DIRECTORY beside it answers ENOTDIR for
+// a symlink as for a file. The answer that tells them apart is one look that never follows, made after the
+// refused open and only then: a symlink is `symlink_refused`, a file `not_directory`, and either error keeps the
+// open's step and errno.
+TEST_F(ObservedContract, UnderAtARefusedLeafIsToldASymlinkOrAFileByOneLookAfterTheOpen) {
+    lay_out_directories(root_path());
+
+    const auto through_the_link = files().open_directory(in("alias"), FinalSymlink::refuse);
+    const std::uint64_t looks_after_the_link = count(Operation::open_directory, Step::fstatat);
+    const auto at_the_file = files().open_directory(in("file"), FinalSymlink::refuse);
+
+    ASSERT_FALSE(through_the_link.has_value());
+    EXPECT_EQ(through_the_link.error().kind, ErrorKind::symlink_refused);
+    EXPECT_EQ(through_the_link.error().step, Step::openat);
+    EXPECT_EQ(through_the_link.error().system_code, ENOTDIR);
+    EXPECT_EQ(looks_after_the_link, 1U);
+    ASSERT_FALSE(at_the_file.has_value());
+    EXPECT_EQ(at_the_file.error().kind, ErrorKind::not_directory);
+    EXPECT_EQ(at_the_file.error().step, Step::openat);
+    EXPECT_EQ(at_the_file.error().system_code, ENOTDIR);
+    EXPECT_EQ(count(Operation::open_directory, Step::fstatat), 2U);
+    EXPECT_EQ(count(Operation::open_directory, Step::identity_check), 0U);
 }
 
 // The fast path, where the platform has one, opens the whole parent in one call under its own step; where it
@@ -1843,12 +1889,15 @@ TEST_F(ObservedContract, AnyOtherErrnoOnTheFastPathIsTheOperationsError) {
 }
 
 // The identity check is a step of its own, so the directory-swapped-between-stat-and-open race can be scripted
-// without a race: its refusal is `symlink_refused` at that step. The race itself is the C-only test's.
+// without a race: its refusal is `symlink_refused` at that step. The check is `beneath`'s (an `at` location's
+// open of the test's directory, first, reaches none), and the race itself is the C-only test's.
 TEST_F(ObservedContract, ARefusedIdentityCheckIsSymlinkRefused) {
     lay_out_directories(root_path());
     script(fail_step(Operation::open_directory, Step::identity_check, 1, EIO));
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
 
-    const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
+    const auto directory = files().open_directory(Location::beneath(*parent, relative("sub")), FinalSymlink::refuse);
 
     ASSERT_FALSE(directory.has_value());
     EXPECT_EQ(directory.error().kind, ErrorKind::symlink_refused);
@@ -1884,6 +1933,34 @@ TEST_F(ObservedContract, ReadFileOpensTheLeafMeasuresItReadsItAndProbesOnceForMo
     EXPECT_EQ(count(Operation::read_file, Step::openat), 1U);
     EXPECT_EQ(count(Operation::read_file, Step::fstat), 1U);
     EXPECT_EQ(count(Operation::read_file, Step::pread), 2U);
+}
+
+// The face's first offer is 1 MiB under `whole_file`, and the bound itself under a bound up to that (the size the
+// caller accepts), so a file that fits is one call: opened once and measured once. A file past it is refused once
+// with the size it needs and read by a second call, which opens and measures it again.
+TEST_F(ObservedContract, ReadFileIsOneCallUpToTheFacesFirstOfferAndTwoPastIt) {
+    const std::string fits(std::size_t{1} << 20, 'f');
+    const std::string past(fits.size() + 1, 'p');
+    bc::file_system_test::write_raw(path_of("fits.bin"), fits, 0644);
+    bc::file_system_test::write_raw(path_of("past.bin"), past, 0644);
+
+    const auto whole = files().read_file(in("fits.bin"), kWholeFileRefusingSymlink);
+    const std::uint64_t opens_whole = count(Operation::read_file, Step::openat);
+    const auto bounded = files().read_file(in("fits.bin"), reading_at_most(fits.size()));
+    const std::uint64_t opens_bounded = count(Operation::read_file, Step::openat) - opens_whole;
+    const auto larger = files().read_file(in("past.bin"), kWholeFileRefusingSymlink);
+    const std::uint64_t opens_larger = count(Operation::read_file, Step::openat) - opens_whole - opens_bounded;
+
+    ASSERT_TRUE(whole.has_value()) << whole.error().message();
+    ASSERT_TRUE(bounded.has_value()) << bounded.error().message();
+    ASSERT_TRUE(larger.has_value()) << larger.error().message();
+    EXPECT_EQ(whole->size(), fits.size());
+    EXPECT_EQ(bounded->size(), fits.size());
+    EXPECT_EQ(larger->size(), past.size());
+    EXPECT_EQ(opens_whole, 1U);
+    EXPECT_EQ(opens_bounded, 1U);
+    EXPECT_EQ(opens_larger, 2U);
+    EXPECT_EQ(count(Operation::read_file, Step::fstat), 4U);
 }
 
 // An empty file is one probe and no other read; its status is one stat of the leaf after the parent's open.
@@ -2191,6 +2268,40 @@ TEST_P(FileSystemContract, CreateDirectoriesRefusesAModeThatIsNotAMode) {
     EXPECT_EQ(created.error().kind, ErrorKind::invalid_argument);
     EXPECT_EQ(created.error().operation, Operation::create_directories);
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("a")));
+}
+
+// A directory the call has just made is opened with nothing checked around the open: no stat before it (the
+// one that found the name free came before the mkdirat) and no identity check after it, since a stat taken
+// after the mkdirat would record whatever stood there by then. A directory that was there already is bracketed
+// like a walk's component. Both chains are `beneath` the test's directory, so every step is the chain's own.
+TEST_F(ObservedContract, CreateDirectoriesOpensADirectoryItJustMadeWithNothingAroundTheOpen) {
+    bc::file_system_test::make_directory_raw(path_of("kept"), 0700);
+    bc::file_system_test::make_directory_raw(path_of("kept/x"), 0700);
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+
+    const auto made =
+        files().create_directories(Location::beneath(*parent, relative("made/a/b")), Permissions::exactly(0750));
+    const std::uint64_t stats_making = count(Operation::create_directories, Step::fstatat);
+    const std::uint64_t opens_making = count(Operation::create_directories, Step::openat);
+    const std::uint64_t checks_making = count(Operation::create_directories, Step::identity_check);
+    const auto existing =
+        files().create_directories(Location::beneath(*parent, relative("kept/x")), Permissions::exactly(0750));
+
+    ASSERT_TRUE(made.has_value()) << made.error().message();
+    ASSERT_TRUE(existing.has_value()) << existing.error().message();
+    EXPECT_EQ(bc::file_system_test::mode_raw(path_of("made/a/b")), 0750U);
+    // Three levels made: one stat each that found the name free, the mkdirat, the mode, the open.
+    EXPECT_EQ(stats_making, 3U);
+    EXPECT_EQ(count(Operation::create_directories, Step::mkdirat), 3U);
+    EXPECT_EQ(count(Operation::create_directories, Step::fchmodat), 3U);
+    EXPECT_EQ(opens_making, 3U);
+    EXPECT_EQ(checks_making, 0U);
+    // Two levels there already: each bracketed, a stat, the open, the descriptor's identity, the comparison.
+    EXPECT_EQ(count(Operation::create_directories, Step::fstatat) - stats_making, 2U);
+    EXPECT_EQ(count(Operation::create_directories, Step::openat) - opens_making, 2U);
+    EXPECT_EQ(count(Operation::create_directories, Step::fstat), 2U);
+    EXPECT_EQ(count(Operation::create_directories, Step::identity_check) - checks_making, 2U);
 }
 
 // -------------------------------------------------------------------------------------------------------------
@@ -2596,6 +2707,25 @@ TEST_F(RootRefusal, ARootReachedByDotDotThroughASymlinkIsRefusedByIdentity) {
     EXPECT_EQ(removed.error().kind, ErrorKind::invalid_argument);
     EXPECT_EQ(count(Operation::remove_tree, Step::unlinkat), 0U);
     EXPECT_TRUE(bc::file_system_test::exists_raw(path_of("alias")));
+}
+
+// The root's identity is read once, when the engine is created, so the refusal by identity asks the system
+// nothing: a tree removed through `at` opens its parent by path and nothing else by path (never `/`), and
+// describes no descriptor (the top is opened with nothing checked around the open under `at`; the stat that
+// decides it is a directory, and that the refusal compares, is the one `fstatat` before it).
+TEST_F(ObservedContract, RemoveTreeRefusesTheRootAgainstAnIdentityReadOnceWhenTheEngineWasCreated) {
+    bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
+    bc::file_system_test::write_raw(path_of("folder/file"), "content", 0644);
+
+    const auto removed = files().remove_tree(in("folder"));
+
+    ASSERT_TRUE(removed.has_value()) << removed.error().message();
+    EXPECT_TRUE(*removed);
+    EXPECT_EQ(count(Operation::remove_tree, Step::open), 1U);
+    EXPECT_EQ(count(Operation::remove_tree, Step::fstat), 0U);
+    EXPECT_EQ(count(Operation::remove_tree, Step::identity_check), 0U);
+    // The top's stat and the file's, which decides it is unlinked where it is.
+    EXPECT_EQ(count(Operation::remove_tree, Step::fstatat), 2U);
 }
 
 // -------------------------------------------------------------------------------------------------------------

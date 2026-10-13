@@ -26,7 +26,8 @@ public final class Engine: @unchecked Sendable {
         bc_file_system_engine_release(handle)
     }
 
-    /// The live engine of a composition root: probes the platform's fast paths once and carries no observer.
+    /// The live engine of a composition root: probes the platform's fast paths once, reads the identity of the
+    /// root of the file system once (what `removeTree` refuses by identity), and carries no observer.
     public static func live() throws(FileSystemError) -> Engine {
         var created: OpaquePointer?
         var coreError = bc_file_system_error()

@@ -5,7 +5,7 @@
 #
 #   cmake --preset bench && cmake --build --preset bench
 #   caffeinate -i build/bench/bench/bc_file_system_benchmark "$PWD/build/bench/bench/bench-temporary" \
-#       20 1000 3 20 4096 1048576 67108864 1000 16 1 8 50 200
+#       20 1000 3 20 4096 1048576 67108864 1000 16 400 1 8 50 200
 #
 # The program makes one directory under the root it is handed and removes it when it ends; the root itself is
 # made here, inside the build tree, so the run touches no shared directory.

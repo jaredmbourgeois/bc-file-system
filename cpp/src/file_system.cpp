@@ -28,11 +28,25 @@ namespace bc::file_system {
 
 namespace {
 
-// The first capacity offered to the core for an answer of variable length. One read serves most files and
-// names outright; a larger answer costs one more call, since the core names the capacity it needs.
-constexpr std::size_t first_read_capacity = std::size_t{64} * 1024;
+// The first capacity offered to the core for an answer of variable length. A larger answer costs one more call,
+// since the core names the capacity it needs, and that call resolves, opens and measures again.
+//
+// A file's bytes: 1 MiB, so one call serves every file up to 1 MiB, read into the answer itself and never
+// zero-filled first (`Bytes`). Measured at stage 28 through the core (macOS, APFS, median µs, one-minute load 57
+// to 95), against a 64 KiB first offer: a 4 KiB file 12.96 against 12.92, a 64 KiB file 17.12 against 15.88 (the
+// shrink to its size), a 256 KiB file 28.08 against 38.50, a 1 MiB file 43.04 against 59.83; the 64 KiB offer's
+// zero fill had cost 0.71 µs more at 4 KiB and 7.88 µs more at 1 MiB. A larger first offer is a fresh mapping on
+// every call on macOS: 16 MiB made a 1 MiB read 68.46 against 43.04. Read into storage of its own and copied into
+// a `std::vector<std::byte>` instead, an answer that outlives the call, as a caller's does, cost 13 µs more at
+// 1 MiB (66.42 against 53.42 at a load of 31, where the POSIX form that zero-fills a vector of the file's size
+// took 53.42).
+constexpr std::size_t first_read_capacity = std::size_t{1} << 20;
 constexpr std::size_t first_text_capacity = 1024;
-constexpr std::size_t first_entry_capacity = 64;
+// A listing: room for 1,024 entries (264 KiB), never zero-filled. Measured at stage 28 through the core, with
+// the core reading the directory once (same probe, median µs): an empty directory 18.12 against 18.21 for 64
+// entries, 10 entries 25.88 against 25.92, 1,000 entries 907.67 against 1,703.62 (64 and 256 entries both
+// overflow there and pay a second call). Zero-filled, the 1,024-entry offer cost 2.3 µs more on every listing.
+constexpr std::size_t first_entry_capacity = 1024;
 // The grow loop's bound, so a file that grows between two calls cannot livelock the face: after this many
 // attempts the `buffer_too_small` is returned as received.
 constexpr int most_attempts = 3;
@@ -57,9 +71,9 @@ auto answer_outside_enum(Operation called, std::string_view location_text) -> Er
                  .failed_location = std::nullopt};
 }
 
-// The buffer protocol as one loop. `call(buffer, capacity, &length, &c_error)` is the core's function with
-// everything but the buffer already bound; the answer lands in a `Container` of bytes or text, sized to what
-// the core stored.
+// The buffer protocol as one loop, for a text answer (a symlink's text, a name the core made, a directory's
+// opened-as text). `call(buffer, capacity, &length, &c_error)` is the core's function with everything but the
+// buffer already bound; the answer lands in a `Container` of text, sized to what the core stored.
 template <class Container, class Call>
 auto answered_into(std::size_t first_capacity, Operation called, std::string_view location_text, Call call)
     -> Result<Container> {
@@ -75,6 +89,35 @@ auto answered_into(std::size_t first_capacity, Operation called, std::string_vie
         }
         if (kind == bc_file_system_error_kind_buffer_too_small && attempt < most_attempts) {
             answer.resize(length);
+            continue;
+        }
+        return error_from(c_error, called, location_text);
+    }
+}
+
+// The buffer protocol for a file's bytes, read into the answer itself: `Bytes` grows without a zero fill, since
+// the core writes what it answers. Only what the core stored is the answer: its length cuts the vector, never past
+// the room the core was offered, so nothing of the storage behind it (whatever the allocator left there) can reach
+// it; and an answer filling less than half its storage is moved into storage of its own size, so a small file
+// read through the 1 MiB first offer holds no more than it needs. `call` is as for `answered_into`.
+template <class Call>
+auto bytes_answered_into(std::size_t first_capacity, Operation called, std::string_view location_text, Call call)
+    -> Result<Bytes> {
+    std::size_t capacity = first_capacity;
+    for (int attempt = 1;; ++attempt) {
+        Bytes answer(capacity);
+        std::size_t length = 0;
+        bc_file_system_error c_error;
+        const std::int32_t kind = call(reinterpret_cast<std::uint8_t*>(answer.data()), capacity, &length, &c_error);
+        if (kind == 0) {
+            answer.resize(std::min(length, capacity));
+            if (answer.capacity() / 2 > answer.size()) {
+                answer.shrink_to_fit();
+            }
+            return answer;
+        }
+        if (kind == bc_file_system_error_kind_buffer_too_small && attempt < most_attempts) {
+            capacity = length;
             continue;
         }
         return error_from(c_error, called, location_text);
@@ -241,33 +284,33 @@ auto FileSystem::status(const Location& location, FinalSymlink final_symlink) no
     return answer;
 }
 
-auto FileSystem::read_file(const Location& location, const ReadOptions& options) noexcept
-    -> Result<std::vector<std::byte>> {
+auto FileSystem::read_file(const Location& location, const ReadOptions& options) noexcept -> Result<Bytes> {
     const bc_file_system_location c_location = location.to_c();
     const bc_file_system_read_options c_options = to_c(options);
-    // Under a bound no successful answer is longer than the bound, so a smaller bound is offered whole.
+    // Under a bound no successful answer is longer than the bound, the size the caller accepts, so a bound up to
+    // the first capacity is offered whole and its read is one call. A larger bound is offered the first capacity,
+    // as `whole_file` is: an offer past it would be a fresh mapping on every call, whatever the file's size.
     const ReadLimit limit = options.limit.value;
     const std::size_t first_capacity =
         limit.kind() == ReadLimitKind::at_most
             ? static_cast<std::size_t>(std::min<std::uint64_t>(limit.bound(), first_read_capacity))
             : first_read_capacity;
-    return answered_into<std::vector<std::byte>>(
-        first_capacity, Operation::read_file, location.text(),
-        [this, &c_location, &c_options](std::uint8_t* buffer, std::size_t capacity, std::size_t* length,
-                                        bc_file_system_error* c_error) {
-            return bc_file_system_read_file(engine_.handle(), &c_location, &c_options, buffer, capacity, length,
-                                            c_error);
-        });
+    return bytes_answered_into(first_capacity, Operation::read_file, location.text(),
+                               [this, &c_location, &c_options](std::uint8_t* buffer, std::size_t capacity,
+                                                               std::size_t* length, bc_file_system_error* c_error) {
+                                   return bc_file_system_read_file(engine_.handle(), &c_location, &c_options, buffer,
+                                                                   capacity, length, c_error);
+                               });
 }
 
 auto FileSystem::read_file_if_present(const Location& location, const ReadOptions& options) noexcept
-    -> Result<std::optional<std::vector<std::byte>>> {
-    Result<std::vector<std::byte>> answer = read_file(location, options);
+    -> Result<std::optional<Bytes>> {
+    Result<Bytes> answer = read_file(location, options);
     if (answer.has_value()) {
-        return std::optional<std::vector<std::byte>>{std::move(answer).value()};
+        return std::optional<Bytes>{std::move(answer).value()};
     }
     if (answer.error().kind == ErrorKind::not_found) {
-        return std::optional<std::vector<std::byte>>{};
+        return std::optional<Bytes>{};
     }
     return std::move(answer).error();
 }
@@ -331,14 +374,17 @@ auto FileSystem::create_directories(const Location& location, Permissions permis
 auto FileSystem::list_directory(const Location& location, FinalSymlink final_symlink) noexcept
     -> Result<std::vector<Entry>> {
     const bc_file_system_location c_location = location.to_c();
-    // The buffer protocol over an array of entries rather than bytes: the same bounded grow loop.
-    std::vector<bc_file_system_entry> c_entries(first_entry_capacity);
+    // The buffer protocol over an array of entries rather than bytes: the same bounded grow loop. The array is
+    // never zero-filled (`DefaultInitializingAllocator`, as for `Bytes`): the core writes every entry it answers,
+    // and nothing past `count` is read.
+    std::size_t capacity = first_entry_capacity;
     for (int attempt = 1;; ++attempt) {
+        std::vector<bc_file_system_entry, DefaultInitializingAllocator<bc_file_system_entry>> c_entries(capacity);
         std::size_t count = 0;
         bc_file_system_error c_error;
         const std::int32_t kind =
             bc_file_system_list_directory(engine_.handle(), &c_location, static_cast<std::int32_t>(final_symlink),
-                                          c_entries.data(), c_entries.size(), &count, &c_error);
+                                          c_entries.data(), capacity, &count, &c_error);
         if (kind == 0) {
             std::vector<Entry> entries;
             entries.reserve(count);
@@ -352,7 +398,7 @@ auto FileSystem::list_directory(const Location& location, FinalSymlink final_sym
             return entries;
         }
         if (kind == bc_file_system_error_kind_buffer_too_small && attempt < most_attempts) {
-            c_entries.resize(count);
+            capacity = count;
             continue;
         }
         return error_from(c_error, Operation::list_directory, location.text());

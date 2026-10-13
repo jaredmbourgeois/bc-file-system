@@ -144,7 +144,9 @@ public struct FileSystem: Sendable {
     /// received.
     public func readFile(_ location: Location, options: ReadOptions) throws(FileSystemError) -> [UInt8] {
         let coreOptions = options.core
-        // Under a bound no successful answer is longer than the bound, so a smaller bound is offered whole.
+        // Under a bound no successful answer is longer than the bound, the size the caller accepts, so a bound up
+        // to the first capacity is offered whole and its read is one call. A larger bound is offered the first
+        // capacity, as `wholeFile` is: an offer past it would be a fresh mapping on every call.
         let firstCapacity: Int
         switch options.limit {
         case .wholeFile:
@@ -233,21 +235,26 @@ public struct FileSystem: Sendable {
 
     /// The entries of a directory, sorted by name so a listing is the same on every run; complete or an error.
     public func listDirectory(_ location: Location, finalSymlink: FinalSymlink) throws(FileSystemError) -> [Entry] {
-        // The buffer protocol over an array of entries rather than bytes: the same bounded grow loop.
+        // The buffer protocol over an array of entries rather than bytes: the same bounded grow loop. The array is
+        // never zero-filled: the core writes every entry it answers.
         var capacity = firstEntryCapacity
         var coreError = bc_file_system_error()
         let bufferTooSmall = Int32(bc_file_system_error_kind_buffer_too_small.rawValue)
         for attempt in 1...mostAttempts {
-            var coreEntries = [bc_file_system_entry](repeating: bc_file_system_entry(), count: capacity)
+            var outcome: Int32 = 0
             var count = 0
-            let outcome = engine.withHandle { handle in
-                location.withCore { coreLocation in
-                    coreEntries.withUnsafeMutableBufferPointer { buffer in
+            let coreEntries = [bc_file_system_entry](unsafeUninitializedCapacity: capacity) {
+                uninitialized, initializedCount in
+                outcome = engine.withHandle { handle in
+                    location.withCore { coreLocation in
                         bc_file_system_list_directory(
-                            handle, coreLocation, finalSymlink.rawValue, buffer.baseAddress, buffer.count, &count,
+                            handle, coreLocation, finalSymlink.rawValue, uninitialized.baseAddress, capacity, &count,
                             &coreError)
                     }
                 }
+                // Only the entries the core stored are ever counted as initialised: on success the first `count`,
+                // which the header holds within the capacity offered; on any failure none.
+                initializedCount = outcome == 0 ? min(count, capacity) : 0
             }
             if outcome == 0 {
                 var entries: [Entry] = []

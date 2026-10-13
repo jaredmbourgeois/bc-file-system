@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -29,10 +30,28 @@ struct Summary {
     std::int64_t p90_nanoseconds;
 };
 
-/// Runs `prepare` and then `action`, `warm_up` times, then `timed` times with only `action` between two readings
-/// of `now`. Answers the summary of the timed samples, or nothing as soon as `prepare` or `action` fails.
-[[nodiscard]] auto measure(Now now, const Repetitions& repetitions, const Action& prepare, const Action& action)
-    -> std::optional<Summary>;
+/// One form a group times: what it does untimed before each of its runs, and the run itself.
+struct Timed {
+    Action prepare;
+    Action action;
+};
+
+/// What timing a group's forms answers: one summary per form, in the forms' order, or the form that failed.
+struct GroupMeasurement {
+    /// Empty when a form failed.
+    std::vector<Summary> summaries;
+    /// The index of the form whose `prepare` or `action` failed first, if one did.
+    std::optional<std::size_t> failed_form;
+};
+
+/// Runs every form of a group in turn within each run: the first form's `prepare` and then its `action`, then the
+/// second's, and so on, `warm_up` times untimed, then `timed` times with only each `action` between two readings
+/// of `now`. The forms interleave run by run, never all of one form's runs before the next form's, so whatever
+/// the system does late on behalf of an earlier group (a delayed write-back after the durable writes) lands
+/// across every form of the group it falls in, not on whichever form happened to run first. `repetitions.timed`
+/// is at least 1, which the command line holds.
+[[nodiscard]] auto measure_interleaved(Now now, const Repetitions& repetitions, const std::vector<Timed>& forms)
+    -> GroupMeasurement;
 
 /// One line of the printed table. The library's rows carry the system calls the operation made, counted on an
 /// observed engine; the standard library's rows leave those cells empty.

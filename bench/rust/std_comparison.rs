@@ -19,8 +19,11 @@
 //! ```text
 //! caffeinate -i cargo bench --manifest-path crates/Cargo.toml -p bc-file-system --bench std_comparison -- \
 //!     <temporary-root> <warm-up> <iterations> <large-warm-up> <large-iterations> \
-//!     <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> <depth>...
+//!     <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> <deep-chain-depth> <depth>...
 //! ```
+//!
+//! The forms of one group interleave run by run (`measure_interleaved`), so no form is timed all at once right
+//! after another group.
 
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -51,19 +54,23 @@ struct Repetitions {
 struct Parameters {
     temporary_root: PathBuf,
     repetitions: Repetitions,
-    /// For the copies of the large file, each of which moves the whole file.
+    /// For the rows whose one run is long: the copies of the large file, each of which moves the whole file, and
+    /// the deep chain's creation and removal.
     large_repetitions: Repetitions,
     small_size: usize,
     medium_size: usize,
     large_size: usize,
     entry_count: usize,
     chain_depth: usize,
+    /// The chain the removal's bounded window re-descends (design doc, S6): deeper than one window.
+    deep_chain_depth: usize,
     status_depths: Vec<usize>,
 }
 
 const USAGE: &str = "usage: std_comparison <temporary-root> <warm-up> <iterations> <large-warm-up> \
-<large-iterations> <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> <depth>...\n  every \
-count and size is a positive integer; <temporary-root> is an absolute path to an existing directory\n";
+<large-iterations> <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> <deep-chain-depth> \
+<depth>...\n  every count and size is a positive integer; <temporary-root> is an absolute path to an existing \
+directory\n";
 
 /// The count the text spells, or nothing for anything but a positive decimal integer.
 fn positive_count(text: &OsString) -> Option<usize> {
@@ -73,7 +80,7 @@ fn positive_count(text: &OsString) -> Option<usize> {
 
 /// Every argument is required: a missing one is a usage error, never a value chosen here.
 fn parameters_from(arguments: &[OsString]) -> Option<Parameters> {
-    const FIXED_ARGUMENTS: usize = 10;
+    const FIXED_ARGUMENTS: usize = 11;
     if arguments.len() < FIXED_ARGUMENTS + 1 {
         return None;
     }
@@ -101,6 +108,7 @@ fn parameters_from(arguments: &[OsString]) -> Option<Parameters> {
         large_size: count(7)?,
         entry_count: count(8)?,
         chain_depth: count(9)?,
+        deep_chain_depth: count(10)?,
         status_depths,
     })
 }
@@ -114,41 +122,66 @@ struct Summary {
     p90_nanoseconds: u128,
 }
 
-/// Runs `prepare` and then `action`, `warm_up` times, then `timed` times with only `action` between two readings
-/// of `now`. Answers the summary of the timed samples, or nothing as soon as `prepare` or `action` fails, because
-/// the numbers of a failing row would time the failure.
-fn measure(
-    now: fn() -> Instant,
-    repetitions: Repetitions,
-    prepare: &mut dyn FnMut() -> bool,
-    action: &mut dyn FnMut() -> bool,
-) -> Option<Summary> {
-    for _ in 0..repetitions.warm_up {
-        if !prepare() || !action() {
-            return None;
-        }
-    }
-    let mut samples = Vec::with_capacity(repetitions.timed);
-    for _ in 0..repetitions.timed {
-        if !prepare() {
-            return None;
-        }
-        let started = now();
-        let succeeded = action();
-        let finished = now();
-        if !succeeded {
-            return None;
-        }
-        samples.push(finished.duration_since(started).as_nanos());
-    }
+/// One form a group times: what it does untimed before each of its runs, and the run itself.
+struct Timed<'form> {
+    prepare: &'form mut dyn FnMut() -> bool,
+    action: Box<dyn FnMut() -> bool + 'form>,
+}
+
+/// The summary of one form's timed samples. Both answers are samples that were taken, never interpolated: the
+/// median is the middle one (the upper of the two middle ones for an even count), and the 90th percentile is the
+/// nearest rank, ceil(0.9 × count). Nothing for no samples, which the command line's positive counts rule out.
+fn summary_of(mut samples: Vec<u128>) -> Option<Summary> {
     samples.sort_unstable();
-    // Both answers are samples that were taken, never interpolated: the median is the middle one (the upper of
-    // the two middle ones for an even count), and the 90th percentile is the nearest rank, ceil(0.9 × count).
     let p90_rank = (samples.len() * 9).div_ceil(10);
     Some(Summary {
         median_nanoseconds: *samples.get(samples.len() / 2)?,
         p90_nanoseconds: *samples.get(p90_rank.checked_sub(1)?)?,
     })
+}
+
+/// Runs every form of a group in turn within each run: the first form's `prepare` and then its `action`, then the
+/// second's, and so on, `warm_up` times untimed, then `timed` times with only each `action` between two readings
+/// of `now`. The forms interleave run by run, never all of one form's runs before the next form's, so whatever the
+/// system does late on behalf of an earlier group (a delayed write-back after the durable writes) lands across
+/// every form of the group it falls in, not on whichever form happened to run first. Answers one summary per
+/// form, in their order, or the index of the form that failed first, because the numbers of a failing form would
+/// time the failure.
+fn measure_interleaved(
+    now: fn() -> Instant,
+    repetitions: Repetitions,
+    forms: &mut [Timed<'_>],
+) -> Result<Vec<Summary>, usize> {
+    for _ in 0..repetitions.warm_up {
+        for (index, form) in forms.iter_mut().enumerate() {
+            if !(form.prepare)() || !(form.action)() {
+                return Err(index);
+            }
+        }
+    }
+    let mut samples: Vec<Vec<u128>> = forms
+        .iter()
+        .map(|_| Vec::with_capacity(repetitions.timed))
+        .collect();
+    for _ in 0..repetitions.timed {
+        for ((index, form), form_samples) in forms.iter_mut().enumerate().zip(&mut samples) {
+            if !(form.prepare)() {
+                return Err(index);
+            }
+            let started = now();
+            let succeeded = (form.action)();
+            let finished = now();
+            if !succeeded {
+                return Err(index);
+            }
+            form_samples.push(finished.duration_since(started).as_nanos());
+        }
+    }
+    samples
+        .into_iter()
+        .enumerate()
+        .map(|(index, form_samples)| summary_of(form_samples).ok_or(index))
+        .collect()
 }
 
 /// `hundredths` as "<whole>.<two digits>", the shape both columns of numbers share.
@@ -304,6 +337,10 @@ struct LibraryRow {
     operations: Vec<Operation>,
     prepare: Prepare,
     action: SideAction,
+    /// For a removal that holds a bounded window of levels: how many levels the tree has, each opened at least
+    /// once, so that its calls also say how many opens past those the window's re-descents cost. `None` for every
+    /// other row.
+    levels_opened_once: Option<usize>,
 }
 
 /// A row of `std::fs`: what it does not promise that the crate does ("less: …"), or "same".
@@ -340,6 +377,20 @@ fn library_row(
         operations: operations.to_vec(),
         prepare,
         action,
+        levels_opened_once: None,
+    }
+}
+
+/// The live row of a removal through the bounded window, whose calls name its re-descents' opens.
+fn live_window_removal_row(
+    levels: usize,
+    operations: &[Operation],
+    prepare: Prepare,
+    action: SideAction,
+) -> LibraryRow {
+    LibraryRow {
+        levels_opened_once: Some(levels),
+        ..library_row(LIVE, EngineKind::Live, operations, prepare, action)
     }
 }
 
@@ -393,7 +444,9 @@ fn call_count(before: &[u64], after: &[u64]) -> (String, String) {
     (calls.to_string(), steps.join(", "))
 }
 
-/// One run of the row on the engine that observes it, between two readings of its step counts.
+/// One run of the row on the engine that observes it, between two readings of its step counts. A window removal's
+/// calls also say how many of its `openat`s re-opened a level a pass before it had opened (every level is opened
+/// at least once; each later pass descends from the top again).
 fn count_calls(sides: &Sides<'_>, row: &mut LibraryRow) -> Option<(String, String)> {
     let (side, observer) = sides.counted(row.timed_on);
     let before = step_counts(observer, &row.operations)?;
@@ -401,42 +454,79 @@ fn count_calls(sides: &Sides<'_>, row: &mut LibraryRow) -> Option<(String, Strin
         return None;
     }
     let after = step_counts(observer, &row.operations)?;
-    Some(call_count(&before, &after))
+    let (mut calls, steps) = call_count(&before, &after);
+    if let Some(levels) = row.levels_opened_once {
+        let openat = Step::ALL.iter().position(|&step| step == Step::Openat)?;
+        let opens = after.get(openat)? - before.get(openat)?;
+        let reopens = opens.checked_sub(u64::try_from(levels).ok()?)?;
+        calls = format!("{calls} ({reopens} reopens)");
+    }
+    Some((calls, steps))
 }
 
-/// Measures every row of `group` and appends its lines to `table`; answers the form that failed, if one did.
+/// Measures every row of `group` and appends its lines to `table`; answers the form that failed, if one did. Each
+/// library row's calls are counted first, in a run of its own on the engine that observes it; then every form of
+/// the group is timed interleaved with the others, the library's rows first in each run, then each comparison.
 fn measure_group(
     now: fn() -> Instant,
     sides: &Sides<'_>,
     group: &mut Group,
     table: &mut Vec<TableRow>,
 ) -> Result<(), String> {
-    let mut lines = Vec::new();
+    let mut counts = Vec::new();
     for row in &mut group.library_rows {
-        let (calls, steps) =
-            count_calls(sides, row).ok_or_else(|| format!("{} (counting its calls)", row.form))?;
+        counts.push(
+            count_calls(sides, row).ok_or_else(|| format!("{} (counting its calls)", row.form))?,
+        );
+    }
+    let form_names: Vec<String> = group
+        .library_rows
+        .iter()
+        .map(|row| row.form.clone())
+        .chain(group.comparison_rows.iter().map(|row| row.form.clone()))
+        .collect();
+    let mut forms = Vec::new();
+    for row in &mut group.library_rows {
         let side = sides.of(row.timed_on);
-        let form = row.form.clone();
         let LibraryRow {
             prepare, action, ..
         } = row;
-        let summary = measure(now, group.repetitions, prepare, &mut || action(side))
-            .ok_or_else(|| form.clone())?;
+        forms.push(Timed {
+            prepare: prepare.as_mut(),
+            action: Box::new(move || action(side)),
+        });
+    }
+    for row in &mut group.comparison_rows {
+        let ComparisonRow {
+            prepare, action, ..
+        } = row;
+        forms.push(Timed {
+            prepare: prepare.as_mut(),
+            action: Box::new(action),
+        });
+    }
+    // The index a failure names is one of `forms`, which has a name for every one of them.
+    let summaries = measure_interleaved(now, group.repetitions, &mut forms)
+        .map_err(|failed| form_names[failed].clone())?;
+    drop(forms);
+    let mut lines = Vec::new();
+    for ((row, (calls, steps)), summary) in group.library_rows.iter().zip(counts).zip(&summaries) {
         lines.push(TableRow {
             operation: group.operation.clone(),
             case_label: group.case_label.clone(),
-            form,
+            form: row.form.clone(),
             guarantee: "library".to_owned(),
-            summary,
+            summary: *summary,
             versus_same: String::new(),
             calls,
             steps,
         });
     }
     let mut same = None;
-    for row in &mut group.comparison_rows {
-        let summary = measure(now, group.repetitions, &mut row.prepare, &mut row.action)
-            .ok_or_else(|| row.form.clone())?;
+    // One summary per form, the library's rows first: the rest are the comparisons'.
+    let comparison_summaries = &summaries[group.library_rows.len()..];
+    for (row, summary) in group.comparison_rows.iter().zip(comparison_summaries) {
+        let summary = *summary;
         if row.guarantee == "same" && same.is_none() {
             same = Some(summary);
         }
@@ -1280,6 +1370,110 @@ fn chain_group(parameters: &Parameters, paths: &WorkPaths) -> Result<Group, Erro
     })
 }
 
+/// The deep chain's levels: `deep`, then `d` inside each level, the text of the deepest beneath the files
+/// directory and the path of every level.
+fn deep_chain(parameters: &Parameters, paths: &WorkPaths) -> (String, Vec<PathBuf>) {
+    let mut deepest_text = "deep".to_owned();
+    let mut levels = vec![paths.files.join("deep")];
+    for _ in 1..parameters.deep_chain_depth {
+        deepest_text.push_str("/d");
+        levels.push(paths.files.join(&deepest_text));
+    }
+    (deepest_text, levels)
+}
+
+/// The deep chain's removal (design doc, S6 in "Unknowns"): a chain deeper than the window of sixteen levels the
+/// removal holds open, so it re-descends from the top in passes, and every level it passes again is opened again,
+/// read-only. Made untimed before each run with `fs::create_dir_all` (by path: `std::fs` has no `mkdirat`), after
+/// anything left at its name (the creation group's last chain) is cleared. `fs::remove_dir_all` recurses with one
+/// descriptor held per level, which the crate's bounded window does not.
+fn deep_removal_group(parameters: &Parameters, paths: &WorkPaths) -> Result<Group, Error> {
+    let top = relative("deep")?;
+    let (_, levels) = deep_chain(parameters, paths);
+    let (top_path, deepest_path) = (levels[0].clone(), levels[levels.len() - 1].clone());
+    let make = move || {
+        let cleared = match fs::remove_dir_all(&top_path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        };
+        cleared && fs::create_dir_all(&deepest_path).is_ok()
+    };
+    let std_top = levels[0].clone();
+    Ok(Group {
+        operation: "remove_tree".to_owned(),
+        case_label: format!("{}-level chain", parameters.deep_chain_depth),
+        repetitions: parameters.large_repetitions,
+        library_rows: vec![live_window_removal_row(
+            parameters.deep_chain_depth,
+            &[Operation::RemoveTree],
+            Box::new(make.clone()),
+            Box::new(move |side: &Side<'_>| {
+                side.engine
+                    .remove_tree(&Location::Beneath(&side.files, &top))
+                    .is_ok_and(|existed| existed)
+            }),
+        )],
+        comparison_rows: vec![comparison_row(
+            "`fs::remove_dir_all`",
+            "less: a descriptor per level",
+            Box::new(make),
+            Box::new(move || fs::remove_dir_all(&std_top).is_ok()),
+        )],
+    })
+}
+
+/// The same deep chain's creation, timed on its own: removed untimed before each run (the chain the run before
+/// made), and made by each form. `std::fs` goes by path, so the chain's text must fit `PATH_MAX` here.
+fn deep_creation_group(parameters: &Parameters, paths: &WorkPaths) -> Result<Group, Error> {
+    let (deepest_text, levels) = deep_chain(parameters, paths);
+    let deepest = relative(&deepest_text)?;
+    let top_path = levels[0].clone();
+    let clear = move || match fs::remove_dir_all(&top_path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    };
+    let plain_deepest = levels[levels.len() - 1].clone();
+    let same_deepest = plain_deepest.clone();
+    Ok(Group {
+        operation: "create_directories".to_owned(),
+        case_label: format!("{}-level chain", parameters.deep_chain_depth),
+        repetitions: parameters.large_repetitions,
+        library_rows: vec![library_row(
+            LIVE,
+            EngineKind::Live,
+            &[Operation::CreateDirectories],
+            Box::new(clear.clone()),
+            Box::new(move |side: &Side<'_>| {
+                side.engine
+                    .create_directories(
+                        &Location::Beneath(&side.files, &deepest),
+                        Permissions::exactly(0o700),
+                    )
+                    .is_ok()
+            }),
+        )],
+        comparison_rows: vec![
+            comparison_row(
+                "`fs::create_dir_all`",
+                "less: modes from the umask",
+                Box::new(clear.clone()),
+                Box::new(move || fs::create_dir_all(&plain_deepest).is_ok()),
+            ),
+            comparison_row(
+                "`fs::create_dir_all`, `fs::set_permissions` per level",
+                "same",
+                Box::new(clear),
+                Box::new(move || {
+                    fs::create_dir_all(&same_deepest).is_ok()
+                        && levels.iter().all(|level| {
+                            fs::set_permissions(level, fs::Permissions::from_mode(0o700)).is_ok()
+                        })
+                }),
+            ),
+        ],
+    })
+}
+
 fn lock_group(parameters: &Parameters, paths: &WorkPaths) -> Result<Group, Error> {
     let path = relative("lock-target")?;
     let target = paths.files.join("lock-target");
@@ -1393,6 +1587,8 @@ fn every_group(
     groups.extend(rename_groups(parameters, paths, held)?);
     groups.push(list_group(parameters, paths)?);
     groups.push(chain_group(parameters, paths)?);
+    groups.push(deep_creation_group(parameters, paths)?);
+    groups.push(deep_removal_group(parameters, paths)?);
     groups.push(lock_group(parameters, paths)?);
     Ok(groups)
 }
@@ -1465,11 +1661,13 @@ fn run(
     let print = |output: &mut dyn Write| -> io::Result<()> {
         writeln!(
             output,
-            "bc-file-system benchmark, Rust face: {} timed runs after {} warm-up runs ({} copies: {} after {}); \
-             the work directory is {depth} components below `/`; times in µs.\n",
+            "bc-file-system benchmark, Rust face: {} timed runs after {} warm-up runs ({} copies and the \
+             {}-level chain: {} after {}), the forms of each group interleaved run by run; the work directory is \
+             {depth} components below `/`; times in µs.\n",
             parameters.repetitions.timed,
             parameters.repetitions.warm_up,
             size_label(parameters.large_size),
+            parameters.deep_chain_depth,
             parameters.large_repetitions.timed,
             parameters.large_repetitions.warm_up
         )?;

@@ -128,3 +128,19 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
                                                        const char *name, int32_t final_symlink, int32_t access,
                                                        const bc_file_system_expected_entry *expected,
                                                        owned_descriptor *opened, bc_file_system_error *error);
+
+/* Opens a directory entry with nothing checked around the open: no stat before it and no identity check after
+ * it, the system's answer to the open being the answer. What an `at` location's leaf is opened with, since the
+ * header promises the system's resolution there and a directory swapped in for the leaf is one the system's own
+ * open of the path would open too, and what a directory the operation has just made is opened with, whose
+ * bracket would record whatever stood there after the mkdirat anyway. The flags are those of
+ * `bc_file_system_resolve_open_expected_directory` (step `openat`), and so is the search-permission step after a
+ * search-only open on a platform whose open checks none. The errno is read by the core's one table (`ENOENT`
+ * `not_found`, `ENOTDIR` `not_directory`, `ELOOP` `symlink_refused`, `EACCES` `permission_denied`), with one
+ * reading the open cannot make alone: under `refuse`, O_DIRECTORY beside O_NOFOLLOW answers ENOTDIR for a
+ * symlink as for a file (macOS and Linux alike), so an ENOTDIR there is followed by one `fstatat` that never
+ * follows, on the failing path only, and a symlink is `symlink_refused`; the error keeps the open's step and
+ * errno. Stores the descriptor in `*opened`, which must hold none (-1) on entry and is untouched on failure. */
+int32_t bc_file_system_resolve_open_directory(bc_file_system_engine *engine, int32_t operation, int parent,
+                                              const char *name, int32_t final_symlink, int32_t access,
+                                              owned_descriptor *opened, bc_file_system_error *error);

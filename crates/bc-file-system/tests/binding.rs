@@ -746,9 +746,9 @@ fn read_file_if_present_passes_an_error_other_than_not_found_through() {
 
 #[test]
 fn read_file_grows_its_buffer_to_a_file_larger_than_the_first_capacity() {
-    // The face offers 64 KiB first; the core names the capacity it needs and the face asks once more.
+    // The face offers 1 MiB first; the core names the capacity it needs and the face asks once more.
     let case = Case::named("grow-read");
-    let large = vec![b'g'; 100 * 1024];
+    let large = vec![b'g'; (1 << 20) + 100 * 1024];
     case.directory
         .write_raw("large.bin", &large, 0o644)
         .expect("setup");
@@ -762,15 +762,62 @@ fn read_file_grows_its_buffer_to_a_file_larger_than_the_first_capacity() {
     assert_eq!(bytes, large);
 }
 
+// The face's buffer is never initialised before the core writes it, so an answer shorter than the buffer it was
+// read into must hold the file's own bytes and nothing of what the buffer held before: a large read first leaves
+// its bytes where the allocator may hand the next buffer out again, and the short file read next is answered as
+// exactly its bytes, its length its own and its capacity nowhere near the first offer's, under either limit.
+#[test]
+fn read_file_of_a_file_shorter_than_the_first_offer_answers_only_its_own_bytes() {
+    let case = Case::named("short-read");
+    let large = vec![b'L'; 900 * 1024];
+    case.directory
+        .write_raw("large.bin", &large, 0o644)
+        .expect("setup");
+    case.directory
+        .write_raw("short.txt", b"seven b", 0o644)
+        .expect("setup");
+    let large_file = case.at("large.bin");
+    let short_file = case.at("short.txt");
+    let at_most_a_mebibyte = ReadOptions {
+        limit: ReadLimit::AtMost(1 << 20),
+        final_symlink: FinalSymlink::Refuse,
+    };
+
+    let first = case
+        .engine()
+        .read_file(&Location::At(&large_file), &WHOLE_FILE_REFUSING_SYMLINK)
+        .expect("the large file is read");
+    let whole = case
+        .engine()
+        .read_file(&Location::At(&short_file), &WHOLE_FILE_REFUSING_SYMLINK)
+        .expect("the short file is read");
+    let bounded = case
+        .engine()
+        .read_file(&Location::At(&short_file), &at_most_a_mebibyte)
+        .expect("the short file is read under a bound");
+
+    assert_eq!(first.len(), large.len());
+    assert_eq!(whole, b"seven b");
+    assert!(
+        whole.capacity() < 1024,
+        "the answer was shrunk to its own size"
+    );
+    assert_eq!(bounded, b"seven b");
+    assert!(
+        bounded.capacity() < 1024,
+        "the answer was shrunk to its own size"
+    );
+}
+
 #[test]
 fn list_directory_grows_its_array_past_the_first_capacity() {
-    // The face offers room for 64 entries first.
+    // The face offers room for 1,024 entries first.
     let case = Case::named("grow-list");
     case.directory
         .make_directory_raw("many", 0o755)
         .expect("setup");
     let mut expected = Vec::new();
-    for number in 100..200 {
+    for number in 1000..2100 {
         let name = format!("entry-{number}");
         case.directory
             .write_raw(&format!("many/{name}"), b"", 0o644)

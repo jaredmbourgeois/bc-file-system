@@ -46,7 +46,8 @@ struct Fault {
 /// their callers to test code.
 class Engine {
 public:
-    /// The live engine of a composition root.
+    /// The live engine of a composition root: the platform's fast paths probed once, the identity of the root of
+    /// the file system read once (what `remove_tree` refuses by identity), no observer.
     [[nodiscard]] static auto live() -> Result<Engine>;
 
     /// The same engine with the observer installed: every step is counted and scripted faults take effect.

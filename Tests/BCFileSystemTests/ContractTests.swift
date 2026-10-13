@@ -104,18 +104,41 @@ struct ContractTests {
         #expect(try observed.root.rawNames() == ["config"])
     }
 
-    /// A read that starts with a buffer too small (the face offers 64 KiB first) is asked again with the size
-    /// the core reports.
+    /// A read that starts with a buffer too small (the face offers 1 MiB first) is asked again with the size the
+    /// core reports.
     @Test
     func aReadGrowsItsBufferUntilTheFileFits() throws {
         let observed = try observedFileSystem()
-        let text = String(repeating: "longer than the first buffer\n", count: 4 * 1024)
+        let text = String(repeating: "longer than the first buffer\n", count: 40 * 1024)
         try observed.root.rawWrite(text, to: "notes.txt", mode: 0o644)
 
         let bytes = try observed.fileSystem.readFile(
             try observed.location("notes.txt"), options: Self.wholeFileRefusingSymlink)
 
         #expect(String(decoding: bytes, as: UTF8.self) == text)
+    }
+
+    /// The face's buffer is never zero-filled, so an answer shorter than the buffer it was read into must hold
+    /// the file's own bytes and nothing of what the buffer held before: a large read first leaves its bytes where
+    /// the allocator may hand the next buffer out again, and the short file read next is answered as exactly its
+    /// bytes, its count its own, under either limit.
+    @Test
+    func aFileShorterThanTheFirstOfferIsAnsweredAsOnlyItsOwnBytes() throws {
+        let observed = try observedFileSystem()
+        let large = String(repeating: "L", count: 900 * 1024)
+        try observed.root.rawWrite(large, to: "large.bin", mode: 0o644)
+        try observed.root.rawWrite("seven b", to: "short.txt", mode: 0o644)
+        let atMostAMebibyte = ReadOptions(limit: .atMost(bytes: 1024 * 1024), finalSymlink: .refuse)
+
+        let first = try observed.fileSystem.readFile(
+            try observed.location("large.bin"), options: Self.wholeFileRefusingSymlink)
+        let whole = try observed.fileSystem.readFile(
+            try observed.location("short.txt"), options: Self.wholeFileRefusingSymlink)
+        let bounded = try observed.fileSystem.readFile(try observed.location("short.txt"), options: atMostAMebibyte)
+
+        #expect(first.count == large.utf8.count)
+        #expect(whole == Array("seven b".utf8))
+        #expect(bounded == Array("seven b".utf8))
     }
 
     // MARK: - Not found
@@ -374,13 +397,13 @@ struct ContractTests {
             ])
     }
 
-    /// More entries than the first array holds, so the listing is asked for a second time with the capacity the
-    /// core named.
+    /// More entries than the first array holds (1,024), so the listing is asked for a second time with the
+    /// capacity the core named.
     @Test
     func aListingLargerThanItsFirstBuffersIsComplete() throws {
         let observed = try observedFileSystem()
         var expected: [String] = []
-        for number in 100..<400 {
+        for number in 1000..<2100 {
             let name = "entry-with-a-reasonably-long-name-\(number).txt"
             try observed.root.rawWrite("", to: name, mode: 0o644)
             expected.append(name)

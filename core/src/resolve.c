@@ -278,6 +278,59 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
     return 0;
 }
 
+/* ---- The open with nothing around it (resolve.h) ------------------------------------------------------------ */
+
+/* What an ENOTDIR from a refusing open of a directory means, which the open cannot say: with O_DIRECTORY beside
+ * O_NOFOLLOW the systems answer ENOTDIR for a symlink as for a file. One `fstatat` that never follows tells them
+ * apart; a symlink is `symlink_refused`, anything else (a file, or nothing left there) `not_directory`. The
+ * error stays the open's: its step and its errno. A stop on the look is reported as every stop is. */
+static int32_t report_refused_directory_open(bc_file_system_engine *engine, int32_t operation, int parent,
+                                             const char *name, const bc_file_system_call_outcome *refused,
+                                             bc_file_system_error *error) {
+    struct stat info;
+    const bc_file_system_call_outcome looked =
+        bc_file_system_call_fstatat(engine, operation, parent, name, AT_SYMLINK_NOFOLLOW, &info);
+    if (looked.stopped) {
+        return report_outcome(error, operation, bc_file_system_step_fstatat, &looked, kind_of(looked.code));
+    }
+    int32_t kind = bc_file_system_error_kind_not_directory;
+    if (looked.succeeded && S_ISLNK(info.st_mode)) {
+        kind = bc_file_system_error_kind_symlink_refused;
+    }
+    return report_outcome(error, operation, bc_file_system_step_openat, refused, kind);
+}
+
+int32_t bc_file_system_resolve_open_directory(bc_file_system_engine *engine, int32_t operation, int parent,
+                                              const char *name, int32_t final_symlink, int32_t access,
+                                              owned_descriptor *opened, bc_file_system_error *error) {
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || parent < 0 || name == nullptr || !is_final_symlink_choice(final_symlink) ||
+        !is_directory_access_choice(access) || opened == nullptr || opened->value != -1) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    const int flags = final_symlink == bc_file_system_final_symlink_refuse ? open_flags_for(access) | O_NOFOLLOW
+                                                                           : open_flags_for(access);
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor candidate = {.value = -1};
+    const bc_file_system_call_outcome outcome =
+        bc_file_system_call_openat(engine, operation, parent, name, flags, &candidate.value);
+    if (!outcome.succeeded) {
+        if (final_symlink == bc_file_system_final_symlink_refuse && !outcome.stopped && outcome.code == ENOTDIR) {
+            return report_refused_directory_open(engine, operation, parent, name, &outcome, error);
+        }
+        return report_outcome(error, operation, bc_file_system_step_openat, &outcome, kind_of(outcome.code));
+    }
+    if (access == bc_file_system_directory_access_search) {
+        const int32_t permission = verify_search_permission(engine, operation, candidate.value, error);
+        if (permission != 0) {
+            return permission;
+        }
+    }
+    opened->value = release_descriptor(&candidate);
+    return 0;
+}
+
 /* ---- The walk ----------------------------------------------------------------------------------------------- */
 
 /* Opens every component of `text`, each against the parent the previous one became, so that at the end

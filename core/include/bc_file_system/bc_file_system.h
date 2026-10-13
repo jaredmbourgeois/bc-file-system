@@ -21,7 +21,8 @@
  * size_t capacity, size_t *length`. On success `*length` is how many bytes were stored. When the answer does not
  * fit the call fails with `bc_file_system_error_kind_buffer_too_small` and `*length` is the capacity needed, so the
  * caller grows the buffer and calls again. A NULL buffer with a capacity of 0 is the stated way to ask for the
- * size first. Nothing is ever cut short silently. A fixed-size answer is an out-parameter.
+ * size first. Nothing is ever cut short silently. What the buffer holds after any failure is not an answer: a
+ * call may have stored part of one there (never past `capacity`). A fixed-size answer is an out-parameter.
  *
  * ENUMS cross this boundary as `int32_t` fields and parameters. Zero is never a valid input value for any of
  * them, so a zeroed options struct is detectably unfilled rather than a silent choice. Every enum is closed: a
@@ -251,7 +252,10 @@ typedef enum bc_file_system_location_kind {
      * `symlink_refused` (a loop), EACCES `permission_denied`, EMFILE or ENFILE `resource_exhausted`, and
      * ENAMETOOLONG `invalid_argument` for a component longer than the volume allows. Nothing is checked around
      * the open, so an entry swapped while the path resolves is followed as the system follows it; containment
-     * is `beneath`'s. Relative text is refused with `invalid_argument`. */
+     * is `beneath`'s. A leaf an operation opens as a directory is opened the same way, with nothing checked
+     * around the open: under `refuse` O_NOFOLLOW still refuses a final symlink (`symlink_refused`), and a
+     * directory swapped in for the leaf is the one the system's own open would open. Relative text is refused
+     * with `invalid_argument`. */
     bc_file_system_location_kind_at = 1,
     /* A relative path resolved beneath an open directory with containment enforced by the kernel: no component
      * may be a symlink, and nothing above the directory is reachable. */
@@ -417,8 +421,11 @@ static inline bc_file_system_location bc_file_system_location_beneath(const bc_f
 
 /* ---- The engine and its observer --------------------------------------------------------------------------- */
 
-/* The engine of a composition root: probes the platform's fast paths once and carries no observer. The only
- * function in this header that may be named outside a composition root's body.
+/* The engine of a composition root: probes the platform's fast paths once, reads the identity of the root of the
+ * file system once (the `st_dev` and `st_ino` of `/`, which `bc_file_system_remove_tree` refuses by identity
+ * without asking again), and carries no observer. The only function in this header that may be named outside a
+ * composition root's body. `resource_exhausted` when the engine cannot be allocated; should the stat of `/`
+ * itself fail, the system's answer, read as every operation reads one (step `fstatat`, the errno kept).
  *
  * `engine`  must not be NULL; receives the new engine on success, owned by the caller until
  *           `bc_file_system_engine_release`.
@@ -544,14 +551,20 @@ int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_
                                         const bc_file_system_permissions *permissions, bc_file_system_error *error);
 
 /* Creates the directory and every missing one on the way, each with `permissions`; one already there is left
- * as it is; something on the way that is not a directory is `not_directory`. */
+ * as it is; something on the way that is not a directory is `not_directory`. A directory this call has just made
+ * is entered with nothing checked around its open: the location kind's own promise holds there (under `beneath`
+ * a symlink swapped in is `symlink_refused`), and a directory swapped in for it is entered, as the system's own
+ * `mkdir -p` enters it. */
 int32_t bc_file_system_create_directories(bc_file_system_engine *engine, const bc_file_system_location *location,
                                           const bc_file_system_permissions *permissions, bc_file_system_error *error);
 
 /* The entries of a directory, sorted by name bytes so a listing is the same on every run, into the caller's
  * array of `capacity` entries; `*count` receives how many were stored, or how many are needed on
- * `buffer_too_small`. A listing is complete or it is an error. The directory's own final symlink is followed or
- * refused per `final_symlink`; a symlink inside is an entry, never followed. */
+ * `buffer_too_small`. The directory is read once: each entry is stored as it is read while the array has room,
+ * and counted once it is full, so a listing that fits is one pass, and one that does not answers the count that
+ * pass reached, with the entries read before the array filled left in it (not an answer). A directory that grew
+ * before the next call answers that call's own count. A listing is complete or it is an error. The directory's
+ * own final symlink is followed or refused per `final_symlink`; a symlink inside is an entry, never followed. */
 int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
                                       int32_t final_symlink, bc_file_system_entry *entries, size_t capacity,
                                       size_t *count, bc_file_system_error *error);
@@ -568,8 +581,9 @@ int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_
 
 /* Removes `location` and everything below it, by unlinkat on held descriptors with a bounded number open and no
  * recursion; a symlink is removed, never followed. The root of the file system is refused by spelling and by
- * identity; a tree that crosses onto another device is refused with `cross_device`. After an error part of the
- * tree may be gone. `*existed` as for `bc_file_system_remove_file`. */
+ * identity (against the identity the engine read when it was created); a tree that crosses onto another device
+ * is refused with `cross_device`. After an error part of the tree may be gone. `*existed` as for
+ * `bc_file_system_remove_file`. */
 int32_t bc_file_system_remove_tree(bc_file_system_engine *engine, const bc_file_system_location *location,
                                    int32_t *existed, bc_file_system_error *error);
 

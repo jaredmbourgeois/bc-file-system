@@ -13,8 +13,12 @@
 // directory it makes under the temporary root it is handed, and removes that directory when it ends. Never a CI
 // job and never a leg of scripts/verify.sh: it is built by the `bench` preset and run by hand.
 //
+// The forms of one group interleave run by run (the harness's `measure_interleaved`), so no form is timed all at
+// once right after another group.
+//
 //   bc_file_system_benchmark <temporary-root> <warm-up> <iterations> <large-warm-up> <large-iterations>
-//                            <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> <depth>...
+//                            <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth>
+//                            <deep-chain-depth> <depth>...
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -61,20 +65,23 @@ namespace {
 struct Parameters {
     std::filesystem::path temporary_root;
     Repetitions repetitions;
-    /// For the copies of the large file, each of which moves the whole file.
+    /// For the rows whose one run is long: the copies of the large file, each of which moves the whole file, and
+    /// the deep chain's creation and removal.
     Repetitions large_repetitions;
     std::size_t small_size;
     std::size_t medium_size;
     std::size_t large_size;
     std::size_t entry_count;
     std::size_t chain_depth;
+    /// The chain the removal's bounded window re-descends (design doc, S6): deeper than one window.
+    std::size_t deep_chain_depth;
     std::vector<std::size_t> status_depths;
 };
 
 constexpr std::string_view usage =
     "usage: bc_file_system_benchmark <temporary-root> <warm-up> <iterations> <large-warm-up> <large-iterations>\n"
-    "                                <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth> "
-    "<depth>...\n"
+    "                                <small-bytes> <medium-bytes> <large-bytes> <entry-count> <chain-depth>\n"
+    "                                <deep-chain-depth> <depth>...\n"
     "  every count and size is a positive integer; <temporary-root> is an absolute path to an existing directory\n";
 
 // The count the text spells, or nothing for anything but a positive decimal integer.
@@ -97,7 +104,7 @@ auto positive_int(std::string_view text) -> std::optional<int> {
 
 // Every argument is required: a missing one is a usage error, never a value chosen here.
 auto parameters_from(const std::vector<std::string_view>& arguments) -> std::optional<Parameters> {
-    constexpr std::size_t fixed_arguments = 10;
+    constexpr std::size_t fixed_arguments = 11;
     if (arguments.size() < fixed_arguments + 1) {
         return std::nullopt;
     }
@@ -110,8 +117,9 @@ auto parameters_from(const std::vector<std::string_view>& arguments) -> std::opt
     const std::optional<std::size_t> large_size = positive_count(arguments[7]);
     const std::optional<std::size_t> entry_count = positive_count(arguments[8]);
     const std::optional<std::size_t> chain_depth = positive_count(arguments[9]);
+    const std::optional<std::size_t> deep_chain_depth = positive_count(arguments[10]);
     if (!warm_up || !iterations || !large_warm_up || !large_iterations || !small_size || !medium_size || !large_size ||
-        !entry_count || !chain_depth) {
+        !entry_count || !chain_depth || !deep_chain_depth) {
         return std::nullopt;
     }
     std::vector<std::size_t> status_depths;
@@ -134,6 +142,7 @@ auto parameters_from(const std::vector<std::string_view>& arguments) -> std::opt
                       .large_size = *large_size,
                       .entry_count = *entry_count,
                       .chain_depth = *chain_depth,
+                      .deep_chain_depth = *deep_chain_depth,
                       .status_depths = status_depths};
 }
 
@@ -254,6 +263,10 @@ struct LibraryRow {
     std::vector<Operation> operations;
     Action prepare;
     SideAction action;
+    /// For a removal that holds a bounded window of levels: how many levels the tree has, each opened at least
+    /// once, so that its calls also say how many opens past those the window's re-descents cost. Empty for every
+    /// other row.
+    std::optional<std::size_t> levels_opened_once;
 };
 
 // A row of the standard forms: what it does not promise that the library does ("less: …"), or "same".
@@ -283,12 +296,21 @@ auto library_row(std::string form, EngineKind timed_on, std::vector<Operation> o
                       .timed_on = timed_on,
                       .operations = std::move(operations),
                       .prepare = std::move(prepare),
-                      .action = std::move(action)};
+                      .action = std::move(action),
+                      .levels_opened_once = std::nullopt};
 }
 
 auto live_row(std::vector<Operation> operations, Action prepare, SideAction action) -> LibraryRow {
     return library_row("library, live engine", EngineKind::live, std::move(operations), std::move(prepare),
                        std::move(action));
+}
+
+// The live row of a removal through the bounded window, whose calls name its re-descents' opens.
+auto live_window_removal_row(std::size_t levels, std::vector<Operation> operations, Action prepare, SideAction action)
+    -> LibraryRow {
+    LibraryRow row = live_row(std::move(operations), std::move(prepare), std::move(action));
+    row.levels_opened_once = levels;
+    return row;
 }
 
 // ---- Counting the system calls ---------------------------------------------------------------------------------
@@ -352,7 +374,9 @@ auto counting_engine(EngineKind timed_on) -> EngineKind {
     return EngineKind::observed;
 }
 
-// One run of the row on the engine that observes it, between two readings of its step counts.
+// One run of the row on the engine that observes it, between two readings of its step counts. A window removal's
+// calls also say how many of its `openat`s re-opened a level a pass before it had opened (every level is opened at
+// least once; each later pass descends from the top again).
 auto count_calls(Sides& sides, const LibraryRow& row) -> std::optional<CallCount> {
     Side& side = sides.of(counting_engine(row.timed_on));
     const std::optional<std::vector<std::uint64_t>> before = step_counts(side.engine, row.operations);
@@ -363,40 +387,64 @@ auto count_calls(Sides& sides, const LibraryRow& row) -> std::optional<CallCount
     if (!after.has_value()) {
         return std::nullopt;
     }
-    return call_count(*before, *after);
+    CallCount counted = call_count(*before, *after);
+    if (row.levels_opened_once.has_value()) {
+        const auto openat_index = static_cast<std::size_t>(Step::openat) - 1;
+        const std::uint64_t opens = (*after)[openat_index] - (*before)[openat_index];
+        counted.calls += " (" + std::to_string(opens - *row.levels_opened_once) + " reopens)";
+    }
+    return counted;
 }
 
-// Measures every row of `group` and appends its lines to `table`; answers the form that failed, if one did.
+// Measures every row of `group` and appends its lines to `table`; answers the form that failed, if one did. Each
+// library row's calls are counted first, in a run of its own on the engine that observes it; then every form of
+// the group is timed interleaved with the others, the library's rows first in each run, then each comparison.
 auto measure_group(Now now, Sides& sides, const Group& group, std::vector<TableRow>& table)
     -> std::optional<std::string> {
-    std::vector<TableRow> lines;
+    std::vector<CallCount> counts;
+    counts.reserve(group.library_rows.size());
     for (const LibraryRow& row : group.library_rows) {
         const std::optional<CallCount> counted = count_calls(sides, row);
         if (!counted.has_value()) {
             return row.form + " (counting its calls)";
         }
+        counts.push_back(*counted);
+    }
+    const std::size_t form_count = group.library_rows.size() + group.comparison_rows.size();
+    std::vector<Timed> forms;
+    forms.reserve(form_count);
+    std::vector<std::string> form_names;
+    form_names.reserve(form_count);
+    for (const LibraryRow& row : group.library_rows) {
         Side& side = sides.of(row.timed_on);
         const SideAction& action = row.action;
-        const std::optional<Summary> summary =
-            measure(now, group.repetitions, row.prepare, [&action, &side] { return action(side); });
-        if (!summary.has_value()) {
-            return row.form;
-        }
+        forms.push_back(Timed{.prepare = row.prepare, .action = [&action, &side] { return action(side); }});
+        form_names.push_back(row.form);
+    }
+    for (const ComparisonRow& row : group.comparison_rows) {
+        forms.push_back(Timed{.prepare = row.prepare, .action = row.action});
+        form_names.push_back(row.form);
+    }
+    const GroupMeasurement measured = measure_interleaved(now, group.repetitions, forms);
+    if (measured.failed_form.has_value()) {
+        return form_names[*measured.failed_form];
+    }
+    std::vector<TableRow> lines;
+    lines.reserve(form_count);
+    for (std::size_t index = 0; index < group.library_rows.size(); ++index) {
         lines.push_back(TableRow{.operation = group.operation,
                                  .case_label = group.case_label,
-                                 .form = row.form,
+                                 .form = group.library_rows[index].form,
                                  .guarantee = "library",
-                                 .summary = *summary,
+                                 .summary = measured.summaries[index],
                                  .versus_same = "",
-                                 .calls = counted->calls,
-                                 .steps = counted->steps});
+                                 .calls = counts[index].calls,
+                                 .steps = counts[index].steps});
     }
     std::optional<Summary> same;
-    for (const ComparisonRow& row : group.comparison_rows) {
-        const std::optional<Summary> summary = measure(now, group.repetitions, row.prepare, row.action);
-        if (!summary.has_value()) {
-            return row.form;
-        }
+    for (std::size_t index = 0; index < group.comparison_rows.size(); ++index) {
+        const ComparisonRow& row = group.comparison_rows[index];
+        const Summary& summary = measured.summaries[group.library_rows.size() + index];
         if (row.guarantee == "same" && !same.has_value()) {
             same = summary;
         }
@@ -404,7 +452,7 @@ auto measure_group(Now now, Sides& sides, const Group& group, std::vector<TableR
                                  .case_label = group.case_label,
                                  .form = row.form,
                                  .guarantee = row.guarantee,
-                                 .summary = *summary,
+                                 .summary = summary,
                                  .versus_same = "",
                                  .calls = "",
                                  .steps = ""});
@@ -815,7 +863,7 @@ auto read_groups(const Parameters& parameters, const WorkPaths& paths, const Hel
             .repetitions = parameters.repetitions,
             .library_rows = {live_row(read_operation, nothing_to_prepare(),
                                       [path = *relative_path, options, size](Side& side) {
-                                          const Result<std::vector<std::byte>> bytes = side.files.read_file(
+                                          const Result<Bytes> bytes = side.files.read_file(
                                               Location::beneath(side.files_directory, path), options);
                                           return bytes.has_value() && bytes->size() == size;
                                       }),
@@ -1162,6 +1210,126 @@ auto chain_group(const Parameters& parameters, const WorkPaths& paths) -> Result
                           }}}};
 }
 
+// A chain of `depth` directories under `held`: `top`, then `d` inside each level. Each is made with mkdirat
+// against the level before it, held open for search, never by path, so no path length bounds the depth. The
+// untimed preparation of the deep removal's runs.
+auto make_chain(int held, const char* top, std::size_t depth) -> bool {
+    if (mkdirat(held, top, 0700) != 0) {
+        return false;
+    }
+    int parent = openat(held, top, search_open_flags());
+    for (std::size_t level = 1; level < depth && parent >= 0; ++level) {
+        int child = -1;
+        if (mkdirat(parent, "d", 0700) == 0) {
+            child = openat(parent, "d", search_open_flags());
+        }
+        (void)close(parent);
+        parent = child;
+    }
+    if (parent < 0) {
+        return false;
+    }
+    (void)close(parent);
+    return true;
+}
+
+// The deep chain's removal (design doc, S6 in "Unknowns"): a chain deeper than the window of sixteen levels the
+// removal holds open, so it re-descends from the top in passes, and every level it passes again is opened again,
+// read-only. Made untimed before each run, by mkdirat on held descriptors, after anything left at its name (the
+// creation group's last chain) is cleared. std's removal recurses with one descriptor held per level, which the
+// library's bounded window does not.
+auto deep_removal_group(const Parameters& parameters, const WorkPaths& paths, const HeldDirectories& held)
+    -> Result<Group> {
+    const std::vector<Operation> removal_operation{Operation::remove_tree};
+    Result<RelativePath> top = relative("deep");
+    if (!top) {
+        return top.error();
+    }
+    const std::size_t depth = parameters.deep_chain_depth;
+    const int files = held.files.descriptor();
+    const std::filesystem::path top_path = paths.files / "deep";
+    const Action make = [files, depth, top_path] {
+        std::error_code error;
+        std::filesystem::remove_all(top_path, error);
+        return !error && make_chain(files, "deep", depth);
+    };
+    return Group{.operation = "remove_tree",
+                 .case_label = std::to_string(depth) + "-level chain",
+                 .repetitions = parameters.large_repetitions,
+                 .library_rows = {live_window_removal_row(depth, removal_operation, make,
+                                                          [top = *top](Side& side) {
+                                                              const Result<bool> removed = side.files.remove_tree(
+                                                                  Location::beneath(side.files_directory, top));
+                                                              return removed.has_value() && *removed;
+                                                          })},
+                 .comparison_rows = {ComparisonRow{.form = "`std::filesystem::remove_all`",
+                                                   .guarantee = "less: a descriptor per level",
+                                                   .prepare = make,
+                                                   .action = [top_path] {
+                                                       std::error_code error;
+                                                       const std::uintmax_t removed =
+                                                           std::filesystem::remove_all(top_path, error);
+                                                       return !error && removed > 0;
+                                                   }}}};
+}
+
+// The same deep chain's creation, timed on its own: removed untimed before each run (the chain the run before
+// made), and made by each form. std's forms go by path, so the chain's text must fit PATH_MAX here.
+auto deep_creation_group(const Parameters& parameters, const WorkPaths& paths) -> Result<Group> {
+    const std::vector<Operation> creation_operation{Operation::create_directories};
+    std::string deepest_text = "deep";
+    std::vector<std::filesystem::path> levels{paths.files / "deep"};
+    for (std::size_t level = 1; level < parameters.deep_chain_depth; ++level) {
+        deepest_text += "/d";
+        levels.push_back(paths.files / deepest_text);
+    }
+    Result<RelativePath> deepest = relative(deepest_text);
+    if (!deepest) {
+        return deepest.error();
+    }
+    const std::filesystem::path top_path = levels.front();
+    const Action clear = [top_path] {
+        std::error_code error;
+        std::filesystem::remove_all(top_path, error);
+        return !error;
+    };
+    return Group{.operation = "create_directories",
+                 .case_label = std::to_string(parameters.deep_chain_depth) + "-level chain",
+                 .repetitions = parameters.large_repetitions,
+                 .library_rows = {live_row(creation_operation, clear,
+                                           [deepest = *deepest](Side& side) {
+                                               return side.files
+                                                   .create_directories(Location::beneath(side.files_directory, deepest),
+                                                                       Permissions::exactly(0700))
+                                                   .has_value();
+                                           })},
+                 .comparison_rows = {
+                     ComparisonRow{.form = "`std::filesystem::create_directories`",
+                                   .guarantee = "less: modes from the umask",
+                                   .prepare = clear,
+                                   .action =
+                                       [deepest_path = levels.back()] {
+                                           std::error_code error;
+                                           std::filesystem::create_directories(deepest_path, error);
+                                           return !error;
+                                       }},
+                     ComparisonRow{.form = "`std::filesystem::create_directories`, `permissions` per level",
+                                   .guarantee = "same",
+                                   .prepare = clear,
+                                   .action = [levels] {
+                                       std::error_code error;
+                                       std::filesystem::create_directories(levels.back(), error);
+                                       for (const std::filesystem::path& level : levels) {
+                                           if (!error) {
+                                               std::filesystem::permissions(level, std::filesystem::perms::owner_all,
+                                                                            std::filesystem::perm_options::replace,
+                                                                            error);
+                                           }
+                                       }
+                                       return !error;
+                                   }}}};
+}
+
 auto lock_group(const Parameters& parameters, const HeldDirectories& held) -> Result<Group> {
     const std::vector<Operation> lock_operation{Operation::try_lock};
     Result<RelativePath> target = relative("lock-target");
@@ -1267,7 +1435,8 @@ auto every_group(const Parameters& parameters, const WorkPaths& paths, const Hel
         std::ranges::move(part.value(), std::back_inserter(groups));
     }
     for (Result<Group> single :
-         {list_group(parameters, paths), chain_group(parameters, paths), lock_group(parameters, held)}) {
+         {list_group(parameters, paths), chain_group(parameters, paths), deep_creation_group(parameters, paths),
+          deep_removal_group(parameters, paths, held), lock_group(parameters, held)}) {
         if (!single) {
             return single.error();
         }
@@ -1323,8 +1492,11 @@ auto measure_work(const Parameters& parameters, Engines& engines, const WorkPath
     const std::size_t work_depth = static_cast<std::size_t>(std::distance(paths.work.begin(), paths.work.end())) - 1;
     output << "bc-file-system benchmark, C++ face: " << parameters.repetitions.timed << " timed runs after "
            << parameters.repetitions.warm_up << " warm-up runs (" << size_label(parameters.large_size)
-           << " copies: " << parameters.large_repetitions.timed << " after " << parameters.large_repetitions.warm_up
-           << "); the work directory is " << work_depth << " components below `/`; times in µs.\n\n";
+           << " copies and the " << parameters.deep_chain_depth
+           << "-level chain: " << parameters.large_repetitions.timed << " after "
+           << parameters.large_repetitions.warm_up
+           << "), the forms of each group interleaved run by run; the work directory is " << work_depth
+           << " components below `/`; times in µs.\n\n";
     print_table(output, table);
     return 0;
 }

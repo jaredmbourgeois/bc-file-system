@@ -2,10 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include <bc_file_system/bc_file_system.h>
@@ -17,6 +20,48 @@
 #include <bc_file_system/status.hpp>
 
 namespace bc::file_system {
+
+/// The allocator of `Bytes`: `std::allocator`'s storage, with one difference. A vector value-initialises the
+/// elements it grows by (a `std::byte` becomes zero), and storage the core is about to write whole is better left as
+/// it is, so an element made with no argument is default-initialised here, which for a byte writes nothing. An
+/// element made from another (a copy, a move) goes through `std::construct_at`, as with `std::allocator`, so the
+/// standard library still copies these bytes with `memcpy`.
+template <class Element>
+class DefaultInitializingAllocator {
+public:
+    using value_type = Element;
+
+    DefaultInitializingAllocator() noexcept = default;
+    // Implicit, as the allocator requirements ask: a container converts its allocator into the rebound one it
+    // needs for its own nodes.
+    template <class Other>
+    DefaultInitializingAllocator(const DefaultInitializingAllocator<Other>& /*rebound*/) noexcept {}
+
+    [[nodiscard]] auto allocate(std::size_t count) -> Element* { return std::allocator<Element>{}.allocate(count); }
+    auto deallocate(Element* elements, std::size_t count) noexcept -> void {
+        std::allocator<Element>{}.deallocate(elements, count);
+    }
+
+    /// Made with no argument: default-initialised, which for a trivial type such as `std::byte` leaves the storage
+    /// as it is.
+    template <class Made>
+    auto construct(Made* place) noexcept(std::is_nothrow_default_constructible_v<Made>) -> void {
+        ::new (static_cast<void*>(place)) Made;
+    }
+
+    // Stateless: any one can free what any other allocated.
+    friend auto operator==(const DefaultInitializingAllocator& /*left*/,
+                           const DefaultInitializingAllocator& /*right*/) noexcept -> bool {
+        return true;
+    }
+};
+
+/// The bytes `read_file` answers: a vector of `std::byte` whose allocator leaves new bytes unwritten
+/// (`DefaultInitializingAllocator`), so the face reads a file into the answer itself, never zero-filled first and
+/// never copied after. A `std::span<const std::byte>` (what `write_file` and `lines_of` take), every standard
+/// algorithm and a range comparison take it as they take any vector; a `std::vector<std::byte>` is one copy away
+/// (`std::vector<std::byte>(bytes.begin(), bytes.end())`).
+using Bytes = std::vector<std::byte, DefaultInitializingAllocator<std::byte>>;
 
 /// The answer of `try_lock`.
 enum class LockOutcome : std::int32_t {
@@ -88,12 +133,11 @@ public:
     /// The bytes of a regular file, under the read limit. Anything that is not a regular file is
     /// `not_regular_file`. The buffer protocol is absorbed here: at most three attempts, then the error as
     /// received.
-    [[nodiscard]] auto read_file(const Location& location, const ReadOptions& options) noexcept
-        -> Result<std::vector<std::byte>>;
+    [[nodiscard]] auto read_file(const Location& location, const ReadOptions& options) noexcept -> Result<Bytes>;
 
     /// `read_file`, with absence as an empty optional instead of `not_found`.
     [[nodiscard]] auto read_file_if_present(const Location& location, const ReadOptions& options) noexcept
-        -> Result<std::optional<std::vector<std::byte>>>;
+        -> Result<std::optional<Bytes>>;
 
     /// Replaces or creates the regular file at `location` with `bytes`, atomically: a reader sees the old
     /// content or the new, never a mixture. The directory must exist. Returns the durability achieved.

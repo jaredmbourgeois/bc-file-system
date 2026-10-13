@@ -9,8 +9,9 @@
  * piece as too long), the walk over a `beneath` path, the fast path where the platform has one and the walk it
  * falls back to when the fast path's step is scripted to refuse, and the identity check against a directory
  * swapped between the stat and the open, which is deterministic here because the two halves of a checked open
- * are called one at a time and the swap lands between them. Every case counts the open descriptors before and
- * after itself: a leaked descriptor is the one leak no sanitizer reports.
+ * are called one at a time and the swap lands between them; and the open with nothing around it that an `at`
+ * leaf and a directory just made take, with a swap landing before it. Every case counts the open descriptors
+ * before and after itself: a leaked descriptor is the one leak no sanitizer reports.
  *
  *   root/a/b/target.txt   "INSIDE"      what a correct resolution reaches
  *   root/file                           a regular file where a directory is needed
@@ -1279,6 +1280,123 @@ static void test_a_symlink_swapped_in_under_at_is_followed_as_the_system_follows
     expect(tally, swap_entries(tree, "staging/b_symlink"), "the swap was undone", "");
 }
 
+/* ---- The open with nothing around it ------------------------------------------------------------------------ */
+
+/* One refusal of `bc_file_system_resolve_open_directory` under `refuse`: the kind, the errno the open answered,
+ * and how many looks (fstatat) the refusal took to tell what it found: one after an ENOTDIR, none otherwise. */
+typedef struct unchecked_refusal_case {
+    const char *relative;
+    int32_t kind;
+    int system_code;
+    uint64_t looks;
+    const char *what;
+} unchecked_refusal_case;
+
+/* What an `at` location's leaf and a directory just made are opened with (resolve.h): one openat on success and
+ * nothing else, no stat before it and no identity after it (the search-permission step only where the platform's
+ * open checks none); under `follow` a symlink to a directory is opened through; under `refuse` the open refuses a
+ * symlink with ENOTDIR as it refuses a file, and one look after it tells them apart, the error keeping the
+ * open's step and errno. */
+static void test_the_open_with_nothing_around_it(report *tally, const fixture *tree) {
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    struct stat a;
+    expect(tally, identity_of(tree->root, "a", &a), "the test can stat root/a", "");
+    bc_file_system_error error;
+    {
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+        expect(tally,
+               bc_file_system_resolve_open_directory(engine, operation, tree->root, "a",
+                                                     bc_file_system_final_symlink_refuse,
+                                                     bc_file_system_directory_access_search, &opened, &error) == 0,
+               "a directory opens", "");
+        expect(tally, descriptor_is(opened.value, &a), "the descriptor is root/a", "");
+        expect(tally, count_of(tally, engine, bc_file_system_step_openat) == 1, "one openat", "");
+        expect(tally, count_of(tally, engine, bc_file_system_step_fstatat) == 0, "no stat before the open", "");
+        expect(tally, count_of(tally, engine, bc_file_system_step_fstat) == 0, "no identity read after it", "");
+        expect(tally, count_of(tally, engine, bc_file_system_step_identity_check) == 0, "nothing compared", "");
+        expect(tally, count_of(tally, engine, bc_file_system_step_faccessat) == search_permission_steps(),
+               "the search permission only where the open checks none", "");
+    }
+    {
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+        expect(tally,
+               bc_file_system_resolve_open_directory(engine, operation, tree->root, "link_to_a",
+                                                     bc_file_system_final_symlink_follow,
+                                                     bc_file_system_directory_access_read, &opened, &error) == 0,
+               "a symlink to a directory under follow is opened through", "");
+        expect(tally, descriptor_is(opened.value, &a), "the descriptor is what the link points at, root/a", "");
+    }
+    static const unchecked_refusal_case cases[] = {
+        {"link_to_a", bc_file_system_error_kind_symlink_refused, ENOTDIR, 1, "a symlink under refuse"},
+        {"dangling", bc_file_system_error_kind_symlink_refused, ENOTDIR, 1, "a dangling symlink under refuse"},
+        {"file", bc_file_system_error_kind_not_directory, ENOTDIR, 1, "a file"},
+        {"absent", bc_file_system_error_kind_not_found, ENOENT, 0, "nothing"},
+    };
+    for (size_t index = 0; index < sizeof cases / sizeof cases[0]; ++index) {
+        const unchecked_refusal_case *item = &cases[index];
+        const uint64_t looks_before = count_of(tally, engine, bc_file_system_step_fstatat);
+        [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+        expect(tally,
+               bc_file_system_resolve_open_directory(
+                   engine, operation, tree->root, item->relative, bc_file_system_final_symlink_refuse,
+                   bc_file_system_directory_access_search, &opened, &error) == item->kind,
+               "the refusal's kind", item->what);
+        expect(tally, error.step == bc_file_system_step_openat, "the error keeps the open's step", item->what);
+        expect(tally, error.system_code == item->system_code, "and the open's errno", item->what);
+        expect(tally, opened.value == -1, "nothing was handed out", item->what);
+        expect(tally, count_of(tally, engine, bc_file_system_step_fstatat) - looks_before == item->looks,
+               "one look after an ENOTDIR, none otherwise", item->what);
+    }
+    bc_file_system_engine_release(engine);
+}
+
+/* A swap before the open with nothing around it is what the system's own open would meet: a directory swapped in
+ * for b is opened (the decoy, as an `at` path or `mkdir -p` would reach it), and a symlink swapped in is refused
+ * under `refuse` by the open and told a symlink by the look after it. */
+static void test_a_swap_before_the_open_with_nothing_around_it(report *tally, const fixture *tree) {
+    if (!platform_can_swap()) {
+        return;
+    }
+    bc_file_system_engine *engine = create_observed(tally);
+    if (engine == nullptr) {
+        return;
+    }
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor a = {.value = openat(tree->root, "a", directory_flags)};
+    expect(tally, a.value >= 0, "the test can open root/a", "");
+    bc_file_system_error error;
+    if (a.value >= 0) {
+        expect(tally, swap_entries(tree, "staging/b_decoy"), "the decoy swap landed", "");
+        struct stat decoy;
+        expect(tally, identity_of(tree->base, "root/a/b", &decoy), "the test can stat the decoy at root/a/b", "");
+        {
+            [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+            expect(tally,
+                   bc_file_system_resolve_open_directory(engine, operation, a.value, "b",
+                                                         bc_file_system_final_symlink_refuse,
+                                                         bc_file_system_directory_access_search, &opened, &error) == 0,
+                   "a directory swapped in is opened", "");
+            expect(tally, descriptor_is(opened.value, &decoy), "the descriptor is the decoy", "");
+        }
+        expect(tally, swap_entries(tree, "staging/b_decoy"), "the decoy swap was undone", "");
+        expect(tally, swap_entries(tree, "staging/b_symlink"), "the symlink swap landed", "");
+        {
+            [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+            expect(tally,
+                   bc_file_system_resolve_open_directory(engine, operation, a.value, "b",
+                                                         bc_file_system_final_symlink_refuse,
+                                                         bc_file_system_directory_access_search, &opened,
+                                                         &error) == bc_file_system_error_kind_symlink_refused,
+                   "a symlink swapped in under refuse is symlink_refused", "");
+            expect(tally, opened.value == -1, "nothing was handed out", "");
+        }
+        expect(tally, swap_entries(tree, "staging/b_symlink"), "the symlink swap was undone", "");
+    }
+    bc_file_system_engine_release(engine);
+}
+
 /* ---- The cases: directory_open through the header ----------------------------------------------------------- */
 
 static bool opened_as_is(const bc_file_system_directory *directory, const char *expected) {
@@ -1443,6 +1561,9 @@ int main(int argument_count, char **arguments) {
     run_balanced(&tally, &tree, test_a_symlink_swapped_in_before_the_walk_is_refused, "swapped before the walk");
     run_balanced(&tally, &tree, test_a_symlink_swapped_in_under_at_is_followed_as_the_system_follows_it,
                  "swapped under at");
+    run_balanced(&tally, &tree, test_the_open_with_nothing_around_it, "the open with nothing around it");
+    run_balanced(&tally, &tree, test_a_swap_before_the_open_with_nothing_around_it,
+                 "a swap before the open with nothing around it");
     run_balanced(&tally, &tree, test_directory_open_remembers_its_text, "directory_open text");
     run_balanced(&tally, &tree, test_directory_open_leaf_refusals, "directory_open refusals");
     run_balanced(&tally, &tree, test_directory_open_follows_a_final_symlink_when_told_to, "directory_open follow");
