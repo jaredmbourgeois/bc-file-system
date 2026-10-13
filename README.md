@@ -33,12 +33,12 @@ Two products: `BCFileSystem` is the library (the engine, the `FileSystem` a piec
 observer installed, so a test can script a failing system call or a kill point and read step counts, with
 `FileSystem.portableOnly(root:)` beside it, the same engine refused every fast path, so a test can run a second
 time over the path every platform has). Neither
-needs C++ interoperability switched on. Until `1.0.0` any release may change the interface, so pin a commit; the
-public URL is decided before `0.1.0`:
+needs C++ interoperability switched on. Until `1.0.0` any release may change the interface, so pin an exact
+version (or a commit) from the public home on Codeberg:
 
 ```swift
 dependencies: [
-    .package(url: "<the public URL, decided before 0.1.0>", revision: "<sha>"),
+    .package(url: "https://codeberg.org/BourgeoisConcernLLC/bc-file-system.git", exact: "0.1.0"),
 ],
 targets: [
     .target(name: "Tool", dependencies: [.product(name: "BCFileSystem", package: "bc-file-system")]),
@@ -68,15 +68,15 @@ act on, an `AbsolutePath` or a `RelativePath` beneath an open `Directory`; the p
 `bc-file-system-testing` is for a consumer's tests only (`ObservedEngine`, an engine with the observer installed,
 so a test can script a failing system call or a kill point and read step counts, and `TemporaryDirectory`, a
 directory the test owns). The core's C sources sit outside the crate directory, so the crates are not published
-(`publish = false`): pin a commit, from the same repository as the Swift package; the public URL is decided before
-`0.1.0`. The crates are experimental until a production consumer runs on them.
+(`publish = false`): pin a tag or a commit, from the same repository as the Swift package. The crates are
+experimental until a production consumer runs on them.
 
 ```toml
 [dependencies]
-bc-file-system = { git = "<the public URL, decided before 0.1.0>", rev = "<sha>" }
+bc-file-system = { git = "https://codeberg.org/BourgeoisConcernLLC/bc-file-system.git", tag = "0.1.0" }
 
 [dev-dependencies]
-bc-file-system-testing = { git = "<the public URL, decided before 0.1.0>", rev = "<sha>" }
+bc-file-system-testing = { git = "https://codeberg.org/BourgeoisConcernLLC/bc-file-system.git", tag = "0.1.0" }
 ```
 
 The composition root names the live engine once and hands `&Engine` down; a test makes an observed one, over a
@@ -208,4 +208,8 @@ containment and its identity check staying `beneath`'s. Stage 29 `at-one-call` i
 whose calls each act on the location itself (a status, a read, an open, a removal, a link, a written append or
 rename, a condemn) hands the system the whole text with no directory opened, so `status` through `at` is one
 `fstatat` at any depth, as `lstat` is; the staged operations, and a durable append or rename, still hold the parent
-they act in. `0.1.0` is tagged when every face is green on every platform.
+they act in. Stage 20 `platform-legs-by-hand` is in: the Android presets and `scripts/android_legs.sh` run the C
+tests and the GoogleTest suite on the API 30, 33 and 35 emulators, and the Swift package's tests run on the iOS
+simulator (above); with it, stage 32 `android-no-clone`: the engine probes no clone on Android, where SELinux
+refuses `FICLONE`, and a case whose fixture the platform refuses the shell user (a FIFO, a hard link) skips with
+that reason. `0.1.0` is the first tag: every face green in CI on Linux and by hand on macOS, iOS and Android.
