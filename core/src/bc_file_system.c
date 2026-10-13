@@ -17,7 +17,11 @@
  * entry carrying one of the engine's own marks, which names.h holds). Each one validates its arguments exactly
  * as the header promises (a contract violation is `invalid_argument` and touches nothing) and announces itself
  * to the observer, then resolves its location once through resolve.h to (parent descriptor, leaf name) and
- * makes only `*at` calls on that pair from then on, each through calls.h (behind the observer's `before_step`,
+ * makes only `*at` calls on that pair from then on; under `at` an operation that acts on its location in one
+ * call (or in calls that each act on that one path) takes the pair (AT_FDCWD, the whole text) instead, so that
+ * call is the system's whole resolution, and an operation whose steps must act in one directory as a unit (a
+ * staged write or copy, a chain of directories, a tree removal, a durable append or rename) holds the parent.
+ * Each call goes through calls.h (behind the observer's `before_step`,
  * asked again on EINTR, the errno copied on the line after the call); every descriptor it holds is an
  * owned_descriptor under the cleanup idiom of owned.h, a directory it reads is an owned_directory_stream, and
  * a file or directory it created and still owns is a staged_file or a created_directory under the same idiom,
@@ -502,6 +506,26 @@ void bc_file_system_engine_before_step(bc_file_system_engine *engine, int32_t op
     verdict->system_code = fired.system_code;
 }
 
+/* ---- The retry in the held parent's shape --------------------------------------------------------------------- */
+
+/* Whether an attempt in the one-call shape met ENAMETOOLONG on an `at` location's whole text, which the held
+ * parent's shape may still resolve: Apple platforms bound a symlink's text joined to the rest of a path by
+ * PATH_MAX, so a text that fits one call may be refused all the same, and the resolution of its parent text takes
+ * such a piece one component at a time (stage 27). The operation is then made once more in the held parent's
+ * shape, so ENAMETOOLONG stays `invalid_argument` only for a single component the system refuses. The refused
+ * attempt changed nothing: the call that answered is the first the operation makes on that text, or a rename's
+ * one move. */
+static bool needs_the_held_parent(const bc_file_system_location *location, int32_t shape, int32_t kind,
+                                  const bc_file_system_error *error) {
+    if (kind != bc_file_system_error_kind_invalid_argument) {
+        return false;
+    }
+    if (error->system_code != ENAMETOOLONG) {
+        return false;
+    }
+    return bc_file_system_resolve_takes_whole_text(location, shape);
+}
+
 /* ---- Directories and locks ----------------------------------------------------------------------------------- */
 
 /* The text a directory remembers: for `at` the path's bytes, for `beneath` the parent's text, a slash and the
@@ -537,17 +561,19 @@ static bc_file_system_directory *allocate_directory(const bc_file_system_locatio
     return created;
 }
 
-/* Opens the directory a resolved location names, for `access`: the leaf under the caller's choice about a final
- * symlink, or, for the root, `.` beneath the descriptor the resolution opened (which is open for search, and a
- * listing needs more). Under `beneath` the open is bracketed by the identity check like every component before
- * it: that is the containment the header promises there. Under `at` the header promises the system's resolution,
- * so nothing is checked around the open: a directory swapped in for the leaf is one the system's own open of the
- * path would open too, O_NOFOLLOW alone refuses a final symlink under `refuse`, and the open's errno is the
- * answer (resolve.h, `bc_file_system_resolve_open_directory`). */
+/* Opens the directory a resolved location names, for `access`: `leaf_name` (the leaf, or an `at` location's whole
+ * text beside AT_FDCWD) under the caller's choice about a final symlink, or, for the root, `.` beneath the
+ * descriptor the resolution opened (which is open for search, and a listing needs more). Under `beneath` the open
+ * is bracketed by the identity check like every component before it: that is the containment the header
+ * promises there. Under `at` the header promises the system's resolution, so nothing is checked around the open:
+ * a directory swapped in for the leaf is one the system's own open of the path would open too, O_NOFOLLOW alone
+ * refuses a final symlink under `refuse`, and the open's errno is the answer (resolve.h,
+ * `bc_file_system_resolve_open_directory`). */
 static int32_t open_resolved_directory(bc_file_system_engine *engine, int32_t operation, int32_t location_kind,
-                                       const bc_file_system_resolved *resolved, int32_t final_symlink, int32_t access,
-                                       owned_descriptor *opened, bc_file_system_error *error) {
-    const char *name = resolved->leaf_length == 0 ? "." : (const char *)resolved->leaf;
+                                       const bc_file_system_resolved *resolved, const uint8_t *leaf_name,
+                                       int32_t final_symlink, int32_t access, owned_descriptor *opened,
+                                       bc_file_system_error *error) {
+    const char *name = resolved->leaf_length == 0 ? "." : (const char *)leaf_name;
     if (location_kind == bc_file_system_location_kind_at) {
         return bc_file_system_resolve_open_directory(engine, operation, resolved->parent, name, final_symlink, access,
                                                      opened, error);
@@ -560,6 +586,41 @@ static int32_t open_resolved_directory(bc_file_system_engine *engine, int32_t op
     }
     return bc_file_system_resolve_open_expected_directory(engine, operation, resolved->parent, name, final_symlink,
                                                           access, &expected, opened, error);
+}
+
+/* The body of `bc_file_system_directory_open`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t open_directory_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_location *location, int32_t shape, int32_t final_symlink,
+                                       bc_file_system_directory **directory, bc_file_system_error *error) {
+    /* One call opens the directory: under `at` the whole text by path, nothing opened before it. */
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_name name;
+    int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The leaf is opened as a directory, for search, with the caller's choice about a final symlink: bracketed by
+     * the identity check under `beneath`, like every component before it, and with nothing around the open under
+     * `at` (`open_resolved_directory`), the whole text by path. The root has no leaf: the parent the resolution
+     * opened is the directory itself, and it is taken over rather than opened again. */
+    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
+    if (resolved.leaf_length == 0) {
+        opened.value = release_descriptor(&resolved.opened);
+    } else {
+        kind = open_resolved_directory(engine, operation, location->kind, &resolved, name.text, final_symlink,
+                                       bc_file_system_directory_access_search, &opened, error);
+        if (kind != 0) {
+            return kind;
+        }
+    }
+    bc_file_system_directory *created = allocate_directory(location);
+    if (created == nullptr) {
+        return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
+    }
+    created->descriptor = release_descriptor(&opened);
+    *directory = created;
+    return succeed(error);
 }
 
 int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_file_system_location *location,
@@ -575,32 +636,13 @@ int32_t bc_file_system_directory_open(bc_file_system_engine *engine, const bc_fi
     }
     bc_file_system_engine_before_operation(engine, operation);
 
-    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
-    if (kind != 0) {
+    const int32_t kind = open_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                                 final_symlink, directory, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
         return kind;
     }
-    /* The leaf is opened as a directory, for search, with the caller's choice about a final symlink: bracketed by
-     * the identity check under `beneath`, like every component before it, and with nothing around the open under
-     * `at` (`open_resolved_directory`). The root has no leaf: the parent the resolution opened is the directory
-     * itself, and it is taken over rather than opened again. */
-    [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    if (resolved.leaf_length == 0) {
-        opened.value = release_descriptor(&resolved.opened);
-    } else {
-        kind = open_resolved_directory(engine, operation, location->kind, &resolved, final_symlink,
-                                       bc_file_system_directory_access_search, &opened, error);
-        if (kind != 0) {
-            return kind;
-        }
-    }
-    bc_file_system_directory *created = allocate_directory(location);
-    if (created == nullptr) {
-        return refuse(error, bc_file_system_error_kind_resource_exhausted, operation);
-    }
-    created->descriptor = release_descriptor(&opened);
-    *directory = created;
-    return succeed(error);
+    return open_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent,
+                                   final_symlink, directory, error);
 }
 
 int32_t bc_file_system_directory_opened_as(const bc_file_system_directory *directory, uint8_t *buffer, size_t capacity,
@@ -693,21 +735,17 @@ static bool overflows_size_t(uint64_t size, size_t *as_size) {
     return ckd_add(as_size, size, (uint64_t)0);
 }
 
-int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                 int32_t final_symlink, int32_t *present, bc_file_system_status *status,
-                                 bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_status;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_in_enum(final_symlink, final_symlink_last) ||
-        present == nullptr || status == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_status_of`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t status_of_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                  const bc_file_system_location *location, int32_t shape, int32_t final_symlink,
+                                  int32_t *present, bc_file_system_status *status, bc_file_system_error *error) {
+    /* One call states the entry: under `at` the whole text by path, so this one `fstatat` is the system's whole
+     * resolution, as `lstat` and `stat` are, and an absence on the way (ENOENT, ENOTDIR) is its answer below. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    const int32_t resolution =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (resolution != 0) {
         if (means_absence(resolution)) {
             *present = 0;
@@ -726,7 +764,7 @@ int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_sy
     } else {
         const int flags = final_symlink == bc_file_system_final_symlink_refuse ? AT_SYMLINK_NOFOLLOW : 0;
         outcome =
-            bc_file_system_call_fstatat(engine, operation, resolved.parent, (const char *)resolved.leaf, flags, &info);
+            bc_file_system_call_fstatat(engine, operation, resolved.parent, (const char *)name.text, flags, &info);
     }
     if (!outcome.succeeded) {
         const int32_t kind = bc_file_system_call_kind_of_errno(outcome.code);
@@ -739,6 +777,28 @@ int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_sy
     *status = status_from_stat(&info);
     *present = 1;
     return succeed(error);
+}
+
+int32_t bc_file_system_status_of(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                 int32_t final_symlink, int32_t *present, bc_file_system_status *status,
+                                 bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_status;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || !is_in_enum(final_symlink, final_symlink_last) ||
+        present == nullptr || status == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = status_of_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                            final_symlink, present, status, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return status_of_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, final_symlink,
+                              present, status, error);
 }
 
 /* Reads the whole of an open regular file of `size` bytes into the caller's buffer, which holds at least that
@@ -825,21 +885,16 @@ static int32_t measure_growth(bc_file_system_engine *engine, int32_t operation, 
     return 0;
 }
 
-int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                 const bc_file_system_read_options *options, uint8_t *buffer, size_t capacity,
-                                 size_t *length, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_read_file;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_valid_read_options(options) ||
-        !is_answer_buffer(buffer, capacity, length)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_read_file`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t read_file_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                  const bc_file_system_location *location, int32_t shape,
+                                  const bc_file_system_read_options *options, uint8_t *buffer, size_t capacity,
+                                  size_t *length, bc_file_system_error *error) {
+    /* One call opens the file, under `at` the whole text by path; every later call is on the descriptor. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
@@ -853,8 +908,8 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
     } else {
         const int flags = options->final_symlink == bc_file_system_final_symlink_refuse ? file_read_flags | O_NOFOLLOW
                                                                                         : file_read_flags;
-        const bc_file_system_call_outcome opened = bc_file_system_call_openat(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, flags, &file.value);
+        const bc_file_system_call_outcome opened =
+            bc_file_system_call_openat(engine, operation, resolved.parent, (const char *)name.text, flags, &file.value);
         if (!opened.succeeded) {
             return report_outcome(error, operation, bc_file_system_step_openat, &opened,
                                   bc_file_system_call_kind_of_errno(opened.code));
@@ -903,6 +958,28 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
     return succeed(error);
 }
 
+int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                 const bc_file_system_read_options *options, uint8_t *buffer, size_t capacity,
+                                 size_t *length, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_read_file;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || !is_valid_read_options(options) ||
+        !is_answer_buffer(buffer, capacity, length)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = read_file_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                            options, buffer, capacity, length, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return read_file_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, options, buffer,
+                              capacity, length, error);
+}
+
 /* ---- Writes ------------------------------------------------------------------------------------------------- */
 
 /* A file this operation created in `parent` under `name` and still owns: a staged write's temporary until it
@@ -912,15 +989,17 @@ int32_t bc_file_system_read_file(bc_file_system_engine *engine, const bc_file_sy
  * stopped the operation, so that the disk is left as a kill would leave it: the file stays, nothing is
  * unlinked. */
 typedef struct staged_file {
-    int parent; /* borrowed: the directory the file was created in */
+    int parent; /* borrowed: the directory the file was created in, or AT_FDCWD beside an absolute name */
     owned_descriptor descriptor;
-    uint8_t name[NAME_MAX + 1]; /* NUL-terminated */
+    /* NUL-terminated, in storage the operation owns and declares before the file, so it outlives the cleanup: a
+     * staged name the operation spells into NAME_MAX + 1 bytes, or an append's leaf or whole `at` text. */
+    uint8_t *name;
     bool created;
     bool kept;
 } staged_file;
 
-static staged_file staged_file_in(int parent) {
-    return (staged_file){.parent = parent, .descriptor = {.value = -1}, .name = {}, .created = false, .kept = false};
+static staged_file staged_file_in(int parent, uint8_t *name) {
+    return (staged_file){.parent = parent, .descriptor = {.value = -1}, .name = name, .created = false, .kept = false};
 }
 
 /* The cleanup. The close's result is discarded because a file that is unlinked next, or that a kill would have
@@ -1371,7 +1450,8 @@ int32_t bc_file_system_write_file(bc_file_system_engine *engine, const bc_file_s
     }
     /* Every write is staged: the bytes go into a new file beside the destination, which takes the destination's
      * name only once it is complete, so a reader sees the old content or the new and never a mixture. */
-    [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(resolved.parent);
+    uint8_t staged_name[NAME_MAX + 1] = {};
+    [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(resolved.parent, staged_name);
     kind = create_staged_file(engine, operation, &staged, resolved.leaf, resolved.leaf_length, error);
     if (kind != 0) {
         return kind;
@@ -1430,23 +1510,15 @@ static int32_t open_for_append(bc_file_system_engine *engine, int32_t operation,
     return 0;
 }
 
-int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_system_location *location,
-                              const uint8_t *bytes, size_t byte_count, int32_t durability,
-                              const bc_file_system_permissions *permissions, int32_t *durability_achieved,
-                              bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_append;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_byte_span(bytes, byte_count) ||
-        !is_in_enum(durability, durability_last) || !is_valid_permissions(permissions) ||
-        durability_achieved == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_append`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t append_in_shape(bc_file_system_engine *engine, int32_t operation,
+                               const bc_file_system_location *location, int32_t shape, const uint8_t *bytes,
+                               size_t byte_count, int32_t durability, const bc_file_system_permissions *permissions,
+                               int32_t *durability_achieved, bc_file_system_error *error) {
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
@@ -1456,8 +1528,7 @@ int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_syste
     }
     /* The file is this operation's own until its mode is set: a new file whose mode cannot be set is taken
      * back, so a failure never leaves a file with a mode nobody chose. */
-    [[gnu::cleanup(discard_staged_file)]] staged_file file = staged_file_in(resolved.parent);
-    memcpy(file.name, resolved.leaf, resolved.leaf_length);
+    [[gnu::cleanup(discard_staged_file)]] staged_file file = staged_file_in(resolved.parent, name.text);
     bool is_new = false;
     kind = open_for_append(engine, operation, &file, permissions->mode, &is_new, error);
     if (kind != 0) {
@@ -1506,21 +1577,46 @@ int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_syste
     return succeed(error);
 }
 
-/* ---- sync ---------------------------------------------------------------------------------------------------- */
-
-int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_location *location,
-                            int32_t *durability_achieved, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_sync;
+int32_t bc_file_system_append(bc_file_system_engine *engine, const bc_file_system_location *location,
+                              const uint8_t *bytes, size_t byte_count, int32_t durability,
+                              const bc_file_system_permissions *permissions, int32_t *durability_achieved,
+                              bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_append;
     if (error == nullptr) {
         return bc_file_system_error_kind_invalid_argument;
     }
-    if (engine == nullptr || !is_valid_location(location) || durability_achieved == nullptr) {
+    if (engine == nullptr || !is_valid_location(location) || !is_byte_span(bytes, byte_count) ||
+        !is_in_enum(durability, durability_last) || !is_valid_permissions(permissions) ||
+        durability_achieved == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
 
+    /* A durable append syncs the directory a new file appears in, so its steps act in one directory as a unit and
+     * it holds that directory; a `written` one acts on the file alone, in one call that opens it (under `at` the
+     * whole text by path), every later call on the descriptor. */
+    const int32_t shape = durability == bc_file_system_durability_durable ? bc_file_system_resolution_shape_held_parent
+                                                                          : bc_file_system_resolution_shape_one_call;
+    const int32_t kind = append_in_shape(engine, operation, location, shape, bytes, byte_count, durability, permissions,
+                                         durability_achieved, error);
+    if (!needs_the_held_parent(location, shape, kind, error)) {
+        return kind;
+    }
+    return append_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, bytes, byte_count,
+                           durability, permissions, durability_achieved, error);
+}
+
+/* ---- sync ---------------------------------------------------------------------------------------------------- */
+
+/* The body of `bc_file_system_sync`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t sync_in_shape(bc_file_system_engine *engine, int32_t operation, const bc_file_system_location *location,
+                             int32_t shape, int32_t *durability_achieved, bc_file_system_error *error) {
+    /* One call opens what is synced (under `at` the whole text by path) and the sync is on its descriptor: the
+     * entry's directory is never synced here, so nothing needs it held. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    const int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
@@ -1531,7 +1627,7 @@ int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_
         adopt_descriptor(&target, &resolved.opened);
     } else {
         const bc_file_system_call_outcome opened = bc_file_system_call_openat(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, sync_open_flags, &target.value);
+            engine, operation, resolved.parent, (const char *)name.text, sync_open_flags, &target.value);
         if (!opened.succeeded) {
             return report_outcome(error, operation, bc_file_system_step_openat, &opened,
                                   bc_file_system_call_kind_of_errno(opened.code));
@@ -1550,6 +1646,26 @@ int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_
     }
     return report_outcome(error, operation, bc_file_system_call_sync_step(engine), &synced,
                           bc_file_system_call_kind_of_errno(synced.code));
+}
+
+int32_t bc_file_system_sync(bc_file_system_engine *engine, const bc_file_system_location *location,
+                            int32_t *durability_achieved, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_sync;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || durability_achieved == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = sync_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                       durability_achieved, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return sync_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, durability_achieved,
+                         error);
 }
 
 /* ---- Directories --------------------------------------------------------------------------------------------- */
@@ -1579,16 +1695,16 @@ static bool means_flag_unsupported(int code) {
  * under `[[gnu::cleanup(discard_created_directory)]]`, so a failing path removes it again (a directory with a
  * mode nobody chose is never left behind) and a stop keeps it, as a kill would. */
 typedef struct created_directory {
-    int parent;                 /* borrowed: the directory it was created in */
-    uint8_t name[NAME_MAX + 1]; /* NUL-terminated */
+    int parent; /* borrowed: the directory it was created in, or AT_FDCWD beside an absolute name */
+    /* NUL-terminated and borrowed from the operation, which declares it before the directory so it outlives the
+     * cleanup: a component, or a `create_directory`'s whole `at` text. */
+    const uint8_t *name;
     bool created;
     bool kept;
 } created_directory;
 
 static created_directory created_directory_in(int parent, const uint8_t *name) {
-    created_directory created = {.parent = parent, .name = {}, .created = false, .kept = false};
-    memcpy(created.name, name, strlen((const char *)name));
-    return created;
+    return (created_directory){.parent = parent, .name = name, .created = false, .kept = false};
 }
 
 /* The cleanup: the removal is best effort after the real error, and nothing it could report changes it. */
@@ -1679,6 +1795,33 @@ static int32_t symlink_choice_of(const bc_file_system_location *location) {
 
 /* ---- create_directory ---------------------------------------------------------------------------------------- */
 
+/* The body of `bc_file_system_create_directory`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t create_directory_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                         const bc_file_system_location *location, int32_t shape,
+                                         const bc_file_system_permissions *permissions, bc_file_system_error *error) {
+    /* The directory is made and given its mode by name (under `at` the whole text by path both times), so the
+     * two calls act on the location itself and nothing is held. */
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_name name;
+    const int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root is always there. A final symlink has no meaning for a creation: the name must be free, and a
+     * symlink holding it is something already there, which mkdirat answers EEXIST for. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_already_exists, operation);
+    }
+    [[gnu::cleanup(discard_created_directory)]] created_directory created =
+        created_directory_in(resolved.parent, name.text);
+    const int32_t made = make_directory_with_mode(engine, operation, &created, permissions->mode, error);
+    if (made != 0) {
+        return made;
+    }
+    return succeed(error);
+}
+
 int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
                                         const bc_file_system_permissions *permissions, bc_file_system_error *error) {
     const int32_t operation = bc_file_system_operation_create_directory;
@@ -1690,23 +1833,13 @@ int32_t bc_file_system_create_directory(bc_file_system_engine *engine, const bc_
     }
     bc_file_system_engine_before_operation(engine, operation);
 
-    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
-    if (kind != 0) {
+    const int32_t kind = create_directory_in_shape(engine, operation, location,
+                                                   bc_file_system_resolution_shape_one_call, permissions, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
         return kind;
     }
-    /* The root is always there. A final symlink has no meaning for a creation: the name must be free, and a
-     * symlink holding it is something already there, which mkdirat answers EEXIST for. */
-    if (resolved.leaf_length == 0) {
-        return refuse(error, bc_file_system_error_kind_already_exists, operation);
-    }
-    [[gnu::cleanup(discard_created_directory)]] created_directory created =
-        created_directory_in(resolved.parent, resolved.leaf);
-    const int32_t made = make_directory_with_mode(engine, operation, &created, permissions->mode, error);
-    if (made != 0) {
-        return made;
-    }
-    return succeed(error);
+    return create_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent,
+                                     permissions, error);
 }
 
 /* ---- create_directories -------------------------------------------------------------------------------------- */
@@ -1952,28 +2085,23 @@ static int32_t store_entries(bc_file_system_engine *engine, int32_t operation, D
     }
 }
 
-int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                      int32_t final_symlink, bc_file_system_entry *entries, size_t capacity,
-                                      size_t *count, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_list_directory;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_in_enum(final_symlink, final_symlink_last) ||
-        (entries == nullptr && capacity != 0) || count == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_list_directory`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t list_directory_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_location *location, int32_t shape, int32_t final_symlink,
+                                       bc_file_system_entry *entries, size_t capacity, size_t *count,
+                                       bc_file_system_error *error) {
+    /* One call opens the directory (under `at` the whole text by path), and the listing is read through it. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
     /* The directory is opened read-only, which a listing needs and the walk's search-only open does not give;
      * the stream then owns the descriptor. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    kind = open_resolved_directory(engine, operation, location->kind, &resolved, final_symlink,
+    kind = open_resolved_directory(engine, operation, location->kind, &resolved, name.text, final_symlink,
                                    bc_file_system_directory_access_read, &opened, error);
     if (kind != 0) {
         return kind;
@@ -2010,21 +2138,41 @@ int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_fi
     return succeed(error);
 }
 
-/* ---- remove_file and remove_directory ----------------------------------------------------------------------- */
-
-int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                   int32_t *existed, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_remove_file;
+int32_t bc_file_system_list_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                      int32_t final_symlink, bc_file_system_entry *entries, size_t capacity,
+                                      size_t *count, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_list_directory;
     if (error == nullptr) {
         return bc_file_system_error_kind_invalid_argument;
     }
-    if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
+    if (engine == nullptr || !is_valid_location(location) || !is_in_enum(final_symlink, final_symlink_last) ||
+        (entries == nullptr && capacity != 0) || count == nullptr) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     bc_file_system_engine_before_operation(engine, operation);
 
+    const int32_t kind = list_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                                 final_symlink, entries, capacity, count, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return list_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent,
+                                   final_symlink, entries, capacity, count, error);
+}
+
+/* ---- remove_file and remove_directory ----------------------------------------------------------------------- */
+
+/* The body of `bc_file_system_remove_file`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t remove_file_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                    const bc_file_system_location *location, int32_t shape, int32_t *existed,
+                                    bc_file_system_error *error) {
+    /* One call removes the entry (under `at` the whole text by path, so a missing or non-directory component on
+     * the way is that call's answer, read below as the absence it always was). */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    const int32_t resolution =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (resolution != 0) {
         if (means_absence(resolution)) {
             *existed = 0;
@@ -2038,22 +2186,23 @@ int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_
     }
     /* unlinkat without AT_REMOVEDIR removes a file or a symlink (the link itself, never what it points at) and
      * refuses a directory: EISDIR on Linux, EPERM on Apple platforms, where EPERM also means what it means
-     * everywhere, so a look at the entry tells the two apart. */
+     * everywhere, so a look at the entry tells the two apart. ENOENT is the entry's absence, and so is ENOTDIR,
+     * which this call answers only for a component on the way (never for its leaf), as a resolution did. */
     const bc_file_system_call_outcome removed =
-        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)resolved.leaf, 0);
+        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)name.text, 0);
     if (removed.succeeded) {
         *existed = 1;
         return succeed(error);
     }
-    if (!removed.stopped && removed.code == ENOENT) {
+    int32_t kind = bc_file_system_call_kind_of_errno(removed.code);
+    if (!removed.stopped && means_absence(kind)) {
         *existed = 0;
         return succeed(error);
     }
-    int32_t kind = bc_file_system_call_kind_of_errno(removed.code);
     if (!removed.stopped && removed.code == EPERM) {
         struct stat info;
         const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, AT_SYMLINK_NOFOLLOW, &info);
+            engine, operation, resolved.parent, (const char *)name.text, AT_SYMLINK_NOFOLLOW, &info);
         if (!looked.succeeded) {
             return report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
                                   bc_file_system_call_kind_of_errno(looked.code));
@@ -2063,6 +2212,26 @@ int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_
         }
     }
     return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed, kind);
+}
+
+int32_t bc_file_system_remove_file(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                   int32_t *existed, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_remove_file;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind =
+        remove_file_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call, existed, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return remove_file_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, existed,
+                                error);
 }
 
 /* The kind a refused directory removal decides: a directory with entries is `directory_not_empty` (ENOTEMPTY,
@@ -2077,19 +2246,16 @@ static int32_t kind_of_directory_removal_failure(int code) {
     return bc_file_system_call_kind_of_errno(code);
 }
 
-int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                        int32_t *existed, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_remove_directory;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_remove_directory`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t remove_directory_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                         const bc_file_system_location *location, int32_t shape, int32_t *existed,
+                                         bc_file_system_error *error) {
+    /* One call removes the directory (under `at` the whole text by path). */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t resolution = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name name;
+    const int32_t resolution =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
     if (resolution != 0) {
         if (means_absence(resolution)) {
             *existed = 0;
@@ -2102,7 +2268,7 @@ int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     const bc_file_system_call_outcome removed =
-        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)resolved.leaf, AT_REMOVEDIR);
+        bc_file_system_call_unlinkat(engine, operation, resolved.parent, (const char *)name.text, AT_REMOVEDIR);
     if (removed.succeeded) {
         *existed = 1;
         return succeed(error);
@@ -2111,8 +2277,44 @@ int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_
         *existed = 0;
         return succeed(error);
     }
+    /* Beside a held parent ENOTDIR is the leaf's own answer: something that is not a directory. Under the whole
+     * text it is also a file on the way, which a resolution answered as absence: one look that never follows, on
+     * this failing path only, tells them apart, nothing there being the absence it always was. */
+    if (!removed.stopped && removed.code == ENOTDIR && bc_file_system_resolved_is_whole_text(&resolved)) {
+        struct stat info;
+        const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
+            engine, operation, resolved.parent, (const char *)name.text, AT_SYMLINK_NOFOLLOW, &info);
+        if (!looked.succeeded) {
+            const int32_t kind = bc_file_system_call_kind_of_errno(looked.code);
+            if (!looked.stopped && means_absence(kind)) {
+                *existed = 0;
+                return succeed(error);
+            }
+            return report_outcome(error, operation, bc_file_system_step_fstatat, &looked, kind);
+        }
+    }
     return report_outcome(error, operation, bc_file_system_step_unlinkat, &removed,
                           kind_of_directory_removal_failure(removed.code));
+}
+
+int32_t bc_file_system_remove_directory(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                        int32_t *existed, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_remove_directory;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || existed == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = remove_directory_in_shape(engine, operation, location,
+                                                   bc_file_system_resolution_shape_one_call, existed, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return remove_directory_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, existed,
+                                     error);
 }
 
 /* ---- remove_tree --------------------------------------------------------------------------------------------- */
@@ -2568,8 +2770,9 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
     int directory = resolved.parent;
     if (resolved.leaf_length > 0) {
-        kind = open_resolved_directory(engine, operation, parent->kind, &resolved, symlink_choice_of(parent),
-                                       bc_file_system_directory_access_search, &opened, error);
+        kind =
+            open_resolved_directory(engine, operation, parent->kind, &resolved, resolved.leaf,
+                                    symlink_choice_of(parent), bc_file_system_directory_access_search, &opened, error);
         if (kind != 0) {
             return kind;
         }
@@ -2621,25 +2824,22 @@ int32_t bc_file_system_create_temporary_directory(bc_file_system_engine *engine,
 
 /* ---- set_permissions ----------------------------------------------------------------------------------------- */
 
-int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                       uint32_t mode, int32_t final_symlink, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_set_permissions;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || mode > permission_bits ||
-        !is_in_enum(final_symlink, final_symlink_last)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_set_permissions`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t set_permissions_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                        const bc_file_system_location *location, int32_t shape, uint32_t mode,
+                                        int32_t final_symlink, bc_file_system_error *error) {
+    /* The mode is set by name (under `at` the whole text by path), after one look under `refuse`: both calls act on
+     * the location itself, so nothing is held. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name leaf_name;
+    const int32_t kind =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &leaf_name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
     /* The root has no leaf: it is `.` beneath the descriptor the walk opened. */
-    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)leaf_name.text;
     if (final_symlink == bc_file_system_final_symlink_follow) {
         const bc_file_system_call_outcome changed =
             bc_file_system_call_fchmodat(engine, operation, resolved.parent, name, mode, 0);
@@ -2670,6 +2870,27 @@ int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_f
         return report_outcome(error, operation, failed_step, &changed, bc_file_system_call_kind_of_errno(changed.code));
     }
     return succeed(error);
+}
+
+int32_t bc_file_system_set_permissions(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                       uint32_t mode, int32_t final_symlink, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_set_permissions;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || mode > permission_bits ||
+        !is_in_enum(final_symlink, final_symlink_last)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = set_permissions_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                                  mode, final_symlink, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return set_permissions_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, mode,
+                                    final_symlink, error);
 }
 
 /* ---- Moves and copies ---------------------------------------------------------------------------------------- */
@@ -2758,15 +2979,20 @@ static int32_t same_directory(bc_file_system_engine *engine, int32_t operation, 
 }
 
 /* The one step that moves the entry: renameat under `replace` (a file replaces a file, a directory an empty
- * directory), the platform's no-replace rename under `refuse`. EXDEV is the table's `cross_device`: the header
- * promises one step, so a rename across devices is refused, never copied and deleted. The step acts on both
- * ends, so its failure is named for the destination (what it holds, or the device it is on, is what refuses),
- * except `not_found`: both parents are held open, so what is missing can only be the source's entry. */
+ * directory), the platform's no-replace rename under `refuse`, each taking the two names the resolutions answered
+ * (a leaf beside its held parent, or an `at` location's whole text beside AT_FDCWD). EXDEV is the table's
+ * `cross_device`: the header promises one step, so a rename across devices is refused, never copied and deleted.
+ * The step acts on both ends, so its failure is named for the destination (what it holds, or the device it is
+ * on, is what refuses), except `not_found`: with the destination's parent held, what is missing can only be the
+ * source's entry. With the destination's whole text it may also be a directory missing on the destination's way,
+ * which a held parent had ruled out, so one look at the source that never follows, on this failing path only,
+ * tells them apart: a source still there makes the missing thing the destination's. */
 static int32_t move_entry(bc_file_system_engine *engine, int32_t operation, const bc_file_system_resolved *source,
-                          const bc_file_system_resolved *destination, int32_t existing_destination,
+                          const bc_file_system_name *source_name, const bc_file_system_resolved *destination,
+                          const bc_file_system_name *destination_name, int32_t existing_destination,
                           bc_file_system_error *error) {
-    const char *from = (const char *)source->leaf;
-    const char *to = (const char *)destination->leaf;
+    const char *from = (const char *)source_name->text;
+    const char *to = (const char *)destination_name->text;
     int32_t step = bc_file_system_step_renameat;
     bc_file_system_call_outcome outcome;
     if (existing_destination == bc_file_system_existing_destination_replace) {
@@ -2778,39 +3004,41 @@ static int32_t move_entry(bc_file_system_engine *engine, int32_t operation, cons
     }
     if (!outcome.succeeded) {
         const int32_t kind = kind_of_rename_failure(outcome.code, existing_destination);
-        const int32_t location = kind == bc_file_system_error_kind_not_found ? first_location : second_location;
+        int32_t location = kind == bc_file_system_error_kind_not_found ? first_location : second_location;
+        if (kind == bc_file_system_error_kind_not_found && !outcome.stopped &&
+            bc_file_system_resolved_is_whole_text(destination)) {
+            struct stat info;
+            const bc_file_system_call_outcome looked =
+                bc_file_system_call_fstatat(engine, operation, source->parent, from, AT_SYMLINK_NOFOLLOW, &info);
+            if (looked.stopped) {
+                return failed_at(error,
+                                 report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
+                                                bc_file_system_error_kind_io_failed),
+                                 first_location);
+            }
+            if (looked.succeeded) {
+                location = second_location;
+            }
+        }
         return failed_at(error, report_outcome(error, operation, step, &outcome, kind), location);
     }
     return 0;
 }
 
-int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_system_location *source,
-                              const bc_file_system_location *destination, int32_t existing_destination,
-                              int32_t durability, int32_t *durability_achieved, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_rename;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(source) || !is_valid_location(destination) ||
-        !is_in_enum(existing_destination, existing_destination_last) || !is_in_enum(durability, durability_last) ||
-        durability_achieved == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-    /* The promise that cannot be kept is the destination's, so the refusal is named for it. */
-    if (cannot_refuse_to_replace(engine, existing_destination)) {
-        return failed_at(error, refuse(error, bc_file_system_error_kind_unsupported, operation), second_location);
-    }
-
-    /* Both locations resolve first, the source then the destination, so both parents are held before anything
-     * moves. The root of the file system is neither moved nor replaced. */
+/* The body of `bc_file_system_rename`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t rename_in_shape(bc_file_system_engine *engine, int32_t operation, const bc_file_system_location *source,
+                               const bc_file_system_location *destination, int32_t shape, int32_t existing_destination,
+                               int32_t durability, int32_t *durability_achieved, bc_file_system_error *error) {
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved from = bc_file_system_resolved_empty();
-    int32_t kind = bc_file_system_resolve(engine, operation, source, &from, error);
+    bc_file_system_name from_name;
+    int32_t kind = bc_file_system_resolve_to_name(engine, operation, source, shape, &from_name, &from, error);
     if (kind != 0) {
         return failed_at(error, kind, first_location);
     }
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved to = bc_file_system_resolved_empty();
-    kind = bc_file_system_resolve(engine, operation, destination, &to, error);
+    bc_file_system_name to_name;
+    kind = bc_file_system_resolve_to_name(engine, operation, destination, shape, &to_name, &to, error);
     if (kind != 0) {
         return failed_at(error, kind, second_location);
     }
@@ -2825,7 +3053,7 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
      * rename is the one step, and a source that vanished in between is the same `not_found` from it. */
     struct stat source_info;
     const bc_file_system_call_outcome looked = bc_file_system_call_fstatat(
-        engine, operation, from.parent, (const char *)from.leaf, AT_SYMLINK_NOFOLLOW, &source_info);
+        engine, operation, from.parent, (const char *)from_name.text, AT_SYMLINK_NOFOLLOW, &source_info);
     if (!looked.succeeded) {
         return failed_at(error,
                          report_outcome(error, operation, bc_file_system_step_fstatat, &looked,
@@ -2839,7 +3067,7 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
             return kind;
         }
     }
-    kind = move_entry(engine, operation, &from, &to, existing_destination, error);
+    kind = move_entry(engine, operation, &from, &from_name, &to, &to_name, existing_destination, error);
     if (kind != 0) {
         return kind;
     }
@@ -2861,6 +3089,41 @@ int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_syste
     }
     *durability_achieved = achieved;
     return succeed(error);
+}
+
+int32_t bc_file_system_rename(bc_file_system_engine *engine, const bc_file_system_location *source,
+                              const bc_file_system_location *destination, int32_t existing_destination,
+                              int32_t durability, int32_t *durability_achieved, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_rename;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(source) || !is_valid_location(destination) ||
+        !is_in_enum(existing_destination, existing_destination_last) || !is_in_enum(durability, durability_last) ||
+        durability_achieved == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+    /* The promise that cannot be kept is the destination's, so the refusal is named for it. */
+    if (cannot_refuse_to_replace(engine, existing_destination)) {
+        return failed_at(error, refuse(error, bc_file_system_error_kind_unsupported, operation), second_location);
+    }
+
+    /* Both locations resolve first, the source then the destination, before anything moves. A durable rename
+     * syncs the directories it moved the name between, so its steps act in those directories as a unit and both
+     * parents are held; a `written` one is its look and its one move, which under `at` take the whole texts by
+     * path. The two names are the two PATH_MAX buffers of this call, one per location. The root of the file
+     * system is neither moved nor replaced. */
+    const int32_t shape = durability == bc_file_system_durability_durable ? bc_file_system_resolution_shape_held_parent
+                                                                          : bc_file_system_resolution_shape_one_call;
+    const int32_t kind = rename_in_shape(engine, operation, source, destination, shape, existing_destination,
+                                         durability, durability_achieved, error);
+    if (!(needs_the_held_parent(source, shape, kind, error) ||
+          needs_the_held_parent(destination, shape, kind, error))) {
+        return kind;
+    }
+    return rename_in_shape(engine, operation, source, destination, bc_file_system_resolution_shape_held_parent,
+                           existing_destination, durability, durability_achieved, error);
 }
 
 /* ---- copy_file ----------------------------------------------------------------------------------------------- */
@@ -3104,7 +3367,8 @@ int32_t bc_file_system_copy_file(bc_file_system_engine *engine, const bc_file_sy
     }
     /* From here every step acts beside the destination: the staged file lives in its directory, and the
      * source is only read from. A read of the source that fails is still reported there, under the source. */
-    [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(to.parent);
+    uint8_t staged_name[NAME_MAX + 1] = {};
+    [[gnu::cleanup(discard_staged_file)]] staged_file staged = staged_file_in(to.parent, staged_name);
     kind = stage_copied_bytes(engine, operation, &staged, file.value, to.leaf, to.leaf_length, error);
     if (kind != 0) {
         if (error->step == bc_file_system_step_pread) {
@@ -3132,24 +3396,16 @@ static bool means_lock_held_elsewhere(int code) {
     return code == EAGAIN;
 }
 
-int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                bc_file_system_lock **lock, int32_t *outcome, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_try_lock;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || lock == nullptr || outcome == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
-    /* A platform whose flock is a stub (Emscripten: every caller "acquires") offers no lock at all, and the
-     * library refuses before any call rather than hand out a lock that excludes nobody. */
-    if (!bc_file_system_platform_enforces_locks()) {
-        return refuse(error, bc_file_system_error_kind_unsupported, operation);
-    }
+/* The body of `bc_file_system_try_lock`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t try_lock_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                 const bc_file_system_location *location, int32_t shape, bc_file_system_lock **lock,
+                                 int32_t *outcome, bc_file_system_error *error) {
+    /* One call opens the entry (under `at` the whole text by path); the lock is taken on its descriptor. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name leaf_name;
+    const int32_t kind =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &leaf_name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
@@ -3158,7 +3414,7 @@ int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_sys
      * the walk's search-only descriptor could not hold one (flock on an O_PATH descriptor is EBADF). A regular
      * file or a directory may be locked, the root included, as `.` beneath the descriptor the walk opened;
      * anything else (a FIFO, a device) is refused after a look at the descriptor, with no step, like a refusal. */
-    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)leaf_name.text;
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor file = {.value = -1};
     const bc_file_system_call_outcome opened =
         bc_file_system_call_openat(engine, operation, resolved.parent, name, lock_open_flags, &file.value);
@@ -3200,6 +3456,31 @@ int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_sys
     return succeed(error);
 }
 
+int32_t bc_file_system_try_lock(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                bc_file_system_lock **lock, int32_t *outcome, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_try_lock;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || lock == nullptr || outcome == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    /* A platform whose flock is a stub (Emscripten: every caller "acquires") offers no lock at all, and the
+     * library refuses before any call rather than hand out a lock that excludes nobody. */
+    if (!bc_file_system_platform_enforces_locks()) {
+        return refuse(error, bc_file_system_error_kind_unsupported, operation);
+    }
+    const int32_t kind =
+        try_lock_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call, lock, outcome, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return try_lock_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, lock, outcome,
+                             error);
+}
+
 /* ---- create_symlink and read_symlink -------------------------------------------------------------------------- */
 
 /* Whether `target` is text the system can take as a symlink's: at least one byte, no NUL inside (the NUL that
@@ -3210,6 +3491,37 @@ static bool is_symlink_target(const uint8_t *target, size_t length) {
         return false;
     }
     return memchr(target, 0, length) == nullptr;
+}
+
+/* The body of `bc_file_system_create_symlink`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t create_symlink_in_shape(bc_file_system_engine *engine, int32_t operation, const uint8_t *target,
+                                       size_t target_length, const bc_file_system_location *location, int32_t shape,
+                                       bc_file_system_error *error) {
+    /* One call makes the link (under `at` at the whole text by path). */
+    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
+    bc_file_system_name name;
+    const int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &name, &resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The root is always there; a link cannot take its name. */
+    if (resolved.leaf_length == 0) {
+        return refuse(error, bc_file_system_error_kind_already_exists, operation);
+    }
+    /* The target goes to the system as the caller spelled it, NUL-terminated and nothing more: never resolved,
+     * never normalised, so a relative text or a `..` is the link's to mean. The second PATH_MAX buffer of this
+     * call, beside the location's name: the two texts the one call takes. */
+    uint8_t text[PATH_MAX];
+    memcpy(text, target, target_length);
+    text[target_length] = 0;
+    const bc_file_system_call_outcome made =
+        bc_file_system_call_symlinkat(engine, operation, (const char *)text, resolved.parent, (const char *)name.text);
+    if (!made.succeeded) {
+        return report_outcome(error, operation, bc_file_system_step_symlinkat, &made,
+                              bc_file_system_call_kind_of_errno(made.code));
+    }
+    return succeed(error);
 }
 
 int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8_t *target, size_t target_length,
@@ -3223,51 +3535,33 @@ int32_t bc_file_system_create_symlink(bc_file_system_engine *engine, const uint8
     }
     bc_file_system_engine_before_operation(engine, operation);
 
-    [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
-    if (kind != 0) {
+    const int32_t kind = create_symlink_in_shape(engine, operation, target, target_length, location,
+                                                 bc_file_system_resolution_shape_one_call, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
         return kind;
     }
-    /* The root is always there; a link cannot take its name. */
-    if (resolved.leaf_length == 0) {
-        return refuse(error, bc_file_system_error_kind_already_exists, operation);
-    }
-    /* The target goes to the system as the caller spelled it, NUL-terminated and nothing more: never resolved,
-     * never normalised, so a relative text or a `..` is the link's to mean. The one PATH_MAX buffer of this
-     * call. */
-    uint8_t text[PATH_MAX];
-    memcpy(text, target, target_length);
-    text[target_length] = 0;
-    const bc_file_system_call_outcome made = bc_file_system_call_symlinkat(
-        engine, operation, (const char *)text, resolved.parent, (const char *)resolved.leaf);
-    if (!made.succeeded) {
-        return report_outcome(error, operation, bc_file_system_step_symlinkat, &made,
-                              bc_file_system_call_kind_of_errno(made.code));
-    }
-    return succeed(error);
+    return create_symlink_in_shape(engine, operation, target, target_length, location,
+                                   bc_file_system_resolution_shape_held_parent, error);
 }
 
-int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file_system_location *location,
-                                    uint8_t *buffer, size_t capacity, size_t *length, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_read_symlink;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-
+/* The body of `bc_file_system_read_symlink`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t read_symlink_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                     const bc_file_system_location *location, int32_t shape, uint8_t *buffer,
+                                     size_t capacity, size_t *length, bc_file_system_error *error) {
+    /* One call reads the link (under `at` the whole text by path). */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name leaf_name;
+    const int32_t kind =
+        bc_file_system_resolve_to_name(engine, operation, location, shape, &leaf_name, &resolved, error);
     if (kind != 0) {
         return kind;
     }
     /* readlinkat cuts a text short silently when the buffer is too small, so the text is read whole into a
-     * scratch as large as any path the system holds (the one PATH_MAX buffer of this call) and only then held
-     * against the caller's capacity, under the buffer protocol. The root is a directory, which readlinkat
-     * refuses with EINVAL like any entry that is not a symlink, as the header says. */
-    const char *name = resolved.leaf_length == 0 ? "." : (const char *)resolved.leaf;
+     * scratch as large as any path the system holds (the second PATH_MAX buffer of this call, beside the
+     * location's name) and only then held against the caller's capacity, under the buffer protocol. The root is a
+     * directory, which readlinkat refuses with EINVAL like any entry that is not a symlink, as the header says. */
+    const char *name = resolved.leaf_length == 0 ? "." : (const char *)leaf_name.text;
     uint8_t text[PATH_MAX];
     size_t text_length = 0;
     const bc_file_system_call_outcome read =
@@ -3290,6 +3584,26 @@ int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file
     }
     *length = text_length;
     return succeed(error);
+}
+
+int32_t bc_file_system_read_symlink(bc_file_system_engine *engine, const bc_file_system_location *location,
+                                    uint8_t *buffer, size_t capacity, size_t *length, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_read_symlink;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+
+    const int32_t kind = read_symlink_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call,
+                                               buffer, capacity, length, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return read_symlink_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, buffer,
+                                 capacity, length, error);
 }
 
 /* ---- condemn ------------------------------------------------------------------------------------------------- */
@@ -3320,23 +3634,17 @@ static size_t spell_condemned_name(uint8_t *name, const uint8_t *leaf, size_t le
     return position;
 }
 
-int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_system_location *location, uint8_t *buffer,
-                               size_t capacity, size_t *length, bc_file_system_error *error) {
-    const int32_t operation = bc_file_system_operation_condemn;
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
-    bc_file_system_engine_before_operation(engine, operation);
-    /* A condemn never replaces: its one step is the no-replace rename, whatever the caller holds. */
-    if (cannot_refuse_to_replace(engine, bc_file_system_existing_destination_refuse)) {
-        return refuse(error, bc_file_system_error_kind_unsupported, operation);
-    }
-
+/* The body of `bc_file_system_condemn`, in the shape its entry chose: the whole text first where the
+ * operation acts in one call, then the held parent's when `needs_the_held_parent` says so. */
+static int32_t condemn_in_shape(bc_file_system_engine *engine, int32_t operation,
+                                const bc_file_system_location *location, int32_t shape, uint8_t *buffer,
+                                size_t capacity, size_t *length, bc_file_system_error *error) {
+    /* One call moves the entry beside itself: under `at` from its whole text to a second text, its parent's text
+     * and the condemned name, which the resolution's bound (the parent, a slash and NAME_MAX bytes fit one call)
+     * guarantees one call takes. */
     [[gnu::cleanup(bc_file_system_resolved_close)]] bc_file_system_resolved resolved = bc_file_system_resolved_empty();
-    const int32_t kind = bc_file_system_resolve(engine, operation, location, &resolved, error);
+    bc_file_system_name entry;
+    const int32_t kind = bc_file_system_resolve_to_name(engine, operation, location, shape, &entry, &resolved, error);
     if (kind != 0) {
         return kind;
     }
@@ -3350,8 +3658,19 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
      * bounded number of times, so a stale leftover never fails a condemn. The name is held against the caller's
      * capacity before each try, so a size query renames nothing and a name that outgrew the buffer on a retry
      * is answered with nothing moved. ENOENT is the entry's absence; EINVAL, which a Linux file system without
-     * the no-replace rename answers, is `unsupported`, as it is for a rename under `refuse`. */
-    uint8_t name[NAME_MAX + 1];
+     * the no-replace rename answers, is `unsupported`, as it is for a rename under `refuse`.
+     *
+     * The destination is the name alone beside a held parent; beside AT_FDCWD it is a text of its own, the
+     * entry's text up to its leaf (the parent and its slash) with the name after it. The second PATH_MAX buffer
+     * of this call, beside the entry's. */
+    uint8_t destination[PATH_MAX];
+    size_t prefix_length = 0;
+    if (bc_file_system_resolved_is_whole_text(&resolved)) {
+        prefix_length = location->length - resolved.leaf_length;
+        memcpy(destination, location->path, prefix_length);
+    }
+    assert(prefix_length + NAME_MAX < sizeof destination);
+    uint8_t *name = destination + prefix_length;
     uint64_t token = 0;
     for (uint32_t attempt = 0; attempt < staging_attempts; ++attempt) {
         const size_t name_length = spell_condemned_name(name, resolved.leaf, resolved.leaf_length, token);
@@ -3360,7 +3679,7 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
             return refuse(error, bc_file_system_error_kind_buffer_too_small, operation);
         }
         const bc_file_system_call_outcome moved = bc_file_system_call_rename_no_replace(
-            engine, operation, resolved.parent, (const char *)resolved.leaf, resolved.parent, (const char *)name);
+            engine, operation, resolved.parent, (const char *)entry.text, resolved.parent, (const char *)destination);
         if (moved.succeeded) {
             memcpy(buffer, name, name_length);
             *length = name_length;
@@ -3377,6 +3696,30 @@ int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_syst
     const bc_file_system_call_outcome taken = {.succeeded = false, .code = EEXIST, .stopped = false};
     return report_outcome(error, operation, bc_file_system_step_rename_no_replace, &taken,
                           bc_file_system_error_kind_io_failed);
+}
+
+int32_t bc_file_system_condemn(bc_file_system_engine *engine, const bc_file_system_location *location, uint8_t *buffer,
+                               size_t capacity, size_t *length, bc_file_system_error *error) {
+    const int32_t operation = bc_file_system_operation_condemn;
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_valid_location(location) || !is_answer_buffer(buffer, capacity, length)) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    bc_file_system_engine_before_operation(engine, operation);
+    /* A condemn never replaces: its one step is the no-replace rename, whatever the caller holds. */
+    if (cannot_refuse_to_replace(engine, bc_file_system_existing_destination_refuse)) {
+        return refuse(error, bc_file_system_error_kind_unsupported, operation);
+    }
+
+    const int32_t kind = condemn_in_shape(engine, operation, location, bc_file_system_resolution_shape_one_call, buffer,
+                                          capacity, length, error);
+    if (!needs_the_held_parent(location, bc_file_system_resolution_shape_one_call, kind, error)) {
+        return kind;
+    }
+    return condemn_in_shape(engine, operation, location, bc_file_system_resolution_shape_held_parent, buffer, capacity,
+                            length, error);
 }
 
 /* ---- remove_condemned ---------------------------------------------------------------------------------------- */
@@ -3495,7 +3838,7 @@ int32_t bc_file_system_remove_condemned(bc_file_system_engine *engine, const bc_
      * serves every removal inside it: a final symlink is the system's to resolve under `at` and refused under
      * `beneath`, as for any component. */
     [[gnu::cleanup(close_owned_descriptor)]] owned_descriptor opened = {.value = -1};
-    kind = open_resolved_directory(engine, operation, parent->kind, &resolved, symlink_choice_of(parent),
+    kind = open_resolved_directory(engine, operation, parent->kind, &resolved, resolved.leaf, symlink_choice_of(parent),
                                    bc_file_system_directory_access_read, &opened, error);
     if (kind != 0) {
         return kind;

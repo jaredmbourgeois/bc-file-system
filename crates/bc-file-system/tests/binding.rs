@@ -587,16 +587,21 @@ fn an_observed_engine_shared_between_threads_counts_every_step() {
             });
         }
     });
-    let root_opens = case
+    let stats = case
+        .observed
+        .step_count(Operation::Status, Step::Fstatat)
+        .expect("the count is read");
+    let parent_opens = case
         .observed
         .step_count(Operation::Status, Step::Open)
         .expect("the count is read");
 
     assert_eq!(
-        root_opens,
+        stats,
         2 * calls_per_thread,
-        "each status opens its parent by path once"
+        "each status is one stat of its whole text"
     );
+    assert_eq!(parent_opens, 0, "no status opens a parent");
 }
 
 // A fault crosses into the core and the failure it scripts comes back typed: the kind the errno maps to, the step

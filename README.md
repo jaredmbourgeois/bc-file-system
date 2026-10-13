@@ -170,5 +170,8 @@ as it counts them; every face first offers 1,024 entries and 1 MiB of a file and
 about to write (the C++ `read_file` answers `Bytes`, a `std::vector<std::byte>` with a default-initialising
 allocator); the engine reads the root's identity once at creation; and an `at` location's leaf opened as a
 directory, like a directory `create_directories` has just made, is opened with nothing checked around the open,
-containment and its identity check staying `beneath`'s. `0.1.0` is tagged when every face is green on every
-platform.
+containment and its identity check staying `beneath`'s. Stage 29 `at-one-call` is in: under `at`, an operation
+whose calls each act on the location itself (a status, a read, an open, a removal, a link, a written append or
+rename, a condemn) hands the system the whole text with no directory opened, so `status` through `at` is one
+`fstatat` at any depth, as `lstat` is; the staged operations, and a durable append or rename, still hold the parent
+they act in. `0.1.0` is tagged when every face is green on every platform.

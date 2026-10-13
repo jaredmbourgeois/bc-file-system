@@ -1,18 +1,18 @@
-/* resolve.c — the bodies behind resolve.h: the one open of an `at` parent, the walk, the fast paths, the identity
- * check, the errno mapping.
+/* resolve.c — the bodies behind resolve.h: the whole text of an `at` location, the one open of an `at` parent,
+ * the walk, the fast paths, the identity check, the errno mapping.
  *
  * Two resolutions, one per kind of location. An `at` location is the system's to resolve, symlinks on the way
- * included, so its parent text is opened by path in one call (for search only: O_SEARCH on Apple platforms,
- * O_PATH on Linux, the platform's flags, so a directory the process may enter but not list is a parent like any
- * other), and nothing is checked around the open. A `beneath` location is the library's to contain, so each of
- * its opens has one shape: `fstatat` records what is there, `openat` opens it as a directory, `fstat` reads what
- * was opened, and the two identities are compared. The walk is that shape in a loop, holding one parent
- * descriptor at a time and closing the previous one as it goes; the fast path is that shape once, with the
- * platform's one-call open in the middle. Every system call goes through calls.h (the two opens that are this
- * file's own, a text by path and the platform's one-call open, keep the same shape here), so it is behind the
- * observer's `before_step`, asked again on EINTR, with the errno copied on the line after the call, and its
- * failure is read with the one errno table of the core. Nothing here opens a leaf, reads a byte or writes one;
- * nothing allocates.
+ * included: an operation that acts on it in one call is handed its whole text beside AT_FDCWD and nothing is
+ * opened here at all; for any other, its parent text is opened by path in one call (for search only: O_SEARCH on
+ * Apple platforms, O_PATH on Linux, the platform's flags, so a directory the process may enter but not list is a
+ * parent like any other), and nothing is checked around the open. A `beneath` location is the library's to contain, so
+ * each of its opens has one shape: `fstatat` records what is there, `openat` opens it as a directory, `fstat` reads
+ * what was opened, and the two identities are compared. The walk is that shape in a loop, holding one parent descriptor
+ * at a time and closing the previous one as it goes; the fast path is that shape once, with the platform's one-call
+ * open in the middle. Every system call goes through calls.h (the two opens that are this file's own, a text by path
+ * and the platform's one-call open, keep the same shape here), so it is behind the observer's `before_step`, asked
+ * again on EINTR, with the errno copied on the line after the call, and its failure is read with the one errno table of
+ * the core. Nothing here opens a leaf, reads a byte or writes one; nothing allocates.
  */
 #include "resolve.h"
 
@@ -300,14 +300,24 @@ static int32_t report_refused_directory_open(bc_file_system_engine *engine, int3
     return report_outcome(error, operation, bc_file_system_step_openat, refused, kind);
 }
 
+/* A directory a name is looked up from: an open descriptor, or AT_FDCWD beside an `at` location's whole text,
+ * which the absolute name makes the system ignore. */
+static bool is_lookup_directory(int parent) {
+    if (parent == AT_FDCWD) {
+        return true;
+    }
+    return parent >= 0;
+}
+
 int32_t bc_file_system_resolve_open_directory(bc_file_system_engine *engine, int32_t operation, int parent,
                                               const char *name, int32_t final_symlink, int32_t access,
                                               owned_descriptor *opened, bc_file_system_error *error) {
     if (error == nullptr) {
         return bc_file_system_error_kind_invalid_argument;
     }
-    if (engine == nullptr || parent < 0 || name == nullptr || !is_final_symlink_choice(final_symlink) ||
-        !is_directory_access_choice(access) || opened == nullptr || opened->value != -1) {
+    if (engine == nullptr || !is_lookup_directory(parent) || name == nullptr ||
+        !is_final_symlink_choice(final_symlink) || !is_directory_access_choice(access) || opened == nullptr ||
+        opened->value != -1) {
         return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
     }
     const int flags = final_symlink == bc_file_system_final_symlink_refuse ? open_flags_for(access) | O_NOFOLLOW
@@ -383,15 +393,17 @@ static bool has_fast_path(const bc_file_system_platform_fast_paths *fast_paths, 
 
 /* The whole parent text beneath `held` in one kernel call, bracketed by the same identity check as a component.
  * `*fell_back` says the platform (or a script on the fast path's step) answered that there is no such call
- * here, and nothing has been decided: the caller walks instead. */
+ * here, and nothing has been decided: the caller walks instead. `relative` is the caller's one PATH_MAX buffer,
+ * which the text is copied into and NUL-terminated for the system; the caller has proved it fits. */
 static int32_t open_beneath_fast(bc_file_system_engine *engine, int32_t operation, int32_t step, int held,
-                                 const uint8_t *text, size_t length, bc_file_system_resolved *resolved, bool *fell_back,
-                                 bc_file_system_error *error) {
+                                 const uint8_t *text, size_t length, uint8_t *relative,
+                                 bc_file_system_resolved *resolved, bool *fell_back, bc_file_system_error *error) {
     *fell_back = false;
-    /* The one PATH_MAX buffer of this call; the caller has proved the text fits with its NUL. */
-    uint8_t relative[PATH_MAX] = {};
     memcpy(relative, text, length);
-    bc_file_system_expected_entry expected;
+    relative[length] = 0;
+    /* Filled by the stat below and read only after it succeeds; written whole first because the analyzer loses
+     * the stat's failing return this many calls below `bc_file_system_resolve_to_name`. */
+    bc_file_system_expected_entry expected = {};
     const int32_t expected_kind = bc_file_system_resolve_expect_entry(
         engine, operation, held, (const char *)relative, bc_file_system_final_symlink_refuse, &expected, error);
     if (expected_kind != 0) {
@@ -424,7 +436,12 @@ enum : size_t {
      * every piece holds at least one). */
     at_piece_capacity = PATH_MAX - 1,
     /* The limit that admits one component and no more, since a piece always takes its first. */
-    one_component_only = 0
+    one_component_only = 0,
+    /* The longest parent text an `at` location may have and still be handed to one call whole: that parent, a
+     * slash and a name of NAME_MAX bytes, with the NUL, fit PATH_MAX (767 bytes of parent on Apple platforms,
+     * 3839 on Linux). The bound is the parent's rather than the text's own so that a name an operation spells
+     * beside the entry, which is at most NAME_MAX bytes, makes a text one call takes as well. */
+    whole_text_parent_capacity = PATH_MAX - NAME_MAX - 2
 };
 
 /* Where the piece of `text` (a valid absolute path of `length` bytes) that begins at `start` ends: as many whole
@@ -523,18 +540,19 @@ static void locate_leaf(const uint8_t *path, size_t length, size_t *leaf_offset,
  * On a platform whose search-only open checks no permission (Linux's O_PATH) the last directory opened is asked
  * for search permission by a step of its own (`faccessat`), as the walk's opens are; a piece after the first is
  * looked up beneath the one before it, which the system refuses without search permission there, so the
- * earlier ones need no step. */
+ * earlier ones need no step.
+ *
+ * `piece` is the caller's one PATH_MAX buffer, into which each piece is copied and NUL-terminated for the
+ * system. */
 static int32_t resolve_at(bc_file_system_engine *engine, int32_t operation, const uint8_t *path, size_t parent_length,
-                          bc_file_system_resolved *resolved, bc_file_system_error *error) {
-    /* The one PATH_MAX buffer of this call: each piece, NUL-terminated for the system. */
-    uint8_t piece[PATH_MAX] = {};
+                          uint8_t *piece, bc_file_system_resolved *resolved, bc_file_system_error *error) {
     size_t start = 0;
     /* Where a piece the system refused as too long ended: up to there, one component per call. */
     size_t one_component_at_a_time_until = 0;
     for (;;) {
         const size_t limit = start < one_component_at_a_time_until ? one_component_only : at_piece_capacity;
         const size_t end = piece_end_of(path, parent_length, start, limit);
-        assert(end - start < sizeof piece);
+        assert(end - start < PATH_MAX);
         memcpy(piece, path + start, end - start);
         piece[end - start] = 0;
         /* The first piece begins the absolute text and is opened by path; a later one is relative to the last. */
@@ -567,8 +585,10 @@ static int32_t resolve_at(bc_file_system_engine *engine, int32_t operation, cons
     return verify_search_permission(engine, operation, resolved->parent, error);
 }
 
+/* `relative` is the caller's one PATH_MAX buffer, which the platform's one-call open takes the parent text from. */
 static int32_t resolve_beneath(bc_file_system_engine *engine, int32_t operation, int held, const uint8_t *path,
-                               size_t parent_length, bc_file_system_resolved *resolved, bc_file_system_error *error) {
+                               size_t parent_length, uint8_t *relative, bc_file_system_resolved *resolved,
+                               bc_file_system_error *error) {
     /* Where a directory descriptor is a path string (Emscripten) a held directory enforces nothing, and the
      * library refuses rather than weakens the guarantee: every `beneath` location is unsupported there. */
     if (!bc_file_system_platform_enforces_containment()) {
@@ -581,8 +601,8 @@ static int32_t resolve_beneath(bc_file_system_engine *engine, int32_t operation,
     int32_t fast_step = 0;
     if (has_fast_path(bc_file_system_engine_fast_paths(engine), &fast_step) && parent_length < PATH_MAX) {
         bool fell_back = false;
-        const int32_t kind =
-            open_beneath_fast(engine, operation, fast_step, held, path, parent_length, resolved, &fell_back, error);
+        const int32_t kind = open_beneath_fast(engine, operation, fast_step, held, path, parent_length, relative,
+                                               resolved, &fell_back, error);
         if (!fell_back) {
             return kind;
         }
@@ -594,15 +614,13 @@ void bc_file_system_resolved_close(bc_file_system_resolved *resolved) {
     close_owned_descriptor(&resolved->opened);
 }
 
-int32_t bc_file_system_resolve(bc_file_system_engine *engine, int32_t operation,
-                               const bc_file_system_location *location, bc_file_system_resolved *resolved,
-                               bc_file_system_error *error) {
-    if (error == nullptr) {
-        return bc_file_system_error_kind_invalid_argument;
-    }
-    if (engine == nullptr || !is_resolvable_location(location) || resolved == nullptr) {
-        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
-    }
+/* What both entries share once the arguments are judged: the parent opened (an `at` parent text by path, a
+ * `beneath` one walked or in one kernel call) or the held directory lent, and the leaf copied, all written into
+ * `*resolved` only on success. `scratch` is the caller's one PATH_MAX buffer, which an `at` parent text's pieces
+ * and a `beneath` parent text's one-call open are made from. */
+static int32_t resolve_parent_and_leaf(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_location *location, uint8_t *scratch,
+                                       bc_file_system_resolved *resolved, bc_file_system_error *error) {
     size_t leaf_offset = 0;
     size_t leaf_length = 0;
     size_t parent_length = 0;
@@ -613,10 +631,10 @@ int32_t bc_file_system_resolve(bc_file_system_engine *engine, int32_t operation,
     candidate.leaf_length = leaf_length;
     int32_t kind = 0;
     if (location->kind == bc_file_system_location_kind_at) {
-        kind = resolve_at(engine, operation, location->path, parent_length, &candidate, error);
+        kind = resolve_at(engine, operation, location->path, parent_length, scratch, &candidate, error);
     } else {
         kind = resolve_beneath(engine, operation, location->directory->descriptor, location->path, parent_length,
-                               &candidate, error);
+                               scratch, &candidate, error);
     }
     if (kind != 0) {
         return kind;
@@ -627,5 +645,88 @@ int32_t bc_file_system_resolve(bc_file_system_engine *engine, int32_t operation,
     resolved->leaf_length = candidate.leaf_length;
     resolved->parent = candidate.parent;
     resolved->opened.value = release_descriptor(&candidate.opened);
+    return 0;
+}
+
+int32_t bc_file_system_resolve(bc_file_system_engine *engine, int32_t operation,
+                               const bc_file_system_location *location, bc_file_system_resolved *resolved,
+                               bc_file_system_error *error) {
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_resolvable_location(location) || resolved == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    /* The one PATH_MAX buffer of this call; every use writes its own NUL, so it is never zero-filled. */
+    uint8_t scratch[PATH_MAX];
+    return resolve_parent_and_leaf(engine, operation, location, scratch, resolved, error);
+}
+
+static bool is_resolution_shape(int32_t shape) {
+    if (shape == bc_file_system_resolution_shape_held_parent) {
+        return true;
+    }
+    return shape == bc_file_system_resolution_shape_one_call;
+}
+
+/* The whole text, where the operation acts in one call and the location is the system's to resolve: an `at`
+ * location with a leaf (the root has none and keeps its own shape, `/` opened as its own parent, which every
+ * operation's root branch acts on through the descriptor) whose parent text, a slash and any name beside it fit
+ * one call. */
+static bool takes_whole_text(const bc_file_system_location *location, int32_t shape, size_t leaf_length,
+                             size_t parent_length) {
+    if (shape != bc_file_system_resolution_shape_one_call) {
+        return false;
+    }
+    if (location->kind != bc_file_system_location_kind_at) {
+        return false;
+    }
+    if (leaf_length == 0) {
+        return false;
+    }
+    return parent_length <= whole_text_parent_capacity;
+}
+
+bool bc_file_system_resolve_takes_whole_text(const bc_file_system_location *location, int32_t shape) {
+    size_t leaf_offset = 0;
+    size_t leaf_length = 0;
+    size_t parent_length = 0;
+    locate_leaf(location->path, location->length, &leaf_offset, &leaf_length, &parent_length);
+    return takes_whole_text(location, shape, leaf_length, parent_length);
+}
+
+int32_t bc_file_system_resolve_to_name(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_location *location, int32_t shape,
+                                       bc_file_system_name *name, bc_file_system_resolved *resolved,
+                                       bc_file_system_error *error) {
+    if (error == nullptr) {
+        return bc_file_system_error_kind_invalid_argument;
+    }
+    if (engine == nullptr || !is_resolvable_location(location) || !is_resolution_shape(shape) || name == nullptr ||
+        resolved == nullptr) {
+        return refuse(error, bc_file_system_error_kind_invalid_argument, operation);
+    }
+    size_t leaf_offset = 0;
+    size_t leaf_length = 0;
+    size_t parent_length = 0;
+    locate_leaf(location->path, location->length, &leaf_offset, &leaf_length, &parent_length);
+    /* Under the whole text nothing is opened: the operation's call resolves the text itself, and that call's errno
+     * is the answer. */
+    if (takes_whole_text(location, shape, leaf_length, parent_length)) {
+        memcpy(name->text, location->path, location->length);
+        name->text[location->length] = 0;
+        *resolved = bc_file_system_resolved_empty();
+        resolved->parent = AT_FDCWD;
+        memcpy(resolved->leaf, location->path + leaf_offset, leaf_length);
+        resolved->leaf_length = leaf_length;
+        return 0;
+    }
+    const int32_t kind = resolve_parent_and_leaf(engine, operation, location, name->text, resolved, error);
+    if (kind != 0) {
+        return kind;
+    }
+    /* The name is the leaf beside the parent, written only now that the buffer's pieces are done with. */
+    memcpy(name->text, resolved->leaf, resolved->leaf_length);
+    name->text[resolved->leaf_length] = 0;
     return 0;
 }

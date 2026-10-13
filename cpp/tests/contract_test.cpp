@@ -1174,6 +1174,8 @@ TEST_F(ObservedContract, AppendWhoseNewFileCannotGetItsModeTakesTheFileBack) {
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("log")));
 }
 
+// The directory a durable append's new file appears in is the one it syncs, so it is held: its parent opened by
+// path once, where a `written` append opens nothing but the file (the observer's per-operation case).
 TEST_F(ObservedContract, DurableAppendToANewFileSyncsTheFileAndItsDirectory) {
     const auto bytes = bytes_of("entry");
 
@@ -1183,6 +1185,7 @@ TEST_F(ObservedContract, DurableAppendToANewFileSyncsTheFileAndItsDirectory) {
     EXPECT_EQ(*achieved, Durability::durable);
     EXPECT_EQ(count(Operation::append, durable_sync_step()), 2U);
     EXPECT_EQ(count(Operation::append, wrong_sync_step()), 0U);
+    EXPECT_EQ(count(Operation::append, Step::open), 1U);
 }
 
 TEST_F(ObservedContract, DurableAppendToAnExistingFileSyncsOnlyTheFile) {
@@ -1260,15 +1263,15 @@ TEST_P(FileSystemContract, SyncOfNothingIsNotFoundAndOfASymlinkIsRefused) {
     EXPECT_EQ(through_link.error().kind, ErrorKind::symlink_refused);
 }
 
-// What a sync costs: the parent's open by path, the leaf's open and one sync under this platform's step, never
-// the other platform's.
+// What a sync costs: the leaf's open, under `at` by its whole text with no parent opened before it, and one sync
+// under this platform's step, never the other platform's.
 TEST_F(ObservedContract, SyncOpensTheLeafAndMakesOneSyncCallUnderThePlatformsStep) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
 
     const auto achieved = files().sync(in("file"));
 
     ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
-    EXPECT_EQ(count(Operation::sync, Step::open), 1U);
+    EXPECT_EQ(count(Operation::sync, Step::open), 0U);
     EXPECT_EQ(count(Operation::sync, Step::openat), 1U);
     EXPECT_EQ(count(Operation::sync, durable_sync_step()), 1U);
     EXPECT_EQ(count(Operation::sync, wrong_sync_step()), 0U);
@@ -1468,8 +1471,8 @@ TEST_F(ObservedContract, ListOpensTheLeafOnceAndReadsEveryEntryOnce) {
 
     ASSERT_TRUE(entries.has_value()) << entries.error().message();
     EXPECT_EQ(entries->size(), 3U);
-    // The listed directory's parent by path, and the listed directory itself.
-    EXPECT_EQ(count(Operation::list_directory, Step::open), 1U);
+    // The listed directory itself, by its whole text: no parent is opened before it.
+    EXPECT_EQ(count(Operation::list_directory, Step::open), 0U);
     EXPECT_EQ(count(Operation::list_directory, Step::openat), 1U);
     EXPECT_EQ(count(Operation::list_directory, Step::fstatat), 0U);
     EXPECT_EQ(count(Operation::list_directory, Step::fstat), 0U);
@@ -1762,17 +1765,17 @@ TEST_P(FileSystemContract, OpenDirectoryWithoutPermissionIsPermissionDenied) {
     EXPECT_EQ(below_it.error().kind, ErrorKind::permission_denied);
 }
 
-// What resolving an `at` location costs, read from the system calls it made: the parent, the test's own
-// directory, opened by path in one call with nothing around it, as the system resolves a path; then the leaf,
-// the operation's own, opened against it with nothing around that open either, since the header promises the
-// system's resolution under `at` (the bracket is `beneath`'s, below).
-TEST_F(ObservedContract, OpenDirectoryOpensTheParentByPathThenTheLeaf) {
+// What resolving an `at` location costs, read from the system calls it made: none of its own, since an open of
+// a directory acts on its location in one call; that one open takes the whole text, as the system resolves a
+// path, with nothing around it, since the header promises the system's resolution under `at` (the bracket is
+// `beneath`'s, below). No parent is opened before it.
+TEST_F(ObservedContract, OpenDirectoryUnderAtIsOneOpenOfTheWholeText) {
     lay_out_directories(root_path());
 
     const auto directory = files().open_directory(in("sub"), FinalSymlink::refuse);
 
     ASSERT_TRUE(directory.has_value()) << directory.error().message();
-    EXPECT_EQ(count(Operation::open_directory, Step::open), 1U);
+    EXPECT_EQ(count(Operation::open_directory, Step::open), 0U);
     EXPECT_EQ(count(Operation::open_directory, Step::openat), 1U);
     EXPECT_EQ(count(Operation::open_directory, Step::fstatat), 0U);
     EXPECT_EQ(count(Operation::open_directory, Step::fstat), 0U);
@@ -1921,15 +1924,15 @@ TEST_F(ObservedContract, AnInterruptedComponentOpenIsAskedAgain) {
 // status and reads, observed: what the two operations cost and how a scripted step reaches them
 // -------------------------------------------------------------------------------------------------------------
 
-// What a read costs beyond resolving its location: the leaf is opened once, measured once, read once, and asked
-// once more past its measured size to be sure it did not grow in between.
+// What a read costs: the leaf is opened once (under `at` by its whole text, no parent opened before it),
+// measured once, read once, and asked once more past its measured size to be sure it did not grow in between.
 TEST_F(ObservedContract, ReadFileOpensTheLeafMeasuresItReadsItAndProbesOnceForMore) {
     bc::file_system_test::write_raw(path_of("notes.txt"), "seven b", 0644);
 
     const auto bytes = files().read_file(in("notes.txt"), kWholeFileRefusingSymlink);
 
     ASSERT_TRUE(bytes.has_value()) << bytes.error().message();
-    EXPECT_EQ(count(Operation::read_file, Step::open), 1U);
+    EXPECT_EQ(count(Operation::read_file, Step::open), 0U);
     EXPECT_EQ(count(Operation::read_file, Step::openat), 1U);
     EXPECT_EQ(count(Operation::read_file, Step::fstat), 1U);
     EXPECT_EQ(count(Operation::read_file, Step::pread), 2U);
@@ -1963,7 +1966,8 @@ TEST_F(ObservedContract, ReadFileIsOneCallUpToTheFacesFirstOfferAndTwoPastIt) {
     EXPECT_EQ(count(Operation::read_file, Step::fstat), 4U);
 }
 
-// An empty file is one probe and no other read; its status is one stat of the leaf after the parent's open.
+// An empty file is one probe and no other read; its status is one stat of its whole text and nothing else, as
+// `lstat` is: no parent is opened, and with no directory opened no search-permission step follows on any platform.
 TEST_F(ObservedContract, AnEmptyFileIsProbedOnceAndStatusStatsTheLeafOnce) {
     bc::file_system_test::write_raw(path_of("empty"), "", 0644);
 
@@ -1974,9 +1978,10 @@ TEST_F(ObservedContract, AnEmptyFileIsProbedOnceAndStatusStatsTheLeafOnce) {
     EXPECT_THAT(*bytes, IsEmpty());
     ASSERT_TRUE(status.has_value()) << status.error().message();
     EXPECT_EQ(count(Operation::read_file, Step::pread), 1U);
-    EXPECT_EQ(count(Operation::status, Step::open), 1U);
+    EXPECT_EQ(count(Operation::status, Step::open), 0U);
     EXPECT_EQ(count(Operation::status, Step::fstatat), 1U);
     EXPECT_EQ(count(Operation::status, Step::openat), 0U);
+    EXPECT_EQ(count(Operation::status, Step::faccessat), 0U);
 }
 
 // A read interrupted by a signal is asked again, and the answer is whole.
@@ -2318,11 +2323,18 @@ TEST_P(FileSystemContract, RemoveFileRemovesAFileAndSaysThereWasOne) {
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("file")));
 }
 
+// Nothing there, and nothing below a file (a file on the way), are both absence.
 TEST_P(FileSystemContract, RemoveFileOfNothingSaysThereWasNone) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
     const auto removed = files().remove_file(in("absent"));
+    const auto below_a_file = files().remove_file(in("file/child"));
 
     ASSERT_TRUE(removed.has_value());
     EXPECT_FALSE(*removed);
+    ASSERT_TRUE(below_a_file.has_value()) << below_a_file.error().message();
+    EXPECT_FALSE(*below_a_file);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
 }
 
 TEST_P(FileSystemContract, RemoveFileRemovesASymlinkAndNotWhatItPointsAt) {
@@ -2361,14 +2373,43 @@ TEST_P(FileSystemContract, RemoveDirectoryRemovesAnEmptyDirectoryAndSaysThereWas
     EXPECT_FALSE(bc::file_system_test::exists_raw(path_of("folder")));
 }
 
+// Nothing there, nothing on the way, and a file on the way are all absence.
 TEST_P(FileSystemContract, RemoveDirectoryOfNothingSaysThereWasNone) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
     const auto removed = files().remove_directory(in("absent"));
     const auto below_nothing = files().remove_directory(in("absent/child"));
+    const auto below_a_file = files().remove_directory(in("file/child"));
 
     ASSERT_TRUE(removed.has_value()) << removed.error().message();
     EXPECT_FALSE(*removed);
     ASSERT_TRUE(below_nothing.has_value()) << below_nothing.error().message();
     EXPECT_FALSE(*below_nothing);
+    ASSERT_TRUE(below_a_file.has_value()) << below_a_file.error().message();
+    EXPECT_FALSE(*below_a_file);
+}
+
+// Under `at` the removal is one unlinkat of the whole text, which answers ENOTDIR for a file on the way and for a
+// leaf that is no directory alike; one look that never follows, on that failing path only, tells the absence from
+// `not_directory`, which keeps the unlinkat's step and errno. No parent is opened.
+TEST_F(ObservedContract, RemoveDirectoryUnderAtTellsAFileOnTheWayFromAFileAtTheEndByOneLook) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+
+    const auto below_a_file = files().remove_directory(in("file/child"));
+    const std::uint64_t looks_below = count(Operation::remove_directory, Step::fstatat);
+    const auto the_file_itself = files().remove_directory(in("file"));
+
+    ASSERT_TRUE(below_a_file.has_value()) << below_a_file.error().message();
+    EXPECT_FALSE(*below_a_file);
+    ASSERT_FALSE(the_file_itself.has_value());
+    EXPECT_EQ(the_file_itself.error().kind, ErrorKind::not_directory);
+    EXPECT_EQ(the_file_itself.error().step, Step::unlinkat);
+    EXPECT_EQ(the_file_itself.error().system_code, ENOTDIR);
+    EXPECT_EQ(the_file_itself.error().path, path_of("file").string());
+    EXPECT_EQ(looks_below, 1U);
+    EXPECT_EQ(count(Operation::remove_directory, Step::fstatat), 2U);
+    EXPECT_EQ(count(Operation::remove_directory, Step::unlinkat), 2U);
+    EXPECT_EQ(count(Operation::remove_directory, Step::open), 0U);
 }
 
 TEST_P(FileSystemContract, RemoveDirectoryOfOneWithEntriesIsDirectoryNotEmptyAndRemovesNothing) {
@@ -3017,6 +3058,86 @@ TEST_F(ObservedContract, DurableRenameWithinOneDirectorySyncsItOnce) {
     ASSERT_TRUE(achieved.has_value());
     EXPECT_EQ(*achieved, Durability::durable);
     EXPECT_EQ(count(Operation::rename, durable_sync_step()), 1U);
+}
+
+// A whole text the system refuses as too long (on Apple platforms a symlink's text joined to the rest of a path can
+// outgrow one call although the path fits) is not the answer: the operation is made once more holding the parent,
+// which resolves the text in pieces, so ENAMETOOLONG stays a single component's refusal. Scripted so the counts are
+// exact on every platform: a status, then a rename, each refused once on its whole text and answered through the
+// parent; under `beneath` there is no whole text, and the refusal is the answer.
+TEST_F(ObservedContract, AWholeTextRefusedAsTooLongIsMadeAgainHoldingTheParent) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    script(fail_step(Operation::status, Step::fstatat, 1, ENAMETOOLONG));
+    script(fail_step(Operation::rename, Step::renameat, 1, ENAMETOOLONG));
+
+    const auto status = files().status(in("file"), FinalSymlink::refuse);
+    const auto renamed = files().rename(in("file"), in("moved"), ExistingDestination::replace, Durability::written);
+
+    ASSERT_TRUE(status.has_value()) << status.error().message();
+    ASSERT_TRUE(status->has_value());
+    EXPECT_EQ(count(Operation::status, Step::fstatat), 2U);
+    EXPECT_EQ(count(Operation::status, Step::open), 1U);
+    ASSERT_TRUE(renamed.has_value()) << renamed.error().message();
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("moved")), "content");
+    EXPECT_EQ(count(Operation::rename, Step::renameat), 2U);
+    EXPECT_EQ(count(Operation::rename, Step::open), 2U);
+
+    const auto parent = files().open_directory(root(), FinalSymlink::refuse);
+    ASSERT_TRUE(parent.has_value()) << parent.error().message();
+    script(fail_step(Operation::status, Step::fstatat, 3, ENAMETOOLONG));
+    const auto beneath = files().status(Location::beneath(*parent, relative("moved")), FinalSymlink::refuse);
+    ASSERT_FALSE(beneath.has_value());
+    EXPECT_EQ(beneath.error().kind, ErrorKind::invalid_argument);
+    EXPECT_EQ(beneath.error().system_code, ENAMETOOLONG);
+    EXPECT_EQ(count(Operation::status, Step::fstatat), 3U);
+}
+
+// A `written` rename under `at` is its look at the source and its one move, both of the whole texts: no parent is
+// opened at either end (the durable one above holds both, since it syncs them).
+TEST_F(ObservedContract, WrittenRenameUnderAtIsALookAndOneMoveOfTheTwoWholeTexts) {
+    bc::file_system_test::make_directory_raw(path_of("from"), 0755);
+    bc::file_system_test::make_directory_raw(path_of("to"), 0755);
+    bc::file_system_test::write_raw(path_of("from/file"), "content", 0644);
+
+    const auto achieved =
+        files().rename(in("from/file"), in("to/file"), ExistingDestination::replace, Durability::written);
+
+    ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
+    EXPECT_EQ(*achieved, Durability::written);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("to/file")), "content");
+    EXPECT_EQ(count(Operation::rename, Step::open), 0U);
+    EXPECT_EQ(count(Operation::rename, Step::openat), 0U);
+    EXPECT_EQ(count(Operation::rename, Step::fstat), 0U);
+    EXPECT_EQ(count(Operation::rename, Step::fstatat), 1U);
+    EXPECT_EQ(count(Operation::rename, Step::renameat), 1U);
+}
+
+// With the destination's whole text, ENOENT from the move may be a directory missing on the destination's way as
+// well as a source gone since its look, which a held parent had ruled out: one more look at the source, on that
+// failing path only, names the end. Scripted so both readings are exact: the move refused while the source is
+// there names the destination; the move refused and the look refused too names the source.
+TEST_F(ObservedContract, AMoveRefusedWithEnoentUnderAtLooksAtTheSourceOnceMoreToNameTheEnd) {
+    bc::file_system_test::write_raw(path_of("file"), "content", 0644);
+    script(fail_step(Operation::rename, Step::renameat, 1, ENOENT));
+    script(fail_step(Operation::rename, Step::renameat, 2, ENOENT));
+    script(fail_step(Operation::rename, Step::fstatat, 4, ENOENT));
+
+    const auto source_there =
+        files().rename(in("file"), in("new-name"), ExistingDestination::replace, Durability::written);
+    const auto source_gone =
+        files().rename(in("file"), in("new-name"), ExistingDestination::replace, Durability::written);
+
+    ASSERT_FALSE(source_there.has_value());
+    EXPECT_EQ(source_there.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(source_there.error().step, Step::renameat);
+    EXPECT_EQ(source_there.error().failed_location, FailedLocation::second);
+    ASSERT_FALSE(source_gone.has_value());
+    EXPECT_EQ(source_gone.error().kind, ErrorKind::not_found);
+    EXPECT_EQ(source_gone.error().step, Step::renameat);
+    EXPECT_EQ(source_gone.error().failed_location, FailedLocation::first);
+    EXPECT_EQ(count(Operation::rename, Step::fstatat), 4U);
+    EXPECT_EQ(count(Operation::rename, Step::renameat), 2U);
+    EXPECT_EQ(bc::file_system_test::read_raw(path_of("file")), "content");
 }
 
 // The name has already moved when the sync fails, so the call reports what it achieved, not an error.
@@ -3963,9 +4084,9 @@ TEST_F(PortableOnlyContract, DurableWriteSyncsByFsyncAndTakesTheNameWithRenameat
 }
 
 // What only the no-replace rename keeps is refused before any system call: a rename, a write and a copy told to
-// refuse an existing destination, and a condemn. Not one step is counted (the resolution of an `at` location
-// begins with the open of its parent by path), nothing is staged, nothing moves, and a two-location refusal names
-// the destination, whose promise it is.
+// refuse an existing destination, and a condemn. Not one step is counted (a staged operation's `at` resolution
+// begins with the open of its parent by path, a one-call one's first call is the look or the open of its whole
+// text), nothing is staged, nothing moves, and a two-location refusal names the destination, whose promise it is.
 TEST_F(PortableOnlyContract, WhatOnlyTheNoReplaceRenameKeepsIsUnsupportedBeforeAnySystemCall) {
     bc::file_system_test::write_raw(path_of("source"), "the new content", 0644);
     bc::file_system_test::write_raw(path_of("current"), "the old content", 0644);
@@ -3995,6 +4116,8 @@ TEST_F(PortableOnlyContract, WhatOnlyTheNoReplaceRenameKeepsIsUnsupportedBeforeA
     for (const Operation operation :
          {Operation::rename, Operation::write_file, Operation::copy_file, Operation::condemn}) {
         EXPECT_EQ(count(operation, Step::open), 0U) << name_of(operation);
+        EXPECT_EQ(count(operation, Step::openat), 0U) << name_of(operation);
+        EXPECT_EQ(count(operation, Step::fstatat), 0U) << name_of(operation);
         EXPECT_EQ(count(operation, Step::rename_no_replace), 0U) << name_of(operation);
         EXPECT_EQ(count(operation, Step::renameat), 0U) << name_of(operation);
     }

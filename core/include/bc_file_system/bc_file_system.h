@@ -246,16 +246,25 @@ typedef enum bc_file_system_permissions_policy {
 
 /* How a location addresses its target. */
 typedef enum bc_file_system_location_kind {
-    /* An absolute path the system resolves, every symlink on the way followed: the parent is opened by path,
-     * for search, in one call (piece after piece where the text is PATH_MAX bytes or longer), and the system's
-     * answer is the error: ENOENT `not_found`, ENOTDIR `not_directory` (a file on the way), ELOOP
-     * `symlink_refused` (a loop), EACCES `permission_denied`, EMFILE or ENFILE `resource_exhausted`, and
-     * ENAMETOOLONG `invalid_argument` for a component longer than the volume allows. Nothing is checked around
-     * the open, so an entry swapped while the path resolves is followed as the system follows it; containment
-     * is `beneath`'s. A leaf an operation opens as a directory is opened the same way, with nothing checked
-     * around the open: under `refuse` O_NOFOLLOW still refuses a final symlink (`symlink_refused`), and a
-     * directory swapped in for the leaf is the one the system's own open would open. Relative text is refused
-     * with `invalid_argument`. */
+    /* An absolute path the system resolves, every symlink on the way followed. An operation whose calls each act on the
+     * location itself (`status_of`, `read_file`, `append` under `written`, `sync`, `create_directory`,
+     * `list_directory`, `bc_file_system_directory_open`, `remove_file`, `remove_directory`, `set_permissions`,
+     * `try_lock`, `create_symlink`, `read_symlink`, `rename` under `written`, `condemn`) hands the system the whole
+     * text, so its call is the system's whole resolution and no directory on the way is opened; one whose steps must
+     * act in one directory as a unit (`write_file`, `copy_file`, `create_directories`, `remove_tree`,
+     * `create_temporary_directory`, `remove_condemned`, and `append` or `rename` under `durable`, which sync the
+     * directory they changed) opens the parent by path, for search, in one call, piece after piece where the text is
+     * PATH_MAX bytes or longer, and so does any operation on the root or on a text whose parent, a slash and a name of
+     * NAME_MAX bytes would not fit one call, and one whose whole text the system refused as too long (Apple platforms
+     * bound a symlink's text joined to the rest of a path by PATH_MAX), made again that way. Either way the system's
+     * answer is the error, which names no entry, the location itself having failed: ENOENT `not_found`, ENOTDIR
+     * `not_directory` (a file on the way), ELOOP `symlink_refused` (a loop), EACCES `permission_denied`, EMFILE or
+     * ENFILE `resource_exhausted`, and ENAMETOOLONG `invalid_argument` for a component longer than the volume allows.
+     * Nothing is checked around an open, so an entry swapped while the path resolves is followed as the system follows
+     * it; containment is `beneath`'s. A leaf an operation opens as a directory is opened the same way, with nothing
+     * checked around the open: under `refuse` O_NOFOLLOW still refuses a final symlink (`symlink_refused`), and a
+     * directory swapped in for the leaf is the one the system's own open would open. Relative text is refused with
+     * `invalid_argument`. */
     bc_file_system_location_kind_at = 1,
     /* A relative path resolved beneath an open directory with containment enforced by the kernel: no component
      * may be a symlink, and nothing above the directory is reachable. */

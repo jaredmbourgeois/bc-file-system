@@ -2,27 +2,31 @@
  *
  * Every operation from the status-and-reads stage on starts here: it resolves its location to the descriptor of
  * the leaf's parent directory and the leaf's name, and from then on makes only `*at` calls on that pair, so
- * what was checked is what is then used. The layer never opens the leaf: the operation does, with the
- * `final_symlink` choice it was given. The security of a `beneath` location is this file's: every component of
- * the relative path is opened against the held parent with `O_DIRECTORY | O_NOFOLLOW`, so no component may be a
- * symlink and nothing above the held directory is reachable (`..` never reaches here: the path module refused
- * it), and each open is bracketed by an identity check, `fstatat` before and `fstat` after, which is the only
- * thing that catches a directory swapped for another directory between the two. A component is opened for
- * search, not for reading (O_SEARCH on Apple platforms, O_PATH on Linux: the platform's flags), so a directory
- * the process may enter but not list is a parent like any other, as the system treats it. Where the platform offers it,
- * one kernel call does the whole walk (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux,
- * `openat` with `O_NOFOLLOW_ANY` on Apple), reported as its own step so a test can refuse it and force the walk.
- * An `at` location is the system's to resolve, because the header promises that the system resolves an
- * absolute path, symlinks on the way included: its parent text is opened by path, for search, in one call (in
- * pieces of whole components where the text is longer than one call takes), with no identity check, since a
- * component swapped under it would be one the system's own resolution follows too. The functions have external
- * linkage under the library's prefix so the C-only test in `core/tests` can drive them; they are declared only
- * here. Every system call the layer makes goes through calls.h, which holds the one loop per call and the one
- * errno table of the core, except the two opens that are resolve.c's own (an `at` parent text by path, the
- * platform's one-call open beneath a held directory), which keep the same shape there. Private to `core/src`:
- * C23, never a common subset.
+ * what was checked is what is then used. An operation that acts on its location in one call (a stat, an open, an
+ * unlink, a rename) takes the second shape under `at`: the location's whole text as the name and AT_FDCWD as the
+ * directory, which an absolute name ignores, so nothing is opened and that one call is the system's whole
+ * resolution, which is what `at` promises (`bc_file_system_resolve_to_name`). The layer never opens the leaf: the
+ * operation does, with the `final_symlink` choice it was given. The security of a `beneath` location is this file's:
+ * every component of the relative path is opened against the held parent with `O_DIRECTORY | O_NOFOLLOW`, so no
+ * component may be a symlink and nothing above the held directory is reachable (`..` never reaches here: the path
+ * module refused it), and each open is bracketed by an identity check, `fstatat` before and `fstat` after, which is the
+ * only thing that catches a directory swapped for another directory between the two. A component is opened for search,
+ * not for reading (O_SEARCH on Apple platforms, O_PATH on Linux: the platform's flags), so a directory the process may
+ * enter but not list is a parent like any other, as the system treats it. Where the platform offers it, one kernel call
+ * does the whole walk (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, `openat` with `O_NOFOLLOW_ANY`
+ * on Apple), reported as its own step so a test can refuse it and force the walk. An `at` location is the system's to
+ * resolve, because the header promises that the system resolves an absolute path, symlinks on the way included: its
+ * parent text is opened by path, for search, in one call (in pieces of whole components where the text is longer than
+ * one call takes), with no identity check, since a component swapped under it would be one the system's own resolution
+ * follows too. The functions have external linkage under the library's prefix so the C-only test in `core/tests` can
+ * drive them; they are declared only here. Every system call the layer makes goes through calls.h, which holds the one
+ * loop per call and the one errno table of the core, except the two opens that are resolve.c's own (an `at` parent text
+ * by path, the platform's one-call open beneath a held directory), which keep the same shape there. Private to
+ * `core/src`: C23, never a common subset.
  */
 #pragma once
+
+#include <fcntl.h>
 
 #include <limits.h>
 #include <stddef.h>
@@ -59,7 +63,9 @@ typedef enum bc_file_system_directory_access : int32_t {
  * `[[gnu::cleanup(bc_file_system_resolved_close)]]` so the descriptor the walk opened is closed on every path. */
 typedef struct bc_file_system_resolved {
     /* The leaf's parent directory. Borrowed: it is `opened` below, or the held directory's own descriptor when
-     * the leaf sits directly inside it and nothing had to be opened. */
+     * the leaf sits directly inside it and nothing had to be opened; or AT_FDCWD when the operation acts on an
+     * `at` location's whole text (`bc_file_system_resolve_to_name`), which nothing opened and an absolute name
+     * ignores. */
     int parent;
     /* What the layer opened for `parent`; -1 when `parent` is the held directory's. For the root (`at("/")`)
      * this is the root itself and the leaf is empty: the parent is the location. */
@@ -86,6 +92,35 @@ static inline bc_file_system_resolved bc_file_system_resolved_empty(void) {
 /* The cleanup of a resolved location: closes what the walk opened, never the held directory's descriptor. */
 void bc_file_system_resolved_close(bc_file_system_resolved *resolved);
 
+/* Whether a resolution answered an `at` location's whole text rather than a parent and its leaf: the parent is
+ * AT_FDCWD, so the name the operation's call takes is absolute, and no directory of the location is held. An
+ * operation reads it where a held parent decided an errno's meaning that the whole text leaves open. */
+static inline bool bc_file_system_resolved_is_whole_text(const bc_file_system_resolved *resolved) {
+    return resolved->parent == AT_FDCWD;
+}
+
+/* The name an operation's `*at` calls take beside `bc_file_system_resolved.parent`, NUL-terminated: an `at`
+ * location's whole text, beside AT_FDCWD; or the leaf, beside the parent the resolution opened or the held
+ * directory; empty for the root, which has no leaf. A struct around one array so the one PATH_MAX buffer of the
+ * operation's call has a type and travels by pointer: the resolution opens the pieces of a long `at` parent text
+ * from this buffer before it writes the name, so the call holds no second one. */
+typedef struct bc_file_system_name {
+    uint8_t text[PATH_MAX];
+} bc_file_system_name;
+
+/* How an operation acts on its location, which the operation chooses from its own steps. */
+typedef enum bc_file_system_resolution_shape : int32_t {
+    /* The leaf's parent opened and held, the leaf named beneath it: for an operation whose steps must act in one
+     * directory as a unit (a durable append syncs the directory it made a file in, a durable rename the
+     * directories it moved a name between), as `bc_file_system_resolve` resolves for every staged operation. */
+    bc_file_system_resolution_shape_held_parent = 1,
+    /* One call acts on the location: under `at`, the whole text beside AT_FDCWD, with nothing opened, wherever
+     * the text's parent and any one name beside it fit one call; under `beneath`, for the root, and for a text
+     * past that bound, the held parent as above, since containment and a text one call cannot take both need a
+     * descriptor. */
+    bc_file_system_resolution_shape_one_call = 2
+} bc_file_system_resolution_shape;
+
 /* Resolves `location` for `operation`, which has already validated its arguments and announced itself to the
  * observer: every system call here goes through `before_step` under that operation's name, and the error names
  * it. On success `*resolved` holds the parent and the leaf; on failure it is untouched and `*error` is filled
@@ -104,6 +139,33 @@ void bc_file_system_resolved_close(bc_file_system_resolved *resolved);
 int32_t bc_file_system_resolve(bc_file_system_engine *engine, int32_t operation,
                                const bc_file_system_location *location, bc_file_system_resolved *resolved,
                                bc_file_system_error *error);
+
+/* Resolves `location` for an operation that names it in its calls through `*name`, in the shape it chose
+ * (`bc_file_system_resolution_shape`). Under `one_call`, an `at` location whose parent text, a slash and NAME_MAX
+ * bytes fit one call (fewer than PATH_MAX bytes with the NUL), and which is not the root, is answered with no
+ * system call at all: `resolved->parent` is AT_FDCWD, nothing is opened, `name` holds the whole text, and the
+ * operation's own call is the system's whole resolution, its errno the answer (the bound leaves room for any name
+ * the operation makes beside the entry, which is what lets `condemn` spell its new name as a text of its own).
+ * Every other case resolves as `bc_file_system_resolve` does, with the same refusals, and `name` then holds the
+ * leaf (empty for the root); the pieces of a long `at` parent text are opened from `name`'s buffer, so the call
+ * holds one PATH_MAX buffer, not two. `resolved->leaf` holds the last component in every case, the root's empty,
+ * so a name made beside the entry is spelled from it.
+ *
+ * `engine`    must not be NULL.
+ * `location`  must not be NULL; a valid location (the path module's rules; `beneath` with an open directory).
+ * `shape`     a bc_file_system_resolution_shape.
+ * `name`      must not be NULL; written on success, scratch on failure.
+ * `resolved`  must not be NULL; written only on success.
+ * `error`     must not be NULL. */
+int32_t bc_file_system_resolve_to_name(bc_file_system_engine *engine, int32_t operation,
+                                       const bc_file_system_location *location, int32_t shape,
+                                       bc_file_system_name *name, bc_file_system_resolved *resolved,
+                                       bc_file_system_error *error);
+
+/* Whether `bc_file_system_resolve_to_name` answers `location`, a valid location, in `shape` with its whole text:
+ * how an operation whose call on the whole text the system refused as too long knows that the held parent's
+ * shape, which resolves such a text in pieces, is left to try. */
+bool bc_file_system_resolve_takes_whole_text(const bc_file_system_location *location, int32_t shape);
 
 /* The two halves of one checked open of a directory entry, which the walk performs for every component and an
  * operation performs for a leaf it opens as a directory. They are two functions so the C-only test can swap the
@@ -140,7 +202,9 @@ int32_t bc_file_system_resolve_open_expected_directory(bc_file_system_engine *en
  * reading the open cannot make alone: under `refuse`, O_DIRECTORY beside O_NOFOLLOW answers ENOTDIR for a
  * symlink as for a file (macOS and Linux alike), so an ENOTDIR there is followed by one `fstatat` that never
  * follows, on the failing path only, and a symlink is `symlink_refused`; the error keeps the open's step and
- * errno. Stores the descriptor in `*opened`, which must hold none (-1) on entry and is untouched on failure. */
+ * errno. `parent` is a directory descriptor, or AT_FDCWD with an `at` location's whole text as `name`: there an
+ * ENOTDIR may also be a file on the way, which the look then fails on in turn, and that is `not_directory`. Stores
+ * the descriptor in `*opened`, which must hold none (-1) on entry and is untouched on failure. */
 int32_t bc_file_system_resolve_open_directory(bc_file_system_engine *engine, int32_t operation, int parent,
                                               const char *name, int32_t final_symlink, int32_t access,
                                               owned_descriptor *opened, bc_file_system_error *error);

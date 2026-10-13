@@ -298,10 +298,10 @@ TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeOnOpenDirectory) {
     EXPECT_EQ(directory.error().path, path_of("folder").string());
 }
 
-// The parent is opened by path once per `at` resolution, so its occurrences count the calls.
+// An `at` directory is opened in one call, its whole text by path, so the occurrences of that open count the calls.
 TEST_F(ObserverTest, OnlyTheNthOccurrenceFailsOnOpenDirectory) {
     bc::file_system_test::make_directory_raw(path_of("folder"), 0755);
-    script(fail_step(Operation::open_directory, Step::open, 2, EIO));
+    script(fail_step(Operation::open_directory, Step::openat, 2, EIO));
 
     const auto first = files().open_directory(in("folder"), FinalSymlink::refuse);
     const auto second = files().open_directory(in("folder"), FinalSymlink::refuse);
@@ -310,9 +310,10 @@ TEST_F(ObserverTest, OnlyTheNthOccurrenceFailsOnOpenDirectory) {
     EXPECT_TRUE(first.has_value());
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error().kind, ErrorKind::io_failed);
-    EXPECT_EQ(second.error().step, Step::open);
+    EXPECT_EQ(second.error().step, Step::openat);
     EXPECT_TRUE(third.has_value());
-    EXPECT_EQ(count(Operation::open_directory, Step::open), 3U);
+    EXPECT_EQ(count(Operation::open_directory, Step::openat), 3U);
+    EXPECT_EQ(count(Operation::open_directory, Step::open), 0U);
 }
 
 // A fault names one operation and one step: a fault on another operation's `open`, and one on a step
@@ -342,11 +343,11 @@ TEST_F(ObserverTest, AScriptedStepFailsWithItsCodeAndNothingIsWritten) {
     EXPECT_THAT(bc::file_system_test::names_raw(root_path()), IsEmpty());
 }
 
-// The parent is opened by path once per `at` resolution, so its occurrences count the calls (an `openat` would
-// count the leaf's open and any other the operation makes as well).
+// An `at` read opens its file in one call, the whole text by path, and makes every other call on the descriptor,
+// so the occurrences of that open count the calls.
 TEST_F(ObserverTest, OnlyTheNthOccurrenceFails) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
-    script(fail_step(Operation::read_file, Step::open, 2, EIO));
+    script(fail_step(Operation::read_file, Step::openat, 2, EIO));
 
     const auto first = files().read_file(in("file"), kWholeFileRefusingSymlink);
     const auto second = files().read_file(in("file"), kWholeFileRefusingSymlink);
@@ -433,8 +434,10 @@ TEST_F(ObserverTest, EveryStepIsCountedAcrossTheEnginesLifetime) {
     EXPECT_EQ(count(Operation::rename, Step::renameat), 1U);
 }
 
-// Each operation counts under its own name: resolving a location opens its parent directory, so every
-// operation reaches `open` at least once.
+// Each operation counts under its own name. An operation whose steps act in one directory as a unit (a staged
+// write or copy, a chain, a tree, the directory a name is made or swept in) opens that `at` location's parent by
+// path, so it reaches `open`; one that acts on its location in one call hands that call the whole text, so it
+// reaches its own call and never `open`.
 TEST_F(ObserverTest, EachOperationCountsUnderItsOwnName) {
     bc::file_system_test::write_raw(path_of("file"), "content", 0644);
     const auto bytes = bytes_of("more");
@@ -462,19 +465,36 @@ TEST_F(ObserverTest, EachOperationCountsUnderItsOwnName) {
     static_cast<void>(files().remove_condemned(root));
     static_cast<void>(files().open_directory(root, FinalSymlink::refuse));
 
-    const std::vector<Operation> operations = {Operation::read_file,        Operation::write_file,
-                                               Operation::append,           Operation::sync,
-                                               Operation::list_directory,   Operation::status,
-                                               Operation::create_directory, Operation::create_directories,
-                                               Operation::copy_file,        Operation::rename,
-                                               Operation::set_permissions,  Operation::create_symlink,
-                                               Operation::read_symlink,     Operation::try_lock,
-                                               Operation::remove_file,      Operation::remove_directory,
-                                               Operation::remove_tree,      Operation::create_temporary_directory,
-                                               Operation::condemn,          Operation::remove_condemned,
-                                               Operation::open_directory};
-    for (const Operation operation : operations) {
+    const std::vector<Operation> holding_a_parent = {
+        Operation::write_file,  Operation::create_directories,         Operation::copy_file,
+        Operation::remove_tree, Operation::create_temporary_directory, Operation::remove_condemned};
+    for (const Operation operation : holding_a_parent) {
         EXPECT_GE(count(operation, Step::open), 1U) << bc::file_system::name_of(operation);
+    }
+    struct OneCall {
+        Operation operation;
+        Step step;
+    };
+    const std::vector<OneCall> in_one_call = {
+        {.operation = Operation::read_file, .step = Step::openat},
+        {.operation = Operation::append, .step = Step::openat},
+        {.operation = Operation::sync, .step = Step::openat},
+        {.operation = Operation::list_directory, .step = Step::openat},
+        {.operation = Operation::status, .step = Step::fstatat},
+        {.operation = Operation::create_directory, .step = Step::mkdirat},
+        {.operation = Operation::rename, .step = Step::renameat},
+        {.operation = Operation::set_permissions, .step = Step::fchmodat},
+        {.operation = Operation::create_symlink, .step = Step::symlinkat},
+        {.operation = Operation::read_symlink, .step = Step::readlinkat},
+        {.operation = Operation::try_lock, .step = Step::openat},
+        {.operation = Operation::remove_file, .step = Step::unlinkat},
+        {.operation = Operation::remove_directory, .step = Step::unlinkat},
+        {.operation = Operation::condemn, .step = Step::rename_no_replace},
+        {.operation = Operation::open_directory, .step = Step::openat},
+    };
+    for (const OneCall& each : in_one_call) {
+        EXPECT_GE(count(each.operation, each.step), 1U) << bc::file_system::name_of(each.operation);
+        EXPECT_EQ(count(each.operation, Step::open), 0U) << bc::file_system::name_of(each.operation);
     }
 }
 
