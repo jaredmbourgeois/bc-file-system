@@ -419,6 +419,9 @@ TEST_P(FileSystemContract, ReadFileRefusesADirectory) {
 // A FIFO is refused as what it is, and the refusal comes back at once: opening a FIFO with no writer would
 // otherwise wait for one forever.
 TEST_P(FileSystemContract, ReadFileRefusesAFifoWithoutWaitingForAWriter) {
+    if (!bc::file_system_test::fifos_can_be_made(root_path())) {
+        GTEST_SKIP() << "this process may not make a FIFO here (Android's shell user in /data/local/tmp)";
+    }
     bc::file_system_test::make_fifo_raw(path_of("pipe"), 0600);
 
     const auto bytes = files().read_file(in("pipe"), kWholeFileRefusingSymlink);
@@ -3378,6 +3381,9 @@ TEST_P(FileSystemContract, CopyOntoADirectoryAndOfADirectoryAreNotRegularFile) {
 // The same file under the destination's name (a hard link included) is nothing to copy: refused before anything
 // is staged, so the file is never replaced with itself.
 TEST_P(FileSystemContract, CopyOfAFileOntoItselfIsInvalidArgumentAndTouchesNothing) {
+    if (!bc::file_system_test::hard_links_can_be_made(root_path())) {
+        GTEST_SKIP() << "this process may not make a hard link here (Android's shell user in /data/local/tmp)";
+    }
     bc::file_system_test::write_raw(path_of("source"), "content", 0644);
     bc::file_system_test::make_hard_link_raw(path_of("source"), path_of("same-file"));
 
@@ -3498,6 +3504,18 @@ constexpr auto kernel_moves_the_bytes() noexcept -> bool {
 }
 #endif
 
+// Android probes no clone (its data file systems have no reflinks and its SELinux policy refuses FICLONE), so a copy
+// there starts at copy_file_range; Apple platforms and every other Linux try the clone first.
+#if defined(__ANDROID__)
+constexpr auto platform_tries_a_clone() noexcept -> bool {
+    return false;
+}
+#else
+constexpr auto platform_tries_a_clone() noexcept -> bool {
+    return true;
+}
+#endif
+
 TEST_F(ObservedContract, CopyByTheFastestPathPassesNoByteThroughTheProcessWhereTheKernelMovesThem) {
     const std::string content(std::size_t{200} * 1024, 'y');
     bc::file_system_test::write_raw(path_of("source"), content, 0644);
@@ -3507,7 +3525,7 @@ TEST_F(ObservedContract, CopyByTheFastestPathPassesNoByteThroughTheProcessWhereT
     ASSERT_TRUE(achieved.has_value()) << achieved.error().message();
     EXPECT_EQ(bc::file_system_test::read_raw(path_of("copy")), content);
     if (kernel_moves_the_bytes()) {
-        EXPECT_EQ(count(Operation::copy_file, Step::clone_file), 1U);
+        EXPECT_EQ(count(Operation::copy_file, Step::clone_file), platform_tries_a_clone() ? 1U : 0U);
         EXPECT_EQ(count(Operation::copy_file, Step::write), 0U);
         EXPECT_EQ(count(Operation::copy_file, Step::pread), 0U);
     }
@@ -3596,6 +3614,9 @@ TEST_P(FileSystemContract, TryLockOnADirectoryAcquiresAndExcludesASecondLock) {
 
 // A lock never creates, never follows a symlink, and never locks what is neither a file nor a directory.
 TEST_P(FileSystemContract, TryLockOnNothingIsNotFoundOnASymlinkIsRefusedAndOnAFifoIsNotRegularFile) {
+    if (!bc::file_system_test::fifos_can_be_made(root_path())) {
+        GTEST_SKIP() << "this process may not make a FIFO here (Android's shell user in /data/local/tmp)";
+    }
     bc::file_system_test::write_raw(path_of("target"), "", 0644);
     bc::file_system_test::make_symlink_raw(path_of("target"), path_of("link"));
     bc::file_system_test::make_fifo_raw(path_of("pipe"), 0600);

@@ -108,6 +108,40 @@ repository is the top-level project; a consumer that pulls the library in throug
 `examples/consumer/`) gets the two libraries and nothing else. The standards the repository holds itself to,
 and how its guards enforce them, are in `AGENTS.md`.
 
+## Running the platform legs by hand
+
+CI runs on Linux only, so macOS, iOS and Android are run by hand on a Mac until runners exist for them. On macOS
+the proof is `bash scripts/verify.sh`.
+
+**Android.** Four presets build the library and its tests with the NDK's own toolchain file, found through
+`ANDROID_HOME` (`$ANDROID_HOME/ndk/30.0.16248370`): `android-arm64-api30`, `android-arm64-api33`,
+`android-arm64-api35`, and `android-x86_64-api30`, which is compiled only. Each is RelWithDebInfo under the
+`hardened` posture with the tests on: the three C tests and the GoogleTest suite build as plain device
+executables, and none is registered with `ctest`, because they run on the device rather than on the Mac. One
+script runs them there:
+
+```sh
+ANDROID_HOME=~/Library/Android/sdk JAVA_HOME=<a JDK 17 or later> bash scripts/android_legs.sh 30 5580
+```
+
+For the API level it is given (30, 33 or 35) it builds the arm64 preset, creates an AVD of its own,
+`agent-bc-file-system-android-api<api>` from the `system-images;android-<api>;google_apis;arm64-v8a` image, boots it
+headless on the console port it is given, pushes the binaries into `/data/local/tmp/bc-file-system` (the device
+directory the presets name, `BC_FILE_SYSTEM_DEVICE_TEST_ROOT`, which is also the C++ suite's compiled-in
+temporary root), runs each as the shell user, and prints every output and exit status; then, whatever happened,
+it stops the emulator and deletes the AVD. It exits 0 only when every test binary did. The SDK root needs
+`cmdline-tools;23.0`, `platform-tools`, `emulator`, `ndk;30.0.16248370` and the system image of each API level.
+
+**iOS.** The Swift package's tests run on a simulator of your own, through the package's scheme
+(`bc-file-system-Package`; the product schemes have no test action):
+
+```sh
+UDID=$(xcrun simctl create bc-file-system-tests "iPhone 17" com.apple.CoreSimulator.SimRuntime.iOS-27-0)
+xcodebuild test -scheme bc-file-system-Package -destination "platform=iOS Simulator,id=$UDID" \
+    -derivedDataPath build/ios-simulator
+xcrun simctl delete "$UDID"
+```
+
 ## Where it stands
 
 Stage 9 of its plan, `salvaged-under-the-new-name`: the public header, an honest stub core that answers

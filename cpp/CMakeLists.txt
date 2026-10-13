@@ -27,8 +27,18 @@ bc_file_system_set_compile_options(bc_file_system)
 if(BUILD_TESTING)
     # Every case creates its own directory under this root and removes it again. The root is handed to the tests
     # through a generated header (never a compile definition); they never ask the system where temporary files go.
-    set(BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT "${CMAKE_CURRENT_BINARY_DIR}/test-temporary")
-    file(MAKE_DIRECTORY "${BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT}")
+    # A host build makes the root inside its build tree. A cross build's tests run on the device they were built
+    # for, so the root is the directory on that device its preset names (BC_FILE_SYSTEM_DEVICE_TEST_ROOT, which
+    # scripts/android_legs.sh creates there and pushes the test binaries into), and nothing is made on this machine.
+    if(CMAKE_CROSSCOMPILING)
+        if(NOT BC_FILE_SYSTEM_DEVICE_TEST_ROOT)
+            message(FATAL_ERROR "A cross build with BUILD_TESTING needs BC_FILE_SYSTEM_DEVICE_TEST_ROOT, the directory on the device its tests run under (the android-* presets set it)")
+        endif()
+        set(BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT "${BC_FILE_SYSTEM_DEVICE_TEST_ROOT}")
+    else()
+        set(BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT "${CMAKE_CURRENT_BINARY_DIR}/test-temporary")
+        file(MAKE_DIRECTORY "${BC_FILE_SYSTEM_TEST_TEMPORARY_ROOT}")
+    endif()
     configure_file(tests/support/test_paths.hpp.in
         "${CMAKE_CURRENT_BINARY_DIR}/generated/test_paths.hpp" @ONLY
     )
@@ -64,5 +74,10 @@ if(BUILD_TESTING)
         GTest::gmock_main
     )
     bc_file_system_set_compile_options(bc_file_system_test)
-    gtest_discover_tests(bc_file_system_test)
+    # gtest_discover_tests runs the binary at build time to list its cases, and ctest would run it after: neither
+    # can run a binary built for another machine (an exec format error on this one), so a cross build registers
+    # nothing and its device runs the binary instead.
+    if(NOT CMAKE_CROSSCOMPILING)
+        gtest_discover_tests(bc_file_system_test)
+    endif()
 endif()

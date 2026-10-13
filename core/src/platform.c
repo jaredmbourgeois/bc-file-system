@@ -293,20 +293,26 @@ static bool probe_openat2(void) {
 static bool probe_rename_no_replace(void) {
     return kernel_dispatched(syscall(SYS_renameat2, -1, "", -1, "", RENAME_NOREPLACE));
 }
+#else
+static bool probe_rename_no_replace(void) {
+    return false;
+}
+#endif
 
+#if defined(__ANDROID__) || !__has_include(<linux/fs.h>)
+/* Android's data file systems (ext4, f2fs) have no reflinks, and its SELinux policy refuses the FICLONE ioctl with
+ * EACCES before the file system is asked (measured on the API 30, 33 and 35 emulators), which the engine would
+ * report as permission_denied rather than copy; a copy there starts at copy_file_range. A header set without
+ * <linux/fs.h> has no FICLONE to ask. */
+static bool probe_clone(void) {
+    return false;
+}
+#else
 /* FICLONE cannot be probed without a file: ioctl(2) checks the descriptor before the request, so an invalid
  * descriptor answers EBADF whether or not the volume clones. The ioctl is in the headers; whether a given volume
  * honours it is answered at clone time (ENOTTY, EOPNOTSUPP), and the clone body falls to the copy loop then. */
 static bool probe_clone(void) {
     return true;
-}
-#else
-static bool probe_rename_no_replace(void) {
-    return false;
-}
-
-static bool probe_clone(void) {
-    return false;
 }
 #endif
 
@@ -434,7 +440,7 @@ int bc_file_system_platform_rename_no_replace([[maybe_unused]] int from_director
 }
 #endif
 
-#if __has_include(<linux/fs.h>)
+#if !defined(__ANDROID__) && __has_include(<linux/fs.h>)
 /* FICLONE takes an open destination, so the body creates the file exclusively with `mode` (as the umask leaves
  * it; the engine sets the mode exactly afterwards), asks the kernel to share the source's extents into it, and
  * takes the file back when the kernel refuses, so the engine sees one step that made the whole file or nothing.
@@ -469,6 +475,8 @@ int bc_file_system_platform_clone_file(int source, int destination_directory, co
     return code;
 }
 #else
+/* The engine never calls this where the probe answered no (Android, or no <linux/fs.h>); the honest answer stays
+ * in place. */
 int bc_file_system_platform_clone_file([[maybe_unused]] int source, [[maybe_unused]] int destination_directory,
                                        [[maybe_unused]] const char *destination_name, [[maybe_unused]] uint32_t mode) {
     return ENOTSUP;

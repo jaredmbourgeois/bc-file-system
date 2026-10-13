@@ -141,6 +141,7 @@ static void expect_platform_fast_paths(report *tally, const bc_file_system_platf
 static void expect_platform_fast_paths(report *tally, const bc_file_system_platform_fast_paths *fast_paths) {
     expect_fast_path(tally, fast_paths->has_openat2, false, "Android: openat2 is never probed");
     expect_fast_path(tally, fast_paths->has_openat_nofollow_any, false, "Android: no O_NOFOLLOW_ANY");
+    expect_fast_path(tally, fast_paths->has_clone, false, "Android: no clone (no reflinks; SELinux refuses FICLONE)");
     expect_fast_path(tally, fast_paths->has_full_fsync, false, "Android: fsync is the durable sync");
 }
 #else

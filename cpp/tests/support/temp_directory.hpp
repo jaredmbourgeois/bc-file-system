@@ -95,6 +95,18 @@ auto set_mode_raw(const std::filesystem::path& path, std::uint32_t mode) -> void
 /// test owns; the probe file is created and removed inside it.
 [[nodiscard]] auto permissions_are_enforced(const std::filesystem::path& scratch) -> bool;
 
+/// False when the system refuses this process a FIFO in `scratch` (EACCES or EPERM), as Android's SELinux policy
+/// refuses the shell user one in /data/local/tmp. A test that needs a FIFO skips itself there, because the case
+/// cannot be set up. `scratch` is a directory the test owns; the probe is created and removed inside it, and any
+/// other failure of the probe is recorded as a test failure.
+[[nodiscard]] auto fifos_can_be_made(const std::filesystem::path& scratch) -> bool;
+
+/// False when the system refuses this process a hard link in `scratch` (EACCES or EPERM), as Android's SELinux
+/// policy refuses the shell user one in /data/local/tmp. A test that needs a hard link skips itself there. `scratch`
+/// is a directory the test owns; the probe's two names are created and removed inside it, and any other failure of
+/// the probe is recorded as a test failure.
+[[nodiscard]] auto hard_links_can_be_made(const std::filesystem::path& scratch) -> bool;
+
 /// While one of these lives, no file this process writes may grow past `byte_limit`: the system refuses the
 /// write that would cross it, which is how a test meets a real "too large" failure without filling a disk. The
 /// previous limit comes back when it is destroyed.

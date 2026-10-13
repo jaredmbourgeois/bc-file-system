@@ -26,7 +26,7 @@ wrong even when it compiles and passes.
 |---|---|---|---|---|
 | `core/include/bc_file_system/` | The public C header, included as `<bc_file_system/bc_file_system.h>` | `bc::file_system_core` | `CBCFileSystem` | — |
 | `core/src/` | The C implementation: `bc_file_system.c` is the engine (the hosted tier: the handles, the observer and every operation, with the `staged_file` a write or a copy owns until it is renamed into place, the `created_directory` a creation owns until it has its mode, the tree removal's bounded window of directory streams, each under the cleanup idiom, the lock over an open of its own, and the condemned sweep over the same tree removal) with its private face `engine.h` (the observer's two hooks and the probed fast paths, for the C-only test, and the vocabulary of a gated system call: the outcome, the reading of a verdict, the report), `calls.c` every gated system call the core makes, one loop each named for the call (`bc_file_system_call_openat`, …, behind the observer, asked again on EINTR, the errno copied on the next line; `close` made once) and the one errno table, behind `calls.h`, `resolve.c` the resolution layer (a location to a parent descriptor and a leaf name: for an operation that acts on an `at` location in one call, the whole text beside `AT_FDCWD` with nothing opened, the system resolving it in that call; for any other, an `at` location's parent opened by path in one call; a `beneath` location's with containment enforced by the kernel: the walk, whose components open for search only, the fast paths, the identity check; and the open of a directory entry with nothing checked around it, for an `at` location's leaf and a directory an operation has just made) behind `resolve.h`, `owned.h` the one cleanup idiom (`owned_descriptor`, `owned_directory_stream`, `owned_buffer` under `[[gnu::cleanup]]`), `names.h` the one table of the names the engine makes up (the staging infix, the condemned prefix), which the sweep and the fuzzers read, `path.c` the path module (the freestanding tier, with its private face `path.h`), and `platform.h` with `platform.c` the only files that name the operating system (`.clang-tidy`: the C set) | `bc::file_system_core` | `CBCFileSystem` | compiled by `bc-file-system`'s `build.rs` |
-| `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach; `resolve_test.c` drives the resolution layer through `resolve.h` over a tree it plants under the root `add_test` hands it | `bc_file_system_path_test`, `bc_file_system_engine_test`, `bc_file_system_resolve_test` | not built | — |
+| `core/tests/` | The C-only tests, each a `.c` main over cases registered with `add_test`: `path_test.c` proves the path module through the public header alone; `engine_test.c` drives the observer's hooks and the platform probes through `engine.h` and `platform.h`, which no face can reach; `resolve_test.c` drives the resolution layer through `resolve.h` over a tree it plants under the root its command line hands it (`add_test` on the host, `scripts/android_legs.sh` on a device) | `bc_file_system_path_test`, `bc_file_system_engine_test`, `bc_file_system_resolve_test` | not built | — |
 | `cpp/include/bc_file_system/`, `cpp/src/` | The C++ face, a thin wrapper over the header (`.clang-tidy`: the C++ set) | `bc::file_system` | not built | — |
 | `cpp/tests/` | The contract suite (the specification every face is held to, driving C through the C++ face), the C++ binding suite, the observer and path-value suites, and `support/` (the temporary directory, the descriptor-balance fixture, the generated `test_paths.hpp`) | `bc_file_system_test` | not built | — |
 | `Sources/BCFileSystem/`, `Sources/BCFileSystemTestFixtures/`, `Tests/BCFileSystemTests/` | The Swift face over the C module `CBCFileSystem` (declared in `Package.swift` over `core/`): the engine, `FileSystem` and its operations, and the path values with `PathText`, the path module's ten functions, every value validated and every answer made by one call into C; its test fixtures (the temporary directory and the observed engine); its binding suites (`BindingTests.swift`, and `PathTests.swift`, the port of `cpp/tests/path_test.cpp`), its contract cases and its source scan; `Package.swift` at the root for git pins | not built | `BCFileSystem`, `BCFileSystemTestFixtures`, `BCFileSystemTests` | — |
@@ -38,6 +38,7 @@ wrong even when it compiles and passes.
 | `scripts/check_house_rules.py` | The guard for the three rules, over every language here | run by `scripts/verify.sh` | — | — |
 | `scripts/check_build_parity.py`, `scripts/check_disabled_cases.py` | The three builds compile the same C the same way; the disabled-case count against its pin `scripts/disabled_cases_pin.txt` | run by `scripts/verify.sh` | — | — |
 | `scripts/verify.sh` | The one verify script the IDE and CI both call | — | — | — |
+| `scripts/android_legs.sh` | The Android legs by hand, for one API level: builds its `android-arm64-api<api>` preset, runs the C tests and the GoogleTest suite on an emulator of its own (an AVD it creates, boots and deletes), and prints each binary's output and exit status | — | — | — |
 | `.forgejo/workflows/ci.yml` | CI: one job per leg of `scripts/verify.sh` | — | — | — |
 
 ## Inject, never reach
@@ -89,7 +90,7 @@ in Swift `FileManager.default`, `ProcessInfo.processInfo`, `Date()`, `UUID()`; i
    root `test_paths.hpp` hands in) and `cpp/tests/support/descriptor_balance.cpp` (the open-descriptor sweep the
    fixture takes before and after every case); `core/tests/resolve_test.c` (the C-only test of the resolution
    layer, which plants its tree with `mkdirat`, `symlinkat` and `openat` on held descriptors under the root
-   `add_test` hands it and removes it when it ends); the two engine fuzzers and their harness (`fuzz/harness.h`,
+   its command line hands it and removes it when it ends); the two engine fuzzers and their harness (`fuzz/harness.h`,
    `fuzz/abi_arguments_fuzz.c`, `fuzz/operation_sequence_fuzz.c`), which make their roots under the directory
    the generated `fuzz_paths.h` hands them and read their own descriptors' paths to prove nothing leaked;
    `Sources/BCFileSystemTestFixtures/TemporaryDirectory.swift` (the
@@ -434,7 +435,11 @@ comment that explains it. Brevity is never worth obscurity.
   `DISABLED_` with the stage that turns it on in the comment above; a Swift Testing case carries
   `.disabled("stage N <slug>")`. `scripts/check_disabled_cases.py` counts both against
   `scripts/disabled_cases_pin.txt`, and the pin only falls: a case brought back to life lowers it in the same
-  commit, and a case disabled to make a run pass is a finding.
+  commit, and a case disabled to make a run pass is a finding. A case whose setup the platform itself refuses
+  is not disabled: it asks a probe in the test support first (`permissions_are_enforced` where the superuser
+  bypasses the permission bits; `fifos_can_be_made` and `hard_links_can_be_made` where Android's SELinux policy
+  refuses the shell user a FIFO or a hard link in `/data/local/tmp`, any errno but EACCES or EPERM being recorded
+  as a failure) and skips itself with that reason.
 - **A guard must be able to fail.** The guard scripts have `--selftest` and the Swift scan planted cases for
   every rule; a new rule comes with a plant that proves it fires and a near miss that proves it does not.
 - **Every public function appears in every face.** The guard's face-parity leg (`face_parity_faces` in
@@ -476,6 +481,16 @@ CI runs it on Linux (Debian 13: GCC 14 and clang 19, Swift 6.4; the `rust` job i
 toolchains through rustup); macOS, iOS and the cross targets (Android, Emscripten, musl, `cargo test` on the two
 musl targets among them) run by hand until CI has runners and packages for them, and so does `fuzz-smoke`, which
 needs clang's compiler-rt (named in `ci.yml`'s gated list beside the clang sanitized leg).
+
+Android runs by hand on an emulator (README, "Running the platform legs by hand"). The `android-*` presets
+configure the NDK's own toolchain file through `ANDROID_HOME`, under the `hardened` posture with `BUILD_TESTING`
+on, so the C tests and the GoogleTest suite build as device executables; a cross build registers no test with
+`ctest` (neither `add_test` nor `gtest_discover_tests`, which runs the binary at build time) and makes no root on
+the Mac: the C++ suite's root is the device directory the preset names in `BC_FILE_SYSTEM_DEVICE_TEST_ROOT`, and
+the resolve test is handed it on its command line. `bash scripts/android_legs.sh <api> <port>` runs one API level
+(30, 33 or 35) on an AVD it creates as `agent-bc-file-system-android-api<api>` and deletes whatever happens, never
+an AVD it did not make; a test binary added to `core/tests/` or `cpp/` joins its `TEST_BINARIES` list. The
+`android-x86_64-api30` preset is compiled only.
 
 The hand-run benchmark (`bench/`) is no leg and no CI job: `cmake --preset bench && cmake --build --preset bench`
 builds the C++ program and `cargo bench --manifest-path crates/Cargo.toml -p bc-file-system --bench

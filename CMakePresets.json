@@ -54,6 +54,57 @@
             }
         },
         {
+            "name": "android",
+            "hidden": true,
+            "inherits": "base",
+            "toolchainFile": "$env{ANDROID_HOME}/ndk/30.0.16248370/build/cmake/android.toolchain.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "BC_FILE_SYSTEM_BUILD_POSTURE": "hardened",
+                "BUILD_TESTING": "ON",
+                "BC_FILE_SYSTEM_DEVICE_TEST_ROOT": {
+                    "type": "STRING",
+                    "value": "/data/local/tmp/bc-file-system"
+                }
+            }
+        },
+        {
+            "name": "android-arm64-api30",
+            "inherits": "android",
+            "displayName": "Android arm64-v8a, API 30 (the floor), hardened, with the tests (run on an emulator by scripts/android_legs.sh)",
+            "cacheVariables": {
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-30"
+            }
+        },
+        {
+            "name": "android-arm64-api33",
+            "inherits": "android",
+            "displayName": "Android arm64-v8a, API 33, hardened, with the tests (run on an emulator by scripts/android_legs.sh)",
+            "cacheVariables": {
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-33"
+            }
+        },
+        {
+            "name": "android-arm64-api35",
+            "inherits": "android",
+            "displayName": "Android arm64-v8a, API 35, hardened, with the tests (run on an emulator by scripts/android_legs.sh)",
+            "cacheVariables": {
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-35"
+            }
+        },
+        {
+            "name": "android-x86_64-api30",
+            "inherits": "android",
+            "displayName": "Android x86_64, API 30 (the floor), hardened, with the tests (compiled only: no x86_64 image is run)",
+            "cacheVariables": {
+                "ANDROID_ABI": "x86_64",
+                "ANDROID_PLATFORM": "android-30"
+            }
+        },
+        {
             "name": "bench",
             "inherits": "base",
             "displayName": "Release, no posture + the hand-run benchmark against std (what a consumer's release build compiles)",
@@ -104,6 +155,22 @@
         {
             "name": "bench",
             "configurePreset": "bench"
+        },
+        {
+            "name": "android-arm64-api30",
+            "configurePreset": "android-arm64-api30"
+        },
+        {
+            "name": "android-arm64-api33",
+            "configurePreset": "android-arm64-api33"
+        },
+        {
+            "name": "android-arm64-api35",
+            "configurePreset": "android-arm64-api35"
+        },
+        {
+            "name": "android-x86_64-api30",
+            "configurePreset": "android-x86_64-api30"
         }
     ],
     "testPresets": [

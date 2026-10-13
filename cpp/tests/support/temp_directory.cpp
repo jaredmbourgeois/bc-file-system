@@ -45,6 +45,11 @@ auto restore_access(const std::filesystem::path& path) -> void {
     }
 }
 
+// The errnos with which a system's security policy, rather than the file system, refuses to make an entry.
+auto is_policy_refusal(int code) -> bool {
+    return code == EACCES || code == EPERM;
+}
+
 } // namespace
 
 TemporaryDirectory::TemporaryDirectory(std::filesystem::path path) noexcept : path_(std::move(path)) {}
@@ -224,6 +229,35 @@ auto permissions_are_enforced(const std::filesystem::path& scratch) -> bool {
     }
     ::unlink(probe.c_str());
     return descriptor < 0;
+}
+
+auto fifos_can_be_made(const std::filesystem::path& scratch) -> bool {
+    const std::filesystem::path probe = scratch / ".fifo-probe";
+    if (::mkfifo(probe.c_str(), S_IRWXU) == 0) {
+        ::unlink(probe.c_str());
+        return true;
+    }
+    const int code = errno;
+    if (!is_policy_refusal(code)) {
+        ADD_FAILURE() << "mkfifo " << probe << ": " << std::strerror(code);
+    }
+    return false;
+}
+
+auto hard_links_can_be_made(const std::filesystem::path& scratch) -> bool {
+    const std::filesystem::path existing = scratch / ".link-probe";
+    const std::filesystem::path second_name = scratch / ".link-probe-second-name";
+    write_raw(existing, "probe", 0600);
+    const bool made = ::link(existing.c_str(), second_name.c_str()) == 0;
+    const int code = errno;
+    if (made) {
+        ::unlink(second_name.c_str());
+    }
+    ::unlink(existing.c_str());
+    if (!made && !is_policy_refusal(code)) {
+        ADD_FAILURE() << "link " << second_name << " = " << existing << ": " << std::strerror(code);
+    }
+    return made;
 }
 
 FileSizeLimit::FileSizeLimit(std::uint64_t byte_limit) : previous_limit_(0), applied_(false) {

@@ -9,7 +9,6 @@ add_executable(bc_file_system_path_test
 )
 target_link_libraries(bc_file_system_path_test PRIVATE bc::file_system_core)
 bc_file_system_set_compile_options(bc_file_system_path_test)
-add_test(NAME bc_file_system_path_test COMMAND bc_file_system_path_test)
 
 add_executable(bc_file_system_engine_test
     engine_test.c
@@ -17,16 +16,26 @@ add_executable(bc_file_system_engine_test
 target_link_libraries(bc_file_system_engine_test PRIVATE bc::file_system_core)
 target_include_directories(bc_file_system_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 bc_file_system_set_compile_options(bc_file_system_engine_test)
-add_test(NAME bc_file_system_engine_test COMMAND bc_file_system_engine_test)
 
-# The resolve test plants its tree under this root (never asking the system where temporary files go) and
-# removes it when it ends; the root is handed in as the one argument, never read from the environment.
-set(BC_FILE_SYSTEM_RESOLVE_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/test-temporary")
-file(MAKE_DIRECTORY "${BC_FILE_SYSTEM_RESOLVE_TEST_ROOT}")
 add_executable(bc_file_system_resolve_test
     resolve_test.c
 )
 target_link_libraries(bc_file_system_resolve_test PRIVATE bc::file_system_core)
 target_include_directories(bc_file_system_resolve_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 bc_file_system_set_compile_options(bc_file_system_resolve_test)
+
+# A cross build's tests run on the device they were built for: scripts/android_legs.sh pushes them there and hands
+# the resolve test that device's root. ctest cannot run a binary built for another machine, so a cross build
+# registers none and makes no root on this one.
+if(CMAKE_CROSSCOMPILING)
+    return()
+endif()
+
+add_test(NAME bc_file_system_path_test COMMAND bc_file_system_path_test)
+add_test(NAME bc_file_system_engine_test COMMAND bc_file_system_engine_test)
+
+# The resolve test plants its tree under this root (never asking the system where temporary files go) and
+# removes it when it ends; the root is handed in as the one argument, never read from the environment.
+set(BC_FILE_SYSTEM_RESOLVE_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/test-temporary")
+file(MAKE_DIRECTORY "${BC_FILE_SYSTEM_RESOLVE_TEST_ROOT}")
 add_test(NAME bc_file_system_resolve_test COMMAND bc_file_system_resolve_test "${BC_FILE_SYSTEM_RESOLVE_TEST_ROOT}")
